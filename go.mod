@@ -1,6 +1,6 @@
 module github.com/azrinaldi/gemini-stealth-bridge
 
-go 1.27.2
+go 1.26.0
 
 require (
 	github.com/bogdanfinn/fhttp v0.6.9

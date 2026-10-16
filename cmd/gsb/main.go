@@ -1,13 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/server"
 	"io"
 	"log"
 	"net"
@@ -17,41 +14,54 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
+
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/server"
 )
 
 var reSafeAccountName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 func main() {
 	var (
-		loginAcct    = flag.String("login", "", "Interactive browser sign-in to capture a fresh session into ~/.gemini-stealth-bridge/accounts/<name>.json")
-		importChrome = flag.String("import-chrome", "", "Import Google cookies from local Chrome/Brave/Chromium SQLite DB into accounts/<name>.json")
-		cookieDB     = flag.String("cookie-db", "", "Explicit path to Chrome/Chromium Cookies SQLite database for --import-chrome")
-		importCookie = flag.String("import-cookie", "", "Import raw Cookie header or Cookie-Editor JSON from --cookie-value or stdin into accounts/<name>.json")
-		cookieValue  = flag.String("cookie-value", "", "Raw Cookie header or JSON string for --import-cookie (reads stdin if omitted)")
-		probeOnce    = flag.Bool("probe", false, "Bootstrap all configured accounts, verify models & quota, and exit")
-		rotateOnce   = flag.Bool("rotate", false, "Run dual-path cookie rotation on all configured accounts and exit")
+		loginAcct     = flag.String("login", "", "Interactive browser sign-in to capture a fresh session into ~/.gemini-stealth-bridge/accounts/<name>.json")
+		importChrome  = flag.String("import-chrome", "", "Import Google cookies from local Chrome/Brave/Chromium/Edge/Firefox SQLite DB into accounts/<name>.json")
+		cookieDB      = flag.String("cookie-db", "", "Explicit path to browser Cookies SQLite database or profile directory for --import-chrome")
+		chromeProfile = flag.String("chrome-profile", "", "Alias for --cookie-db (browser profile directory or Cookies SQLite database path)")
+		importCookie  = flag.String("import-cookie", "", "Import raw Cookie header or Cookie-Editor JSON from --cookie-value, --cookie-file, or stdin into accounts/<name>.json")
+		cookieValue   = flag.String("cookie-value", "", "Raw Cookie header or JSON string for --import-cookie")
+		cookieFile    = flag.String("cookie-file", "", "Path to file containing raw Cookie header or Cookie-Editor JSON array for --import-cookie")
+		probeOnce     = flag.Bool("probe", false, "Bootstrap all configured accounts, verify models & quota, and exit")
+		rotateOnce    = flag.Bool("rotate", false, "Run dual-path cookie rotation on all configured accounts and exit")
 	)
 	flag.Parse()
 
 	cfg := config.Load()
+	dbOrProfile := *cookieDB
+	if dbOrProfile == "" {
+		dbOrProfile = *chromeProfile
+	}
 
 	if *loginAcct != "" {
-		if err := runInteractiveLogin(cfg, *loginAcct); err != nil {
+		if err := runInteractiveLogin(cfg, *loginAcct, dbOrProfile); err != nil {
 			log.Fatalf("[login] failed: %v", err)
 		}
 		return
 	}
 	if *importChrome != "" {
-		if err := runImportChrome(cfg, *importChrome, *cookieDB); err != nil {
+		if err := runImportChrome(cfg, *importChrome, dbOrProfile); err != nil {
 			log.Fatalf("[import-chrome] failed: %v", err)
 		}
 		return
 	}
 	if *importCookie != "" {
-		if err := runImportCookie(cfg, *importCookie, *cookieValue); err != nil {
+		if err := runImportCookie(cfg, *importCookie, *cookieValue, *cookieFile); err != nil {
 			log.Fatalf("[import-cookie] failed: %v", err)
 		}
 		return
@@ -77,6 +87,13 @@ func main() {
 			}
 			for _, m := range a.Models {
 				fmt.Printf("  - %-24s (%s, id=%s, cap=%d)\n", m.ModelName, m.DisplayName, m.ModelID, m.Capacity)
+			}
+			for _, q := range a.Quota {
+				if q.Unlimited {
+					fmt.Printf("  quota: %-18s unlimited\n", q.Label)
+				} else {
+					fmt.Printf("  quota: %-18s remaining=%d/%d resets=%s\n", q.Label, q.Remaining, q.Total, q.ResetAt)
+				}
 			}
 		}
 		return
@@ -163,9 +180,16 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 	return nil
 }
 
-func runImportCookie(cfg config.Config, acctName, rawVal string) error {
+func runImportCookie(cfg config.Config, acctName, rawVal, filePath string) error {
 	if !reSafeAccountName.MatchString(acctName) {
 		return fmt.Errorf("invalid account name %q (use 1-64 chars of A-Z a-z 0-9 . _ -)", acctName)
+	}
+	if rawVal == "" && filePath != "" {
+		b, err := os.ReadFile(filePath)
+		if err != nil {
+			return err
+		}
+		rawVal = string(b)
 	}
 	if rawVal == "" {
 		b, err := io.ReadAll(os.Stdin)
@@ -194,27 +218,36 @@ func runImportCookie(cfg config.Config, acctName, rawVal string) error {
 	return nil
 }
 
-func runInteractiveLogin(cfg config.Config, acctName string) error {
+func runInteractiveLogin(cfg config.Config, acctName, explicitDB string) error {
 	if !reSafeAccountName.MatchString(acctName) {
 		return fmt.Errorf("invalid account name %q (use 1-64 chars of A-Z a-z 0-9 . _ -)", acctName)
 	}
-	script := filepath.Join("..", "gemini-app-bridge", "web-login.js")
-	if _, err := os.Stat(script); err != nil {
-		return fmt.Errorf("web-login.js helper not found at %s", script)
+	targetURL := "https://gemini.google.com/app"
+	fmt.Printf("Opening %s in your browser...\n", targetURL)
+	openBrowserURL(targetURL)
+	fmt.Println("1. Sign in to Google Gemini in your browser.")
+	fmt.Println("2. Press Enter to auto-import cookies from your local browser profile,")
+	fmt.Println("   or paste a raw Cookie header / Cookie-Editor JSON line and press Enter:")
+	reader := bufio.NewReader(os.Stdin)
+	line, _ := reader.ReadString('\n')
+	line = strings.TrimSpace(line)
+	if line != "" {
+		return runImportCookie(cfg, acctName, line, "")
 	}
-	cmd := exec.Command("node", script, "--name", acctName)
-	cmd.Env = append(os.Environ(),
-		"BRIDGE_HOME="+cfg.HomeDir,
-		"PORT="+strconv.Itoa(cfg.Port),
-	)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return err
+	return runImportChrome(cfg, acctName, explicitDB)
+}
+
+func openBrowserURL(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
 	}
-	printStandaloneConnectionInfo(cfg, acctName)
-	return nil
+	_ = cmd.Start()
 }
 
 func printStandaloneConnectionInfo(cfg config.Config, acctName string) {
