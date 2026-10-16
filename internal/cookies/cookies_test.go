@@ -1,15 +1,21 @@
 package cookies
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"fmt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
+	fhttp "github.com/bogdanfinn/fhttp"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
-	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 type stubCookieDoer struct {
@@ -134,5 +140,155 @@ func TestSaveAndLoadAccountFile(t *testing.T) {
 	st, _ := os.Stat(path)
 	if st.Mode().Perm() != 0o600 {
 		t.Fatalf("expected mode 0600, got %o", st.Mode().Perm())
+	}
+}
+
+func TestFindBrowserCookieDB_WindowsAndProfileDirs(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("LOCALAPPDATA", tmp)
+
+	userData := filepath.Join(tmp, "Google", "Chrome", "User Data")
+	prof4 := filepath.Join(userData, "Profile 4")
+	netDir := filepath.Join(prof4, "Network")
+	if err := os.MkdirAll(netDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	netCookies := filepath.Join(netDir, "Cookies")
+	if err := os.WriteFile(netCookies, []byte("sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Profile directory path with Windows backslashes -> resolves to <profile>/Network/Cookies
+	winStylePath := strings.ReplaceAll(prof4, "/", `\`)
+	got, err := FindBrowserCookieDB(winStylePath)
+	if err != nil || got != netCookies {
+		t.Fatalf("Windows backslash profile dir: got=%q err=%v, want=%q", got, err, netCookies)
+	}
+
+	// 2. Profile name shorthand ("Profile 4" and "chrome:Profile 4")
+	got, err = FindBrowserCookieDB("Profile 4")
+	if err != nil || got != netCookies {
+		t.Fatalf("Profile name shorthand: got=%q err=%v, want=%q", got, err, netCookies)
+	}
+	got, err = FindBrowserCookieDB("chrome:Profile 4")
+	if err != nil || got != netCookies {
+		t.Fatalf("Browser:Profile shorthand: got=%q err=%v, want=%q", got, err, netCookies)
+	}
+
+	// 3. Fallback to legacy <profile>/Cookies when Network/Cookies is absent
+	legacyProf := filepath.Join(userData, "Profile 2")
+	if err := os.MkdirAll(legacyProf, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacyCookies := filepath.Join(legacyProf, "Cookies")
+	if err := os.WriteFile(legacyCookies, []byte("sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = FindBrowserCookieDB(legacyProf)
+	if err != nil || got != legacyCookies {
+		t.Fatalf("Legacy profile Cookies fallback: got=%q err=%v, want=%q", got, err, legacyCookies)
+	}
+
+	// 4. %LOCALAPPDATA% expansion in path
+	got, err = FindBrowserCookieDB(`%LOCALAPPDATA%\Google\Chrome\User Data\Profile 4`)
+	if err != nil || got != netCookies {
+		t.Fatalf("Percent env expansion: got=%q err=%v, want=%q", got, err, netCookies)
+	}
+}
+
+func TestReadBrowserCookies_WindowsLocalStateDPAPI(t *testing.T) {
+	tmp := t.TempDir()
+	userData := filepath.Join(tmp, "Google", "Chrome", "User Data")
+	netDir := filepath.Join(userData, "Profile 4", "Network")
+	if err := os.MkdirAll(netDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a 32-byte master key and wrap it in a simulated DPAPI Local State file.
+	masterKey := bytes.Repeat([]byte{0x42}, 32)
+	fakeDPAPIBlob := []byte("simulated-dpapi-wrapped-key")
+	rawEncryptedKey := append([]byte("DPAPI"), fakeDPAPIBlob...)
+	localStateJSON := fmt.Sprintf(`{"os_crypt":{"encrypted_key":%q}}`, base64.StdEncoding.EncodeToString(rawEncryptedKey))
+	if err := os.WriteFile(filepath.Join(userData, "Local State"), []byte(localStateJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	origUnprotect := dpapiUnprotect
+	dpapiUnprotect = func(blob []byte) ([]byte, error) {
+		if !bytes.Equal(blob, fakeDPAPIBlob) {
+			return nil, fmt.Errorf("unexpected DPAPI blob: %x", blob)
+		}
+		return masterKey, nil
+	}
+	defer func() { dpapiUnprotect = origUnprotect }()
+
+	// Create SQLite Cookies DB with v10 AES-256-GCM + Chrome 130+ SHA-256(host_key) domain prefix.
+	dbPath := filepath.Join(netDir, "Cookies")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB, value TEXT)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+
+	encryptV10 := func(host, val string) []byte {
+		block, err := aes.NewCipher(masterKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gcm, err := cipher.NewGCM(block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		nonce := bytes.Repeat([]byte{0x07}, 12)
+		hostHash := sha256.Sum256([]byte(host))
+		plain := append(hostHash[:], []byte(val)...)
+		ct := gcm.Seal(nil, nonce, plain, nil)
+		out := append([]byte("v10"), nonce...)
+		return append(out, ct...)
+	}
+
+	for _, row := range []struct{ host, name, val string }{
+		{".google.com", "SAPISID", "sap_win_123"},
+		{".google.com", "__Secure-1PSID", "psid_win_456"},
+		{".google.com", "__Secure-1PSIDTS", "psidts_win_789"},
+	} {
+		if _, err := db.Exec(`INSERT INTO cookies (host_key, name, encrypted_value, value) VALUES (?, ?, ?, '')`,
+			row.host, row.name, encryptV10(row.host, row.val)); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	hdr, err := ReadChromeCookies(dbPath)
+	if err != nil {
+		t.Fatalf("ReadChromeCookies failed: %v", err)
+	}
+	if ExtractSAPISID(hdr) != "sap_win_123" || !strings.Contains(hdr, "__Secure-1PSID=psid_win_456") {
+		t.Fatalf("unexpected decrypted header: %q", hdr)
+	}
+}
+
+func TestParseProfileHint(t *testing.T) {
+	cases := []struct {
+		in          string
+		wantBrowser string
+		wantProfile string
+	}{
+		{`C:\Users\alice\AppData\Local\Google\Chrome\User Data\Profile 4`, "chrome", "Profile 4"},
+		{`C:\Users\alice\AppData\Local\Google\Chrome\User Data\Profile 4\Network\Cookies`, "chrome", "Profile 4"},
+		{`/home/alice/.config/BraveSoftware/Brave-Browser/Profile 2`, "brave", "Profile 2"},
+		{`Profile 4`, "", "Profile 4"},
+		{`chrome:Profile 4`, "chrome", "Profile 4"},
+		{`edge`, "edge", "Default"},
+	}
+	for _, tc := range cases {
+		b, p := ParseProfileHint(tc.in)
+		if b != tc.wantBrowser || p != tc.wantProfile {
+			t.Errorf("ParseProfileHint(%q) = (%q, %q), want (%q, %q)", tc.in, b, p, tc.wantBrowser, tc.wantProfile)
+		}
 	}
 }

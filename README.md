@@ -53,10 +53,17 @@ Reads and decrypts `google.com` cookies directly from a local Chrome, Chromium, 
 ./gsb --import-chrome acc1
 ```
 
-To specify a custom browser profile or `Cookies` SQLite path:
+To specify a custom browser profile name, profile directory, or `Cookies` SQLite path:
 
 ```sh
+# By profile name (Linux, macOS, Windows)
+./gsb --import-chrome acc1 --chrome-profile "Profile 4"
+
+# By profile directory path (Linux / macOS)
 ./gsb --import-chrome acc1 --chrome-profile ~/.config/google-chrome/Default
+
+# By profile directory path (Windows PowerShell / cmd)
+./gsb --import-chrome acc1 --chrome-profile "C:\Users\<user>\AppData\Local\Google\Chrome\User Data\Profile 4"
 ```
 
 ### 2. Import from a Cookie Header or Cookie-Editor JSON Export
@@ -75,6 +82,9 @@ Launches a local browser window, waits for Google authentication on `gemini.goog
 
 ```sh
 ./gsb --login acc1
+
+# Target a specific browser profile on multi-profile setups:
+./gsb --login acc1 --chrome-profile "Profile 4"
 ```
 
 ### 4. Verify Accounts, Models, and Quota (`--probe`)

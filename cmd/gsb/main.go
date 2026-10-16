@@ -32,8 +32,8 @@ func main() {
 	var (
 		loginAcct     = flag.String("login", "", "Interactive browser sign-in to capture a fresh session into ~/.gemini-stealth-bridge/accounts/<name>.json")
 		importChrome  = flag.String("import-chrome", "", "Import Google cookies from local Chrome/Brave/Chromium/Edge/Firefox SQLite DB into accounts/<name>.json")
-		cookieDB      = flag.String("cookie-db", "", "Explicit path to browser Cookies SQLite database or profile directory for --import-chrome")
-		chromeProfile = flag.String("chrome-profile", "", "Alias for --cookie-db (browser profile directory or Cookies SQLite database path)")
+		cookieDB      = flag.String("cookie-db", "", "Explicit path to browser Cookies SQLite database or profile directory for --import-chrome / --login")
+		chromeProfile = flag.String("chrome-profile", "", "Browser profile name (e.g. \"Profile 4\"), profile directory, or Cookies SQLite path for --import-chrome / --login")
 		importCookie  = flag.String("import-cookie", "", "Import raw Cookie header or Cookie-Editor JSON from --cookie-value, --cookie-file, or stdin into accounts/<name>.json")
 		cookieValue   = flag.String("cookie-value", "", "Raw Cookie header or JSON string for --import-cookie")
 		cookieFile    = flag.String("cookie-file", "", "Path to file containing raw Cookie header or Cookie-Editor JSON array for --import-cookie")
@@ -153,12 +153,23 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 	if !reSafeAccountName.MatchString(acctName) {
 		return fmt.Errorf("invalid account name %q (use 1-64 chars of A-Z a-z 0-9 . _ -)", acctName)
 	}
-	dbPath := cookies.FindChromeCookieDB(explicitDB)
-	if dbPath == "" {
-		dbPath = cookies.FindChromeCookieDB(cfg.CookieDB)
-	}
-	if dbPath == "" {
-		return fmt.Errorf("could not locate Chrome/Brave/Chromium Cookies SQLite database")
+	var dbPath string
+	if strings.TrimSpace(explicitDB) != "" {
+		p, err := cookies.FindBrowserCookieDB(explicitDB)
+		if err != nil {
+			return err
+		}
+		dbPath = p
+	} else {
+		if cfg.CookieDB != "" {
+			dbPath = cookies.FindChromeCookieDB(cfg.CookieDB)
+		}
+		if dbPath == "" {
+			dbPath = cookies.FindChromeCookieDB("")
+		}
+		if dbPath == "" {
+			return fmt.Errorf("could not locate Chrome/Brave/Chromium Cookies SQLite database")
+		}
 	}
 	hdr, err := cookies.ReadChromeCookies(dbPath)
 	if err != nil {
@@ -222,9 +233,19 @@ func runInteractiveLogin(cfg config.Config, acctName, explicitDB string) error {
 	if !reSafeAccountName.MatchString(acctName) {
 		return fmt.Errorf("invalid account name %q (use 1-64 chars of A-Z a-z 0-9 . _ -)", acctName)
 	}
+	if explicitDB == "" {
+		explicitDB = cfg.CookieDB
+	}
 	targetURL := "https://gemini.google.com/app"
-	fmt.Printf("Opening %s in your browser...\n", targetURL)
-	openBrowserURL(targetURL)
+	browser, profileDir := cookies.ParseProfileHint(explicitDB)
+	if explicitDB != "" {
+		fmt.Printf("Opening %s in your browser (target profile: %s)...\n", targetURL, explicitDB)
+	} else {
+		fmt.Printf("Opening %s in your default browser...\n", targetURL)
+		fmt.Println("Note: No --chrome-profile specified; auto-import reads from the Default profile.")
+		fmt.Println("      On multi-profile setups, pass --chrome-profile \"<Profile Name or Path>\" (e.g. \"Profile 4\").")
+	}
+	openBrowserURL(targetURL, browser, profileDir)
 	fmt.Println("1. Sign in to Google Gemini in your browser.")
 	fmt.Println("2. Press Enter to auto-import cookies from your local browser profile,")
 	fmt.Println("   or paste a raw Cookie header / Cookie-Editor JSON line and press Enter:")
@@ -237,7 +258,90 @@ func runInteractiveLogin(cfg config.Config, acctName, explicitDB string) error {
 	return runImportChrome(cfg, acctName, explicitDB)
 }
 
-func openBrowserURL(url string) {
+func findBrowserBinary(browser string) string {
+	b := strings.ToLower(strings.TrimSpace(browser))
+	if b == "" {
+		b = "chrome"
+	}
+	switch runtime.GOOS {
+	case "windows":
+		roots := []string{
+			os.Getenv("ProgramFiles"),
+			os.Getenv("ProgramFiles(x86)"),
+			os.Getenv("LOCALAPPDATA"),
+		}
+		var rels []string
+		switch b {
+		case "brave":
+			rels = []string{`BraveSoftware\Brave-Browser\Application\brave.exe`}
+		case "edge":
+			rels = []string{`Microsoft\Edge\Application\msedge.exe`}
+		case "vivaldi":
+			rels = []string{`Vivaldi\Application\vivaldi.exe`}
+		case "chromium":
+			rels = []string{`Chromium\Application\chrome.exe`}
+		default:
+			rels = []string{`Google\Chrome\Application\chrome.exe`}
+		}
+		for _, r := range roots {
+			if r == "" {
+				continue
+			}
+			for _, rel := range rels {
+				cand := filepath.Join(r, rel)
+				if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+					return cand
+				}
+			}
+		}
+	default:
+		var names []string
+		switch b {
+		case "brave":
+			names = []string{"brave-browser", "brave"}
+		case "edge":
+			names = []string{"microsoft-edge", "microsoft-edge-stable"}
+		case "vivaldi":
+			names = []string{"vivaldi", "vivaldi-stable"}
+		case "chromium":
+			names = []string{"chromium", "chromium-browser"}
+		default:
+			names = []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser"}
+		}
+		for _, n := range names {
+			if p, err := exec.LookPath(n); err == nil {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+func openBrowserURL(url, browser, profileDir string) {
+	if profileDir != "" {
+		if runtime.GOOS == "darwin" {
+			appName := "Google Chrome"
+			switch strings.ToLower(browser) {
+			case "brave":
+				appName = "Brave Browser"
+			case "edge":
+				appName = "Microsoft Edge"
+			case "vivaldi":
+				appName = "Vivaldi"
+			case "chromium":
+				appName = "Chromium"
+			}
+			cmd := exec.Command("open", "-a", appName, "--args", "--profile-directory="+profileDir, url)
+			if err := cmd.Start(); err == nil {
+				return
+			}
+		} else if bin := findBrowserBinary(browser); bin != "" {
+			cmd := exec.Command(bin, "--profile-directory="+profileDir, url)
+			if err := cmd.Start(); err == nil {
+				return
+			}
+		}
+	}
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
