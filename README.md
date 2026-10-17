@@ -49,7 +49,7 @@ Compatibility covers the endpoints and fields described below, not the entire Op
 Version `0.2.0` focuses on making daily coding-agent workflows smoother, keeping long sessions stable, and protecting connected Google accounts:
 
 - **Cleaner answers on multilingual & reasoning prompts**: Gemini Web sometimes writes its thought process directly inside the reply body—especially when thinking in Chinese, Japanese, Korean, or mixed languages. `gsb` now recognizes these patterns and routes them to the reasoning channel so your chat or coding agent only receives the final answer.
-- **Full context and output limits in routers**: API routers and coding harnesses often fall back to small default limits (like `4,096` output tokens) when model metadata is incomplete. `/v1/models` now publishes complete OpenAI and OpenRouter capability metadata so clients can use the full context window and output capacity without premature truncation.
+- **Model metadata that matches reality**: `/v1/models` now reports the thinking levels each model actually advertises upstream, the default the daemon really applies, and the token limits Google publishes for that specific model. Previously every model inherited one global context window, thinking levels came from name heuristics (so `flash-lite` was wrongly listed as non-reasoning), and the advertised default was hardcoded `high` even when the daemon ran `medium`.
 - **Faster streaming & lower prompt overhead**: Tool definitions are compacted before being injected into the prompt so agents with many tools waste less context, while keep-alive pings and optional early SSE headers prevent clients and reverse proxies from timing out during long thinking phases.
 - **Accurate cached-token & CJK usage reporting**: When `gsb` reuses a conversation continuation or processes CJK text, token usage now reflects both the script density and the tokens saved by session caching (`cached_tokens`), giving coding agents a much more realistic view of your context budget.
 - **Smarter recovery when an account is busy or downgraded**: Instead of failing immediately when you send overlapping requests to a single account, `gsb` briefly waits for the active stream to finish. When Gemini Web silently downgrades a model, backoff now starts small (1 minute) and clears automatically as soon as the model responds normally again.
@@ -246,7 +246,18 @@ Add a separate provider credential for each account if you want the router to ma
 
 **Prefer one connection with the pool key.** Account rotation belongs to `gsb` because it is the only component that knows per-account quota, quarantine state, and conversation continuation affinity. A router that spreads requests across per-account connections cannot see any of that: it only learns about exhaustion from a `429`, and it will move the next turn to a different account, discarding the cached Gemini session. Use per-account connections only when you deliberately want to pin traffic to one account.
 
-The base URL must be reachable **from the router process**. Inside a container, `127.0.0.1` refers to that container, not the host running `gsb`. Any non-loopback deployment needs the security measures below. If your router caches or overrides model limits, you can run `./scripts/check-router-metadata.sh <router-url> <api-key>` to verify that context and output limits are passed through intact.
+The base URL must be reachable **from the router process**. Inside a container, `127.0.0.1` refers to that container, not the host running `gsb`. Any non-loopback deployment needs the security measures below. If your router caches or overrides model metadata, verify what survives:
+
+```sh
+# Check the bridge alone (all fields required)
+./scripts/check-router-metadata.sh http://127.0.0.1:20133 public
+
+# Compare the bridge against the router; reports exactly which fields the router dropped
+./scripts/check-router-metadata.sh --compare \
+  http://127.0.0.1:20133 http://127.0.0.1:20130 - sk-router-key
+```
+
+The compare form distinguishes a bridge problem from a router problem. A router that drops `capabilities.thinkingLevels` is why a harness cannot render a low/medium/high selector, and the script names that field rather than blaming the bridge.
 
 ## API usage
 
@@ -295,7 +306,7 @@ All `/v1/*` endpoints below use the same authentication resolver. Account keys s
 |---|---|---|
 | `GET` | `/health` | Unauthenticated daemon status and account/model counts; does not prove upstream readiness |
 | `GET` | `/readyz` | Readiness probe reporting per-account `models_fresh`, `quota_fresh`, `auth_ok`, and `quarantined` (`?strict=1` returns HTTP `503` when no healthy account is available) |
-| `GET` | `/v1/models` | Model IDs, OpenRouter/OpenAI limits, and capability metadata (`ETag` / `If-None-Match` caching; `?fresh=1` forces live discovery) |
+| `GET` | `/v1/models` | Model IDs, per-model documented token limits, registry-discovered thinking levels, and OpenRouter/OpenAI capability metadata (`ETag` / `If-None-Match` caching; `?fresh=1` forces live discovery) |
 | `POST` | `/v1/chat/completions` | Chat messages, tools, images, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
 | `POST` | `/v1/responses` | Responses input, instructions, tools, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
 | `GET` | `/v1/accounts` | Account IDs, email addresses, provenance (`importedFrom`, `profileId`, `proxyConfigured`), timestamps, quarantine state, surfaces, models, cached quotas, and load telemetry (`activeStreams`, `recentRpm`, `peakRpm`, `totalRequests`, `offloadRequests`, `lastUsedAt`) |
@@ -355,7 +366,7 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BRIDGE_DEFAULT_THINKING` | `high` | Default effort name: `low`, `medium`, or `high` |
+| `BRIDGE_DEFAULT_THINKING` | `high` | Effort applied when a request sends no `reasoning_effort`: `low`, `medium`, or `high`. Also advertised as `thinking.default` in `/v1/models`, so metadata matches behaviour. Models that do not list the configured level keep their own default |
 | `BRIDGE_REJECT_DOWNGRADE` | `true` | Reject detected upstream model substitution instead of silently returning another model |
 | `BRIDGE_LIVE_THOUGHTS` | `true` | Include separately extracted reasoning in API output |
 | `BRIDGE_TEMPORARY` | `false` | Request temporary Gemini conversations; skips continuation-cache reuse |
@@ -365,6 +376,8 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 | `BRIDGE_MAX_OLD_TOOL_CHARS` | `32000` | Compaction threshold for older tool-result messages |
 | `BRIDGE_HISTORY_OFFLOAD` | `true` | Upload older conversation turns as text attachments when inline budget is exceeded; `false` forces inline compaction only |
 | `BRIDGE_PERSONAL_CONTEXT` | `auto` | Personal context flag (`inner[67]`/`inner[68]`): `auto` (disabled in `bridge` mode, enabled in pure `web` mode), `on`, or `off` |
+| `BRIDGE_CONTEXT_WINDOW` | `1048576` | Fallback context window for models Google has not published limits for. Models with a documented limit always use the documented value |
+| `BRIDGE_MAX_OUTPUT_TOKENS` | `65536` | Fallback output limit, used on the same terms as `BRIDGE_CONTEXT_WINDOW` |
 | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `10` | Per-account requests-per-minute limit (`0` disables the limit) |
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | Per-account concurrent active stream limit (`0` disables the limit) |
 | `BRIDGE_ACCOUNT_STRATEGY` | `rotate` | Pool routing for the pool key. `rotate` keeps using one account until it is exhausted, banned, rate-limited, or failing, then advances to the next and wraps around. `lru` spreads load to the least recently used healthy account. `fill-first` drains the highest-priority account first |

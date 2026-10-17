@@ -809,6 +809,7 @@ func (ac *AccountClient) AvailableModels(ctx context.Context, force bool) (*Avai
 	capacity, capacityField := ComputeCapacity(tierFlags, capFlags)
 
 	models := make([]ModelInfo, 0, len(rawModels))
+	thinkingPolicy := ParseThinkingPolicy(payloadAt(pArr, 24))
 	for _, mdAny := range rawModels {
 		md, ok := mdAny.([]any)
 		if !ok || len(md) == 0 {
@@ -859,14 +860,16 @@ func (ac *AccountClient) AvailableModels(ctx context.Context, force bool) (*Avai
 		}
 
 		models = append(models, ModelInfo{
-			ModelID:       modelID,
-			ModelName:     modelName,
-			DisplayName:   disp,
-			Aliases:       aliases,
-			Description:   description,
-			Capacity:      capacity,
-			CapacityField: capacityField,
-			ModelNumber:   modelNumber,
+			ModelID:             modelID,
+			ModelName:           modelName,
+			DisplayName:         disp,
+			Aliases:             aliases,
+			Description:         description,
+			Capacity:            capacity,
+			CapacityField:       capacityField,
+			ModelNumber:         modelNumber,
+			ThinkingLevels:      thinkingPolicy[modelNumber],
+			ThinkingPolicyKnown: len(thinkingPolicy) > 0,
 		})
 	}
 
@@ -1029,6 +1032,13 @@ func intAt(arr []any, idx int) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func payloadAt(arr []any, idx int) any {
+	if idx >= 0 && idx < len(arr) {
+		return arr[idx]
+	}
+	return nil
 }
 
 func matchFirst(re *regexp.Regexp, s string) string {

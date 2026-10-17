@@ -638,6 +638,27 @@ func readJSONBody(w http.ResponseWriter, r *http.Request) (map[string]any, bool)
 	return body, true
 }
 
+// ThinkingLevelName maps the configured numeric thinking level to the effort name
+// advertised in model metadata. An unknown value yields "" so callers fall back to
+// the model's own default instead of advertising a level the daemon cannot apply.
+func ThinkingLevelName(level int) string {
+	for name, enum := range gemini.ThinkingLevels {
+		if enum == level {
+			return name
+		}
+	}
+	return ""
+}
+
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
 // BuildModelsPayload constructs the canonical /v1/models response object with
 // OpenAI, OpenRouter, and gsb capability metadata.
 func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
@@ -645,20 +666,30 @@ func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
 	if createdSec <= 0 {
 		createdSec = time.Now().Unix()
 	}
-	ctxWin := s.Cfg.ContextWindow
-	if ctxWin <= 0 {
-		ctxWin = 1048576
+	ctxWinFallback := s.Cfg.ContextWindow
+	if ctxWinFallback <= 0 {
+		ctxWinFallback = 1048576
 	}
-	maxOut := s.Cfg.MaxOutputTokens
-	if maxOut <= 0 {
-		maxOut = 65536
+	maxOutFallback := s.Cfg.MaxOutputTokens
+	if maxOutFallback <= 0 {
+		maxOutFallback = 65536
 	}
+	// The configured default is what requests without an explicit effort actually
+	// use, so it is what the metadata must advertise. Reporting a hardcoded "high"
+	// here would tell clients the opposite of the daemon's behaviour.
+	configuredDefault := ThinkingLevelName(s.Cfg.DefaultThinking)
 
 	data := make([]map[string]any, 0, len(models))
 	for _, x := range models {
 		caps := gemini.ResolveModelCapabilities(x)
 		isReasoning := caps.Reasoning
+		limits, limitsSource := gemini.ResolveModelLimits(x, ctxWinFallback, maxOutFallback)
+		ctxWin := limits.ContextWindow
+		maxOut := limits.MaxOutput
 		defThinkStr := caps.DefaultEffort
+		if isReasoning && configuredDefault != "" && containsString(caps.EffortLevels, configuredDefault) {
+			defThinkStr = configuredDefault
+		}
 		if defThinkStr == "" {
 			if isReasoning {
 				defThinkStr = "high"
@@ -671,13 +702,14 @@ func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
 			aliases = []string{}
 		}
 		var suppParams []string
-		var efforts []string
+		efforts := caps.EffortLevels
+		if efforts == nil {
+			efforts = []string{}
+		}
 		if isReasoning {
 			suppParams = []string{"tools", "tool_choice", "reasoning", "reasoning_effort", "max_tokens", "max_completion_tokens"}
-			efforts = gemini.SupportedThinkingEfforts
 		} else {
 			suppParams = []string{"tools", "tool_choice", "max_tokens", "max_completion_tokens"}
-			efforts = []string{}
 		}
 
 		entry := map[string]any{
@@ -737,6 +769,9 @@ func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
 				"defaultThinkingLevel":    defThinkStr,
 				"contextWindow":           ctxWin,
 				"maxOutput":               maxOut,
+				// "documented" means the number came from Google's published model
+				// page; "config" means it is the operator's configured fallback.
+				"limitsSource": limitsSource,
 			},
 		}
 		data = append(data, entry)

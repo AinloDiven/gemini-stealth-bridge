@@ -16,6 +16,18 @@ type ModelInfo struct {
 	Capacity      int      `json:"capacity"`
 	CapacityField int      `json:"capacityField"`
 	ModelNumber   int      `json:"modelNumber"`
+	// ThinkingLevels holds the thinking levels this model advertises upstream,
+	// ordered as the registry lists them. It is empty when the registry has no
+	// policy entry for the model, in which case capability detection falls back
+	// to name heuristics.
+	ThinkingLevels []string `json:"thinkingLevels,omitempty"`
+	// ThinkingLabels holds the human-readable label for each ThinkingLevels entry.
+	ThinkingLabels []string `json:"thinkingLabels,omitempty"`
+	// ThinkingPolicyKnown reports that the registry published a thinking policy
+	// and simply did not list this model. That is different from an older registry
+	// with no policy at all: an excluded model genuinely has no thinking levels,
+	// while a missing policy means we must fall back to name heuristics.
+	ThinkingPolicyKnown bool `json:"thinkingPolicyKnown,omitempty"`
 }
 
 // QuotaBucket represents one rate-limit/quota bucket returned by the qpEbW RPC.
@@ -35,6 +47,140 @@ type QuotaBucket struct {
 type ModelLimits struct {
 	ContextWindow int `json:"contextWindow"`
 	MaxOutput     int `json:"maxOutput"`
+}
+
+// documentedModelLimits holds the token limits Google publishes for each model
+// reachable through the Gemini web UI. Values come from the per-model pages under
+// ai.google.dev/gemini-api/docs/models and are keyed by the documented model id
+// derived from the registry's display name ("3.5 Flash-Lite" -> "gemini-3.5-flash-lite").
+//
+// They are deliberately per-model rather than one global number: a future model
+// with a smaller window must not silently inherit another model's limit.
+var documentedModelLimits = map[string]ModelLimits{
+	"gemini-3.5-flash-lite":  {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-3.8-flash":       {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-3.1-pro":         {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-3.1-pro-preview": {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-4-argon":         {ContextWindow: 1048576, MaxOutput: 65536},
+}
+
+// DocumentedModelKey derives the documented model id for a registry entry, e.g.
+// "3.5 Flash-Lite" becomes "gemini-3.5-flash-lite".
+func DocumentedModelKey(m ModelInfo) string {
+	name := strings.TrimSpace(m.DisplayName)
+	if name == "" {
+		name = strings.TrimSpace(m.ModelName)
+		name = strings.TrimPrefix(name, "gemini-")
+	}
+	slug := whitespaceRe.ReplaceAllString(strings.ToLower(name), "-")
+	if slug == "" {
+		return ""
+	}
+	return "gemini-" + slug
+}
+
+// ResolveModelLimits returns the documented limits for a model, falling back to
+// the supplied defaults when Google has not published limits for it yet. Source
+// reports which of the two was used so callers can tell a verified number from a
+// configured guess.
+func ResolveModelLimits(m ModelInfo, fallbackContext, fallbackOutput int) (ModelLimits, string) {
+	if lim, ok := documentedModelLimits[DocumentedModelKey(m)]; ok {
+		return lim, "documented"
+	}
+	if fallbackContext <= 0 {
+		fallbackContext = 1048576
+	}
+	if fallbackOutput <= 0 {
+		fallbackOutput = 65536
+	}
+	return ModelLimits{ContextWindow: fallbackContext, MaxOutput: fallbackOutput}, "config"
+}
+
+// ParseThinkingPolicy converts the otAQ7b field 24 policy entries into a map from
+// model number to the thinking levels that model advertises. Each entry looks like
+//
+//	[modelDescriptor, [[1,"Low","Quick and efficient",...],[4,"Medium",...],[2,"High",...]], null, [1]]
+//
+// where the first element of every level row is Google's Assistant_Lamda_ThinkingLevel
+// enum. Only levels whose enum matches a known name are returned, so an unknown
+// future enum is dropped rather than advertised with a guessed name.
+func ParseThinkingPolicy(policy any) map[int][]string {
+	out := make(map[int][]string)
+	rows, ok := policy.([]any)
+	if !ok || len(rows) < 2 {
+		return out
+	}
+	entries, ok := rows[1].([]any)
+	if !ok {
+		return out
+	}
+	for _, entryAny := range entries {
+		entry, ok := entryAny.([]any)
+		if !ok || len(entry) < 2 {
+			continue
+		}
+		desc, ok := entry[0].([]any)
+		if !ok {
+			continue
+		}
+		modelNumber, ok := intAt(desc, 1)
+		if !ok || modelNumber <= 0 {
+			continue
+		}
+		levelRows, ok := entry[1].([]any)
+		if !ok {
+			continue
+		}
+		levels := make([]string, 0, len(levelRows))
+		for _, rowAny := range levelRows {
+			row, ok := rowAny.([]any)
+			if !ok || len(row) == 0 {
+				continue
+			}
+			enum, ok := intAt(row, 0)
+			if !ok {
+				continue
+			}
+			if name, ok := ThinkingLevelName(enum); ok {
+				levels = append(levels, name)
+			}
+		}
+		if len(levels) > 0 {
+			out[modelNumber] = levels
+		}
+	}
+	return out
+}
+
+// pickDefaultEffort returns the level to advertise as default for a model that
+// lists levels. Google documents medium as the default where a model offers it;
+// otherwise the model's own ordering decides, so the answer is always a level the
+// model actually supports.
+func pickDefaultEffort(levels []string) string {
+	for _, l := range levels {
+		if l == "medium" {
+			return "medium"
+		}
+	}
+	if len(levels) > 0 {
+		return levels[0]
+	}
+	return ""
+}
+
+// ThinkingLevelName maps Google's Assistant_Lamda_ThinkingLevel enum back to its
+// effort name. The registry, not this table, is the source of truth for which
+// models expose which levels; this only names the values it sees.
+func ThinkingLevelName(enum int) (string, bool) {
+	switch enum {
+	case 1:
+		return "low", true
+	case 4:
+		return "medium", true
+	case 2:
+		return "high", true
+	}
+	return "", false
 }
 
 // ModelCapabilities describes the features and reasoning effort support of a model.
@@ -93,41 +239,48 @@ func IsReasoningModel(modelName string) bool {
 }
 
 // ResolveModelCapabilities returns the structured capabilities for a ModelInfo.
+//
+// When the registry advertised thinking levels for the model, those levels are
+// authoritative. When the registry published a policy but excluded this model,
+// the model has no thinking levels and must not be advertised as reasoning just
+// because its name contains "flash". Name heuristics remain as a fallback only
+// for registries that carry no thinking policy at all, and for the static list.
 func ResolveModelCapabilities(m ModelInfo) ModelCapabilities {
+	base := ModelCapabilities{
+		Vision:        true,
+		Tools:         true,
+		Search:        true,
+		DefaultEffort: "low",
+	}
+	if len(m.ThinkingLevels) > 0 {
+		base.Reasoning = true
+		base.EffortLevels = append([]string(nil), m.ThinkingLevels...)
+		// The advertised default must be one of the levels this model lists, or
+		// clients would send a value the model cannot represent. Google documents
+		// medium as the default where it is available.
+		base.DefaultEffort = pickDefaultEffort(m.ThinkingLevels)
+		return base
+	}
+	if m.ThinkingPolicyKnown {
+		// The registry answered and left this model out: it has no thinking modes.
+		return base
+	}
+
 	lowerName := strings.ToLower(strings.TrimSpace(m.ModelName))
 	lowerDisp := strings.ToLower(strings.TrimSpace(m.DisplayName))
 	if strings.Contains(lowerName, "lite") || strings.Contains(lowerDisp, "lite") {
-		return ModelCapabilities{
-			Reasoning:     false,
-			Vision:        true,
-			Tools:         true,
-			Search:        true,
-			EffortLevels:  nil,
-			DefaultEffort: "low",
-		}
+		return base
 	}
 	reasoning := IsReasoningModel(m.ModelName)
 	if !reasoning && m.DisplayName != "" {
 		reasoning = IsReasoningModel(m.DisplayName)
 	}
 	if reasoning {
-		return ModelCapabilities{
-			Reasoning:     true,
-			Vision:        true,
-			Tools:         true,
-			Search:        true,
-			EffortLevels:  SupportedThinkingEfforts,
-			DefaultEffort: "high",
-		}
+		base.Reasoning = true
+		base.EffortLevels = append([]string(nil), SupportedThinkingEfforts...)
+		base.DefaultEffort = "high"
 	}
-	return ModelCapabilities{
-		Reasoning:     false,
-		Vision:        true,
-		Tools:         true,
-		Search:        true,
-		EffortLevels:  nil,
-		DefaultEffort: "low",
-	}
+	return base
 }
 
 // ComputeCapacity derives the account's capacity and capacityField (12 or 13)
