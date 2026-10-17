@@ -57,6 +57,7 @@ Version `0.2.0` focuses on making daily coding-agent workflows smoother, keeping
 - **Lower detection surface in prompts and tool contracts**: Prompt text no longer asserts an API identity, lists internal platform tool names, or tells the model to ignore platform notices and claim unlimited turns. Reminders use a neutral `[Tool reminder: ...]` prefix and offloaded history uses `[Context note: ...]`; the parser accepts the older prefixes so existing sessions keep working.
 - **Per-account load control enabled by default**: `BRIDGE_MAX_RPM_PER_ACCOUNT` now defaults to `10` and `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` to `2`, so a single account is no longer hammered by unbounded parallelism. Set either to `0` to disable that limit. Two new knobs control prompt assembly: `BRIDGE_HISTORY_OFFLOAD` (`false` keeps oversized history inline instead of uploading text attachments) and `BRIDGE_PERSONAL_CONTEXT` (`auto`, `on`, or `off`, instead of inferring the flag from protocol mode).
 - **Account posture and quieter idle accounts**: `/v1/accounts` now reports provenance (`importedFrom`, `profileId`, `proxyConfigured`), load counters (`activeStreams`, `recentRpm`, `peakRpm`, `totalRequests`, `offloadRequests`), and `lastUsedAt`. Accounts idle for longer than two rotation intervals rotate cookies at half frequency, and `--import-chrome` prints an advisory when the selected browser profile is still open or when the `Default` profile is chosen implicitly.
+- **Selectable pool routing**: `BRIDGE_ACCOUNT_STRATEGY=lru` (default) spreads work to the least recently used healthy account, while `fill-first` drains one account before touching the next so a conversation stays on a single Gemini session. `BRIDGE_ACCOUNT_PRIORITY` sets the fill-first order. Both strategies still skip quarantined, quota-exhausted, and busy accounts, and both prefer the account holding the conversation's continuation cache.
 
 ## Quick start
 
@@ -317,6 +318,8 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 | `BRIDGE_PERSONAL_CONTEXT` | `auto` | Personal context flag (`inner[67]`/`inner[68]`): `auto` (disabled in `bridge` mode, enabled in pure `web` mode), `on`, or `off` |
 | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `10` | Per-account requests-per-minute limit (`0` disables the limit) |
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | Per-account concurrent active stream limit (`0` disables the limit) |
+| `BRIDGE_ACCOUNT_STRATEGY` | `lru` | Pool routing: `lru` spreads load to the least recently used healthy account, `fill-first` drains the highest-priority account before moving on |
+| `BRIDGE_ACCOUNT_PRIORITY` | Empty | Comma-separated account IDs used as the fill-first order; accounts outside the list follow load order |
 
 ### Timeouts and background work
 

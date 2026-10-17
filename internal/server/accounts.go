@@ -3,6 +3,11 @@ package server
 import (
 	"context"
 	"fmt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	"log"
 	"math"
 	"os"
@@ -12,11 +17,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 // SetAccounts replaces the server's loaded account list (used by tests).
@@ -714,7 +714,14 @@ func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]boo
 	var idleModel *gemini.ModelInfo
 	var busyCand *AccountState
 	var busyModel *gemini.ModelInfo
-	for _, cand := range accts {
+	candidates := accts
+	if s.fillFirst() {
+		ranks := s.accountRanks(accts)
+		candidates = make([]*AccountState, len(accts))
+		copy(candidates, accts)
+		sort.SliceStable(candidates, func(i, j int) bool { return ranks[candidates[i].ID] < ranks[candidates[j].ID] })
+	}
+	for _, cand := range candidates {
 		if tried[cand.ID] {
 			continue
 		}
@@ -843,6 +850,27 @@ func (s *Server) markAccountFailure(a *AccountState, msg string) {
 	a.mu.Unlock()
 }
 
+// accountRanks assigns a selection rank to every loaded account. Accounts named
+// in BRIDGE_ACCOUNT_PRIORITY keep the caller's order; the rest follow their load
+// order so fill-first stays deterministic without extra configuration.
+func (s *Server) accountRanks(accts []*AccountState) map[string]int {
+	ranks := make(map[string]int, len(accts))
+	base := len(s.Cfg.AccountPriority)
+	for i, a := range accts {
+		ranks[a.ID] = base + i
+	}
+	for i, id := range s.Cfg.AccountPriority {
+		if _, ok := ranks[id]; ok {
+			ranks[id] = i
+		}
+	}
+	return ranks
+}
+
+func (s *Server) fillFirst() bool {
+	return strings.EqualFold(strings.TrimSpace(s.Cfg.AccountStrategy), "fill-first")
+}
+
 func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requested string, hasher *prompt.HistoryHasher) *AccountState {
 	if scope.AccountID != "" {
 		for _, a := range accts {
@@ -864,6 +892,11 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 	bestBusy := false
 	bestHasCache := false
 	bestQuotaOK := false
+	fillFirst := s.fillFirst()
+	ranks := map[string]int(nil)
+	if fillFirst {
+		ranks = s.accountRanks(accts)
+	}
 	for _, a := range accts {
 		a.mu.RLock()
 		qState := a.Quarantined
@@ -924,7 +957,25 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 		best.mu.RLock()
 		bFails, bUsed := best.Fails, best.LastUsed
 		best.mu.RUnlock()
-		if aFails < bFails || (aFails == bFails && aUsed.Before(bUsed)) {
+		if aFails != bFails {
+			if aFails < bFails {
+				best = a
+				bestBusy = aBusy
+				bestHasCache = aHasCache
+				bestQuotaOK = aQuotaOK
+			}
+			continue
+		}
+		if fillFirst {
+			if ranks[a.ID] < ranks[best.ID] {
+				best = a
+				bestBusy = aBusy
+				bestHasCache = aHasCache
+				bestQuotaOK = aQuotaOK
+			}
+			continue
+		}
+		if aUsed.Before(bUsed) {
 			best = a
 			bestBusy = aBusy
 			bestHasCache = aHasCache
@@ -1133,12 +1184,12 @@ func (s *Server) prepareGeneration(
 		effortStr = "high"
 	}
 	opts := gemini.StreamOptions{
-		Model:         model,
-		ThinkingLevel: thinkLvl,
-		Temporary:     tempReq || s.Cfg.Temporary,
-		Language:      s.Cfg.Locale,
-		DisableTools:  !strings.EqualFold(s.Cfg.ProtocolMode, "web") || hasTools,
-		HasTools:      hasTools,
+		Model:           model,
+		ThinkingLevel:   thinkLvl,
+		Temporary:       tempReq || s.Cfg.Temporary,
+		Language:        s.Cfg.Locale,
+		DisableTools:    !strings.EqualFold(s.Cfg.ProtocolMode, "web") || hasTools,
+		HasTools:        hasTools,
 		ProtocolMode:    s.Cfg.ProtocolMode,
 		PersonalContext: s.Cfg.PersonalContext,
 	}

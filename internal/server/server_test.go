@@ -1095,7 +1095,7 @@ func TestContinuationCachedTokens(t *testing.T) {
 	}
 
 	// Also verify /v1/responses input_tokens_details.cached_tokens
-	respUsage := buildResponsesUsage( map[string]any{
+	respUsage := buildResponsesUsage(map[string]any{
 		"prompt_tokens":     400,
 		"completion_tokens": 50,
 		"total_tokens":      450,
@@ -1493,5 +1493,80 @@ func TestAccountsEndpointPostureAndIdleRotationBackoff(t *testing.T) {
 	acct.mu.RUnlock()
 	if nextRot.Sub(baseNow) < 18*time.Minute {
 		t.Fatalf("expected idle account rotation interval stretched to >= 18m, got %v", nextRot.Sub(baseNow))
+	}
+}
+
+func TestAccountStrategyFillFirstHonorsPriority(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.AccountTokens = nil
+	cfg.SessionCache = false
+	cfg.AccountStrategy = "fill-first"
+	cfg.AccountPriority = []string{"acctC", "acctA"}
+	srv := New(cfg)
+
+	mk := func(id string) *AccountState {
+		return &AccountState{
+			ID:       id,
+			Email:    id + "@example.com",
+			Models:   []gemini.ModelInfo{testModel},
+			ModelsAt: time.Now(),
+		}
+	}
+	acctA, acctB, acctC := mk("acctA"), mk("acctB"), mk("acctC")
+	srv.SetAccounts([]*AccountState{acctA, acctB, acctC})
+
+	// Fill-first must stick to the highest-priority healthy account regardless of LastUsed.
+	for i := 0; i < 4; i++ {
+		got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil)
+		if got == nil || got.ID != "acctC" {
+			t.Fatalf("iteration %d: expected acctC, got %+v", i, got)
+		}
+		got.mu.Lock()
+		got.LastUsed = time.Now().Add(time.Duration(i+1) * time.Hour)
+		got.mu.Unlock()
+	}
+
+	// When the preferred account is busy, selection must move to the next rank.
+	acctC.mu.Lock()
+	acctC.Quarantined = true
+	acctC.mu.Unlock()
+	got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil)
+	if got == nil || got.ID != "acctA" {
+		t.Fatalf("expected acctA after acctC quarantined, got %+v", got)
+	}
+
+	// Fallback order must follow the same ranking.
+	cand, _ := srv.pickFallbackAccount(srv.Accounts(), map[string]bool{"acctC": true}, "", testModel.ModelName, nil)
+	if cand == nil || cand.ID != "acctA" {
+		t.Fatalf("expected fallback to prefer acctA, got %+v", cand)
+	}
+}
+
+func TestAccountStrategyLRUIsDefault(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.AccountTokens = nil
+	cfg.SessionCache = false
+	srv := New(cfg)
+	if srv.fillFirst() {
+		t.Fatal("expected fill-first to be disabled by default")
+	}
+	mk := func(id string, used time.Time) *AccountState {
+		return &AccountState{
+			ID:       id,
+			Email:    id + "@example.com",
+			Models:   []gemini.ModelInfo{testModel},
+			ModelsAt: time.Now(),
+			LastUsed: used,
+		}
+	}
+	now := time.Now()
+	acctA := mk("acctA", now)
+	acctB := mk("acctB", now.Add(-time.Hour))
+	srv.SetAccounts([]*AccountState{acctA, acctB})
+	got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil)
+	if got == nil || got.ID != "acctB" {
+		t.Fatalf("expected LRU to pick the least recently used account acctB, got %+v", got)
 	}
 }

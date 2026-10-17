@@ -73,6 +73,8 @@ type Config struct {
 	MaxConcurrentPerAccount int
 	QuietHours              string
 	AccountGroups           map[string]string
+	AccountStrategy         string
+	AccountPriority         []string
 	HistoryOffload          bool
 	PersonalContext         string
 	EgressPerAccount        map[string]string
@@ -141,6 +143,8 @@ func FromEnv() *Config {
 	tlsExtOrder := envEnum("BRIDGE_TLS_EXT_ORDER", "fixed", []string{"fixed", "random"}, &warnings)
 	protocolMode := envEnum("BRIDGE_PROTOCOL_MODE", "bridge", []string{"bridge", "web"}, &warnings)
 	personalContext := envEnum("BRIDGE_PERSONAL_CONTEXT", "auto", []string{"auto", "off", "on"}, &warnings)
+	accountStrategy := envEnum("BRIDGE_ACCOUNT_STRATEGY", "lru", []string{"lru", "fill-first"}, &warnings)
+	accountPriority := parseCSVList(os.Getenv("BRIDGE_ACCOUNT_PRIORITY"))
 
 	ipv6Default := "auto"
 	if strings.TrimSpace(os.Getenv("BRIDGE_DISABLE_IPV6")) == "1" {
@@ -217,6 +221,8 @@ func FromEnv() *Config {
 		PersonalContext:         personalContext,
 		QuietHours:              quietHours,
 		AccountGroups:           accountGroups,
+		AccountStrategy:         accountStrategy,
+		AccountPriority:         accountPriority,
 		EgressPerAccount:        egressPerAccount,
 		Warnings:                warnings,
 	}
@@ -326,6 +332,22 @@ func envBool(key string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+// parseCSVList splits a comma- or semicolon-separated list, trimming blanks and
+// dropping duplicates while preserving the caller's order.
+func parseCSVList(raw string) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, item := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ';' }) {
+		v := strings.TrimSpace(item)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 func parseKeyValMap(raw string) map[string]string {
