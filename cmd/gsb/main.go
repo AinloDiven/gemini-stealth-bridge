@@ -208,6 +208,14 @@ func main() {
 		log.Printf("  transport: browserless Chrome uTLS + HTTP/2 (%s)", cfg.ImpersonateProfile)
 		log.Printf("  data:      %s (%d account(s) loaded)", cfg.HomeDir, loaded)
 		log.Printf("  models:    http://%s/v1/models", addr)
+		if loaded > 0 {
+			poolDesc := cfg.APIKey
+			if cfg.APIKey == "public" {
+				poolDesc = "public (no auth)"
+			}
+			log.Printf("  keys:      pool=%s across %d account(s), strategy=%s", poolDesc, loaded, cfg.AccountStrategy)
+			log.Printf("             account keys gsb-<name> pin a single account")
+		}
 		if loaded == 0 {
 			log.Printf("  WARNING:   no credentials found — run `gsb --login <name>` to sign in and capture a session, or place account files in %s", cfg.AccountsDir)
 		}
@@ -445,11 +453,18 @@ func openBrowserURL(url, browser, profileDir string) {
 }
 
 func printStandaloneConnectionInfo(cfg config.Config, acctName string) {
-	fmt.Printf("  base url: http://%s:%d/v1\n", cfg.Host, cfg.Port)
-	fmt.Printf("  api key : gsb-%s (or %s)\n", acctName, acctName)
-	fmt.Println("  note    : this session was captured from an already-signed-in browser.")
-	fmt.Println("            If Gemini later rejects it, run `gsb --login " + acctName + "` to sign in again")
-	fmt.Println("            instead of copying cookies from a browser that was never signed in.")
+	fmt.Printf("  base url    : http://%s:%d/v1\n", cfg.Host, cfg.Port)
+	fmt.Printf("  pool key    : %s", cfg.APIKey)
+	if cfg.APIKey == "public" {
+		fmt.Print("  (default; no auth, routes across every loaded account)")
+	} else {
+		fmt.Print("  (routes across every loaded account)")
+	}
+	fmt.Println()
+	fmt.Printf("  account key : gsb-%s (or %s)  (pins this account only, no failover)\n", acctName, acctName)
+	fmt.Println("  note        : this session was captured from an already-signed-in browser.")
+	fmt.Println("                If Gemini later rejects it, run `gsb --login " + acctName + "` to sign in again")
+	fmt.Println("                instead of copying cookies from a browser that was never signed in.")
 }
 
 func runUnquarantine(cfg config.Config, acctID string) error {

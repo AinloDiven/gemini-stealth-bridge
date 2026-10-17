@@ -1335,9 +1335,9 @@ func (s *Server) prepareGeneration(
 				return nil, transport.NewUpstreamError(fmt.Sprintf("all accounts are quarantined (last: %s)", r), 403, "account_banned", nil, nil)
 			}
 		}
-		msg := "this endpoint requires a per-account token; the admin key cannot serve chat"
+		msg := "this endpoint requires a pool key (BRIDGE_API_KEY) or an account key; no usable account is loaded for this request"
 		if scope.AccountID != "" {
-			msg = fmt.Sprintf("token is bound to account %q, which is not loaded", scope.AccountID)
+			msg = fmt.Sprintf("account key is bound to account %q, which is not loaded", scope.AccountID)
 		}
 		return nil, transport.NewUpstreamError(msg, 401, "authentication_error", nil, nil)
 	}

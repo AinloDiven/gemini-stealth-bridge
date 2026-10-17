@@ -31,7 +31,7 @@ The daemon runs without headless Chrome or CDP. Browserless transport is an impl
 | Image input | Base64 image data URLs and remote HTTPS images |
 | Thinking effort | Maps `low`, `medium`, and `high` to Gemini Web thinking levels |
 | Conversation history | Reuses Gemini continuation tokens when matching history is available; offloads older turns into text attachments when the inline prompt budget is exceeded |
-| Multiple accounts | Per-account keys, model discovery, quota checks, and account selection for unscoped requests |
+| Multiple accounts | Pool key routes across accounts with rotation; per-account keys pin one account. Includes model discovery, quota checks, and per-account isolation |
 | Session maintenance | Background cookie rotation and persistence of updated credentials |
 
 This is an unofficial bridge to the Gemini web app, not Google's supported Gemini Developer API or an OpenAI service. Changes to Google's web protocol, sign-in requirements, account restrictions, and quotas can interrupt operation. The transport does not guarantee protection from detection or account restrictions. Use only accounts you are authorized to access and review Google's applicable terms.
@@ -112,11 +112,18 @@ The default address is `http://127.0.0.1:20133`. Keep this default local-only se
 
 ### 4. Send a request
 
-In another terminal, list the models available to `acc1`:
+There are two kinds of key. Pick one:
+
+| Key | Value | Behavior |
+|---|---|---|
+| **Pool key** | `BRIDGE_API_KEY` (default `public`) | Routes each request across all loaded accounts using `BRIDGE_ACCOUNT_STRATEGY`. Use this normally |
+| **Account key** | `gsb-<name>` or `<name>` | Pins the request to that account and never fails over. Use this to test or isolate one account |
+
+List the models available to the pool:
 
 ```sh
 curl -sS http://127.0.0.1:20133/v1/models \
-  -H 'Authorization: Bearer gsb-acc1'
+  -H 'Authorization: Bearer public'
 ```
 
 Set `MODEL` to an `id` returned by that endpoint. `gemini-flash` below is an example, not a promise of availability:
@@ -124,12 +131,14 @@ Set `MODEL` to an `id` returned by that endpoint. `gemini-flash` below is an exa
 ```sh
 export MODEL=gemini-flash
 curl -sS http://127.0.0.1:20133/v1/chat/completions \
-  -H 'Authorization: Bearer gsb-acc1' \
+  -H 'Authorization: Bearer public' \
   -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK.\"}]}"
 ```
 
 Read the answer from `choices[0].message.content`. `/health` checks that the daemon is running; only a successful model request verifies upstream generation.
+
+`X-GSB-Account` in the response headers names the account that served the request, which is the quickest way to see the pool working. Replace `public` with `gsb-acc1` to pin the same request to one account.
 
 ## Account setup
 
@@ -230,15 +239,17 @@ Add `gsb` as an OpenAI-compatible provider in `9router`:
 | Base URL | `http://127.0.0.1:20133/v1` |
 | API type | Chat Completions (`chat`) or Responses (`responses`) |
 | Prefix | `gsb` |
-| Credential | `gsb-acc1`, or another key configured for that account |
+| Credential | Pool key (`BRIDGE_API_KEY`) to let `gsb` rotate accounts, or an account key (`gsb-acc1`) to pin one account |
 
 Add a separate provider credential for each account if you want the router to manage account selection. Point the coding agent at the router's URL with the router's own API key; use the model name/prefix exposed by the router, for example `gsb/gemini-flash`. The bridge also accepts the `gsb/` model prefix directly.
+
+**Prefer one connection with the pool key.** Account rotation belongs to `gsb` because it is the only component that knows per-account quota, quarantine state, and conversation continuation affinity. A router that spreads requests across per-account connections cannot see any of that: it only learns about exhaustion from a `429`, and it will move the next turn to a different account, discarding the cached Gemini session. Use per-account connections only when you deliberately want to pin traffic to one account.
 
 The base URL must be reachable **from the router process**. Inside a container, `127.0.0.1` refers to that container, not the host running `gsb`. Any non-loopback deployment needs the security measures below. If your router caches or overrides model limits, you can run `./scripts/check-router-metadata.sh <router-url> <api-key>` to verify that context and output limits are passed through intact.
 
 ## API usage
 
-The following examples assume the daemon is running, `acc1` is imported, and `MODEL` is set to an available model as shown in the quick start.
+The following examples assume the daemon is running, `acc1` is imported, and `MODEL` is set to an available model as shown in the quick start. They use `gsb-acc1` so the account serving each request is predictable. Replace it with your pool key (`BRIDGE_API_KEY`, `public` by default) to let `gsb` rotate across accounts.
 
 ### Streaming chat
 
@@ -295,14 +306,27 @@ All `/v1/*` endpoints below use the same authentication resolver. Account keys s
 
 ## Authentication and security
 
-The daemon listens on loopback by default. **`BRIDGE_API_KEY` defaults to `public`, and unauthenticated access is allowed in that mode.** Account-name keys are convenience routing keys, not strong secrets.
+The daemon listens on loopback by default. **`BRIDGE_API_KEY` defaults to `public`, and unauthenticated access is allowed in that mode.**
 
-- Imported accounts receive both `gsb-<name>` and `<name>` keys. These select a specific account.
-- A non-`public` `BRIDGE_API_KEY` enables a shared, unscoped key. It can access operational endpoints and generate responses, selecting among loaded accounts.
-- `BRIDGE_ACCOUNT_TOKENS` adds `token:account_id` mappings. It does not disable automatically registered account-name aliases for loaded files. Setting a shared secret or custom account tokens alone does not remove those predictable aliases.
+Two kinds of key exist, and they do different things:
+
+| | **Pool key** | **Account key** |
+|---|---|---|
+| Value | `BRIDGE_API_KEY` (default `public`) | `gsb-<name>` and `<name>` |
+| Scope | All loaded accounts | Exactly one account |
+| Account selection | Automatic, per `BRIDGE_ACCOUNT_STRATEGY` | None; the named account is always used |
+| Failover on quota, ban, or failure | Yes | No; the error is returned to the caller |
+| `/v1/accounts` and `/v1/quota` | All accounts | Only the named account |
+| Best for | Normal use, agents, routers | Testing one account, per-project quota isolation |
+
+Use the pool key unless you specifically need to pin an account. Pool routing is described under `BRIDGE_ACCOUNT_STRATEGY` below.
+
+- `BRIDGE_API_KEY=public` means the pool key is `public` and requests without a key are accepted. Set `BRIDGE_API_KEY` to a random value before exposing the daemon beyond loopback; the account keys then keep working alongside it.
+- Account keys are registered for every loaded account file. They are predictable from the filename, so treat them as routing aliases, not secrets. Setting a pool key does not remove them.
+- `BRIDGE_ACCOUNT_TOKENS` adds `token:account_id` mappings for custom account keys. It does not disable the automatically registered aliases.
 - `Authorization: Bearer <key>` is recommended. `x-api-key`, `x-goog-api-key`, and `?key=` are also accepted; query keys can leak into URL logs.
 - The daemon serves plain HTTP, not HTTPS. For access outside the local machine, use a private network/tunnel or an authenticated TLS reverse proxy that restricts access independently of the daemon's routing keys. Do not publish the port directly to an untrusted network.
-- Startup warns about a non-loopback bind with default authentication; it does **not** refuse to start. `/health` remains unauthenticated even when a shared key is set.
+- Startup warns about a non-loopback bind with default authentication; it does **not** refuse to start. `/health` remains unauthenticated even when a pool key is set.
 
 Account files contain Google session credentials and are written with mode `0600` on POSIX systems. The session cache also contains sensitive continuation metadata. Protect the whole data directory with OS permissions, exclude it from version control and shared backups, and do not paste cookies or account responses into issues. On Windows, use appropriate filesystem ACLs rather than relying on POSIX mode bits.
 
@@ -317,7 +341,7 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 | `HOST` | `127.0.0.1` | Listen address |
 | `PORT` | `20133` | Listen port |
 | `BRIDGE_HOME` | `~/.gemini-stealth-bridge` | Root for account files and continuation cache |
-| `BRIDGE_API_KEY` | `public` | Shared API key; default permits unauthenticated access |
+| `BRIDGE_API_KEY` | `public` | Pool key: routes across all accounts. Default `public` permits unauthenticated access |
 | `BRIDGE_ACCOUNT_TOKENS` | Empty | Comma- or semicolon-separated `token:account_id` mappings; account aliases remain available |
 | `CHROME_COOKIES` | Empty | Browser cookie database/profile hint for import/login; also enables a live-cookie fallback when no saved accounts load |
 | `CHROME_PASS` | Empty | Browser cookie-encryption password override, not your Google sign-in password; treat as a secret |
@@ -342,8 +366,12 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 | `BRIDGE_PERSONAL_CONTEXT` | `auto` | Personal context flag (`inner[67]`/`inner[68]`): `auto` (disabled in `bridge` mode, enabled in pure `web` mode), `on`, or `off` |
 | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `10` | Per-account requests-per-minute limit (`0` disables the limit) |
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | Per-account concurrent active stream limit (`0` disables the limit) |
-| `BRIDGE_ACCOUNT_STRATEGY` | `rotate` | Pool routing: `rotate` keeps using one account until it is exhausted, banned, rate-limited, or failing, then advances to the next and wraps around; `lru` spreads load to the least recently used healthy account; `fill-first` drains the highest-priority account first |
+| `BRIDGE_ACCOUNT_STRATEGY` | `rotate` | Pool routing for the pool key. `rotate` keeps using one account until it is exhausted, banned, rate-limited, or failing, then advances to the next and wraps around. `lru` spreads load to the least recently used healthy account. `fill-first` drains the highest-priority account first |
 | `BRIDGE_ACCOUNT_PRIORITY` | Empty | Comma-separated account IDs used as the `fill-first` order; ignored by `rotate` and `lru` |
+
+All three strategies share the same eligibility rules. An account is skipped when it is quarantined after an upstream restriction, when its cached quota shows the requested model exhausted, when its per-account RPM or concurrency limit is reached, or when it failed within the last 60 seconds. An account that already holds the conversation's continuation cache is preferred, so a multi-turn conversation stays on one Gemini session even when the pool rotates. A failed account is retried after its cooldown instead of being demoted permanently.
+
+`rotate` is the default because it keeps one Gemini session per conversation and leaves the other accounts at full quota as standby. It does not reclaim an earlier account the moment that account recovers; it continues forward from the current position. Use `fill-first` when you want a fixed preferred account to take traffic again as soon as it is healthy.
 
 ### Timeouts and background work
 
@@ -393,7 +421,7 @@ Run `./gsb` directly for predictable environment handling. The optional Bash hel
 | Symptom | What to check |
 |---|---|
 | `503 auth_unavailable` / no accounts configured | Connect an account with `gsb --login <name>`; ensure the daemon and the import use the same `BRIDGE_HOME`; reload with `/v1/refresh` or restart |
-| `401 authentication_error` | Confirm the key, account filename, shared-key setting, and whether the mapped account is loaded |
+| `401 authentication_error` | Confirm the key: pool key is `BRIDGE_API_KEY`, account keys are `gsb-<name>` or `<name>`. Check the account filename and whether that account is loaded |
 | Cookie import/decryption failure | Run `gsb --login <name>` instead; cookie import only works when that browser profile is already signed in. If decryption itself fails, unlock the keyring or use a cookie export |
 | Bootstrap/sign-in failure | Open Gemini Web with the same account, complete any Google sign-in checks, then re-import |
 | `401 upstream_auth_error` / `code 1016` on a previously working account | The saved session expired. Run `gsb --login <name>`, complete sign-in, then `gsb --probe`. Re-exporting the same browser cookies will not help |
