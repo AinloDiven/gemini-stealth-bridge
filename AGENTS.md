@@ -67,3 +67,13 @@ Do not tell users to create one router connection per account. Account rotation 
 Every strategy skips quarantined accounts, accounts whose cached quota shows the requested model exhausted, accounts at their RPM/concurrency limit, and accounts that failed in the last 60 seconds. All strategies prefer the account holding the conversation's continuation cache. A failed account becomes eligible again after its cooldown; it is not demoted permanently.
 
 `rotate` does not jump back to an earlier account as soon as that account recovers — it continues forward from the current position. If a user expects traffic to return to a preferred account immediately after a quota reset, that is `fill-first`, not `rotate`.
+
+## Checking account status and quota
+
+```sh
+gsb --accounts --accounts-live
+```
+
+Or query `GET /v1/accounts` on the running daemon. Each account includes a computed `status` (`ok`, `exhausted`, `expired`, `quarantined`, `cooling`, `degraded`, `unknown`) and `statusReason`.
+
+Gemini enforces two limits at once: a rolling ~5-hour window and a weekly cap. The upstream quota RPC only exposes the rolling ~5-hour window (`quotaWindow.weeklyExposed: false`), so a nonzero remaining count does not prove the weekly cap has room. When a model repeatedly fails despite remaining 5-hour quota, `gsb` escalates its cooldown (`1m → 5m → 15m → 1h → 6h → 24h`) and marks the account `exhausted` (`still exhausted after N retries`).

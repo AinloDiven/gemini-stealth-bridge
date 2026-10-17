@@ -23,11 +23,9 @@ import (
 func (s *Server) SetAccounts(accts []*AccountState) {
 	s.mu.Lock()
 	s.accounts = accts
-	if len(s.Cfg.AccountTokens) == 0 {
-		for _, a := range accts {
-			if a != nil && a.ID != "" {
-				s.registerAccountTokensLocked(a.ID, a.ID)
-			}
+	for _, a := range accts {
+		if a != nil && a.ID != "" {
+			s.registerAccountTokensLocked(a.ID, a.ID)
 		}
 	}
 	s.mu.Unlock()
@@ -113,6 +111,52 @@ func (s *Server) LoadCredentials() int {
 	deduped := dedupeAccounts(rawList, credFile)
 
 	s.mu.Lock()
+	existingByID := make(map[string]*AccountState, len(s.accounts))
+	for _, a := range s.accounts {
+		if a != nil && a.ID != "" {
+			existingByID[a.ID] = a
+		}
+	}
+	for i, st := range deduped {
+		prev, ok := existingByID[st.ID]
+		if !ok || prev == nil || !strings.EqualFold(prev.Email, st.Email) {
+			continue
+		}
+		prev.mu.Lock()
+		recaptured := (!st.CapturedAt.IsZero() && st.CapturedAt.After(prev.CapturedAt)) ||
+			(prev.Quarantined && !st.Quarantined)
+		prev.FilePath = st.FilePath
+		prev.CapturedAt = st.CapturedAt
+		if !st.RotatedAt.IsZero() && st.RotatedAt.After(prev.RotatedAt) {
+			prev.RotatedAt = st.RotatedAt
+		}
+		prev.ImportedFrom = st.ImportedFrom
+		prev.ProfileID = st.ProfileID
+		prev.AccountGroup = st.AccountGroup
+		prev.ProxyURL = st.ProxyURL
+		prev.Quarantined = st.Quarantined
+		prev.QuarantineReason = st.QuarantineReason
+		if len(st.Surfaces) > 0 {
+			if prev.Surfaces == nil {
+				prev.Surfaces = make(map[string]string, len(st.Surfaces))
+			}
+			for k, v := range st.Surfaces {
+				prev.Surfaces[k] = v
+			}
+		}
+		if recaptured {
+			prev.Fails = 0
+			prev.LastFail = time.Time{}
+			prev.LastError = ""
+			prev.ModelsError = nil
+		}
+		prev.mu.Unlock()
+		if ac, ok := prev.Client.(*gemini.AccountClient); ok {
+			ac.ReloadFromDiskIfNewer()
+			ac.SetRuntimeOptions(s.Cfg.Locale, s.Cfg.BLOverride, s.Cfg.ProtocolMode, st.AccountGroup, st.ProxyURL)
+		}
+		deduped[i] = prev
+	}
 	s.accounts = deduped
 	// Auto-populate gsb-<id> (and raw <id>) so 9router and direct harnesses work out of the box.
 	byEmail := make(map[string]string, len(deduped))

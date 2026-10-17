@@ -167,6 +167,13 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 func (ac *AccountClient) SetProvenance(cookieDB, profileHint string) {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
+	ac.capturedAt = time.Now().UTC().Format(time.RFC3339)
+	ac.quarantined = false
+	ac.quarantineReason = ""
+	if ac.surfaces == nil {
+		ac.surfaces = make(map[string]string)
+	}
+	ac.surfaces["geminiWeb"] = "ok"
 	if cookieDB != "" {
 		ac.cookieDB = cookieDB
 	}

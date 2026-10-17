@@ -106,7 +106,7 @@ func main() {
 		return
 	}
 
-	if *listAccounts {
+	if *listAccounts || *accountsLive {
 		runAccountsTable(cfg, *accountsLive)
 		return
 	}
@@ -136,10 +136,12 @@ func main() {
 	}
 
 	lock, lockErr := config.AcquireLock(cfg.HomeDir)
-	if lockErr != nil {
+	if lockErr != nil && !*probeOnce {
 		log.Fatalf("[lock] %v", lockErr)
 	}
-	defer func() { _ = lock.Release() }()
+	if lock != nil {
+		defer func() { _ = lock.Release() }()
+	}
 
 	srv := server.New(cfg)
 	loaded := srv.LoadCredentials()
@@ -274,7 +276,7 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 		return err
 	}
 	if cookies.ExtractSAPISID(hdr) == "" {
-		return fmt.Errorf("no SAPISID cookie found in %s — sign in to gemini.google.com first, then re-run --import-chrome", dbPath)
+		return fmt.Errorf("no SAPISID cookie found in %s — sign in to gemini.google.com first (e.g. `gsb --login %s`), then try again", dbPath, acctName)
 	}
 	if res, resErr := cookies.ReadBrowserCookies(dbPath); resErr == nil {
 		if hint := cookies.SessionCookieHint(res, 7*24*time.Hour); hint != "" {

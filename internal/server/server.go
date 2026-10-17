@@ -213,9 +213,13 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 	explicitTokens := len(s.Cfg.AccountTokens) > 0
 	s.mu.RUnlock()
 
-	// Hot-load newly added account files on the fly when not locked by explicit BRIDGE_ACCOUNT_TOKENS,
-	// rate-limited to avoid disk/SQLite scans on repeated invalid tokens.
-	if token != "" && !explicitTokens && (strings.HasPrefix(token, "gsb-") || reSafeID.MatchString(token)) {
+	isPoolKey := (s.Cfg.APIKey == "public" && (token == "" || token == "public")) ||
+		(s.Cfg.APIKey != "public" && token == s.Cfg.APIKey)
+
+	// Hot-load newly added account files on the fly when an unknown account token
+	// arrives and explicit token lock is not enabled, rate-limited to once per 2s
+	// to avoid disk scans on repeated invalid tokens or pool-key requests.
+	if !isPoolKey && token != "" && !explicitTokens && (strings.HasPrefix(token, "gsb-") || reSafeID.MatchString(token)) {
 		s.mu.RLock()
 		canReload := time.Since(s.lastHotLoadAt) >= 2*time.Second
 		s.mu.RUnlock()

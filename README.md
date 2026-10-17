@@ -52,7 +52,7 @@ Version `0.2.0` focuses on making daily coding-agent workflows smoother, keeping
 - **Model metadata that matches reality**: `/v1/models` now reports the thinking levels each model actually advertises upstream, the default the daemon really applies, and the token limits Google publishes for that specific model. Previously every model inherited one global context window, thinking levels came from name heuristics (so `flash-lite` was wrongly listed as non-reasoning), and the advertised default was hardcoded `high` even when the daemon ran `medium`.
 - **Faster streaming & lower prompt overhead**: Tool definitions are compacted before being injected into the prompt so agents with many tools waste less context, while keep-alive pings and optional early SSE headers prevent clients and reverse proxies from timing out during long thinking phases.
 - **Accurate cached-token & CJK usage reporting**: When `gsb` reuses a conversation continuation or processes CJK text, token usage now reflects both the script density and the tokens saved by session caching (`cached_tokens`), giving coding agents a much more realistic view of your context budget.
-- **Smarter recovery when an account is busy or downgraded**: Instead of failing immediately when you send overlapping requests to a single account, `gsb` briefly waits for the active stream to finish. When Gemini Web silently downgrades a model, backoff now starts small (1 minute) and clears automatically as soon as the model responds normally again.
+- **Smarter recovery when an account is busy or downgraded**: Instead of failing immediately when you send overlapping requests to a single account, `gsb` briefly waits for the active stream to finish. When Gemini Web silently downgrades or exhausts a model, backoff starts small (`1m → 5m → 15m`) for rolling 5-hour limits, escalates to hour scale (`1h → 6h → 24h`) when repeated failures indicate the weekly cap, and clears automatically as soon as the model responds normally again.
 - **Safer session lifecycle & account protection**: A single-writer lock prevents two `gsb` instances from corrupting the same credential directory, expired browser cookies are filtered out during import, in-flight requests no longer overwrite freshly rotated cookies, and accounts that hit an upstream restriction are automatically quarantined instead of being retried in a loop.
 - **Lower detection surface in prompts and tool contracts**: Prompt text no longer asserts an API identity, lists internal platform tool names, or tells the model to ignore platform notices and claim unlimited turns. Reminders use a neutral `[Tool reminder: ...]` prefix and offloaded history uses `[Context note: ...]`; the parser accepts the older prefixes so existing sessions keep working.
 - **Per-account load control enabled by default**: `BRIDGE_MAX_RPM_PER_ACCOUNT` now defaults to `10` and `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` to `2`, so a single account is no longer hammered by unbounded parallelism. Set either to `0` to disable that limit. Two new knobs control prompt assembly: `BRIDGE_HISTORY_OFFLOAD` (`false` keeps oversized history inline instead of uploading text attachments) and `BRIDGE_PERSONAL_CONTEXT` (`auto`, `on`, or `off`, instead of inferring the flag from protocol mode).
@@ -60,6 +60,7 @@ Version `0.2.0` focuses on making daily coding-agent workflows smoother, keeping
 - **Selectable pool routing**: `BRIDGE_ACCOUNT_STRATEGY=rotate` (default) stays on one account until it is exhausted, banned, rate-limited, or failing, then moves to the next account and wraps around, so a conversation keeps a single Gemini session and idle accounts retain their full quota. `lru` spreads work to the least recently used healthy account, and `fill-first` drains a fixed priority order set by `BRIDGE_ACCOUNT_PRIORITY`. Every strategy still skips quarantined, quota-exhausted, rate-limited, and busy accounts, prefers the account holding the conversation's continuation cache, and lets a failed account reclaim its turn after a 60-second cooldown.
 - **Clearer guidance for expired sessions**: `--import-chrome` now warns when the selected browser profile holds expired or soon-to-expire Google session cookies, and auth failures tell you to run `gsb --login <name>` and sign in again rather than re-exporting the same stale cookies. Import output repeats the same advice.
 - **Streaming survives long thinking turns**: buffered streaming used to hold the response headers until Gemini produced its first frame, so a slow thinking model could exceed a reverse proxy's response-header timeout (9router gives up at 120s). Headers now flush as soon as the served model id is verified, with `BRIDGE_EARLY_SSE_GRACE_MS` (default 20s) as a fallback while downgrade verification continues on the stream body. Time-to-first-token still measures the first real token rather than the header flush.
+- **Honest account status & quota scope**: `/v1/accounts` and `gsb --accounts` (`--accounts-live`) report a single computed `status` (`ok`, `exhausted`, `expired`, `quarantined`, `cooling`, `degraded`, `unknown`) with `statusReason`, `lastError`, `lastFailAt`, and `quotaWindow` metadata stating plainly that upstream RPC quota numbers only cover the rolling ~5-hour window while the weekly cap is not exposed.
 
 ## Quick start
 
@@ -224,9 +225,9 @@ Configure any client that supports a custom OpenAI-compatible endpoint:
 | Setting | Value |
 |---|---|
 | Base URL | `http://127.0.0.1:20133/v1` |
-| API key | `gsb-acc1` for the account imported as `acc1` |
+| API key | Pool key (`BRIDGE_API_KEY`, default `public`) for automatic rotation/failover, or `gsb-acc1` to pin `acc1` |
 | API mode | Chat Completions or Responses, matching the client's adapter |
-| Model | An ID from `GET /v1/models` using the same account key |
+| Model | An ID from `GET /v1/models` using the same key |
 
 Choose Chat Completions for clients that consume `choices` / `tool_calls`, or Responses for clients that consume `output` items and `response.*` events. Client support for reasoning fields varies. OpenAI compatibility does not imply that every coding agent or every client-specific feature has been tested.
 
@@ -307,10 +308,9 @@ All `/v1/*` endpoints below use the same authentication resolver. Account keys s
 | `GET` | `/health` | Unauthenticated daemon status and account/model counts; does not prove upstream readiness |
 | `GET` | `/readyz` | Readiness probe reporting per-account `models_fresh`, `quota_fresh`, `auth_ok`, and `quarantined` (`?strict=1` returns HTTP `503` when no healthy account is available) |
 | `GET` | `/v1/models` | Model IDs, per-model documented token limits, registry-discovered thinking levels, and OpenRouter/OpenAI capability metadata (`ETag` / `If-None-Match` caching; `?fresh=1` forces live discovery) |
-| `GET` | `/v1/accounts` | Per-account computed `status` with `statusReason`, last error, load counters, quota buckets, and `quotaWindow` describing which limit the numbers cover |
 | `POST` | `/v1/chat/completions` | Chat messages, tools, images, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
 | `POST` | `/v1/responses` | Responses input, instructions, tools, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
-| `GET` | `/v1/accounts` | Account IDs, email addresses, provenance (`importedFrom`, `profileId`, `proxyConfigured`), timestamps, quarantine state, surfaces, models, cached quotas, and load telemetry (`activeStreams`, `recentRpm`, `peakRpm`, `totalRequests`, `offloadRequests`, `lastUsedAt`) |
+| `GET` | `/v1/accounts` | Account IDs, email addresses, computed `status` and `statusReason`, `lastError`/`lastFailAt`, provenance (`importedFrom`, `profileId`, `proxyConfigured`), timestamps, quarantine state, surfaces, models, cached quotas, `quotaWindow` metadata, and load telemetry (`activeStreams`, `recentRpm`, `peakRpm`, `totalRequests`, `offloadRequests`, `lastUsedAt`) |
 | `GET` | `/v1/quota` | Cached or live (`?fresh=1`) upstream quota buckets for scoped accounts |
 | `GET` | `/v1/sessions` | Transport session status and continuation cache hit/miss counters |
 | `POST` | `/v1/refresh` | Reloads credential files and refreshes the model registry across the daemon |
@@ -360,7 +360,7 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 | `CHROME_PASS` | Empty | Browser cookie-encryption password override, not your Google sign-in password; treat as a secret |
 | `BRIDGE_PROXY_SERVER` | Empty | Outbound HTTP or SOCKS5 proxy URL for Gemini transport |
 | `BRIDGE_IMPERSONATE` | `chrome_150_psk` | uTLS profile; alternatives include `chrome_146`, `chrome_133`, `firefox_135`, and `safari_18_0` |
-| `BRIDGE_DISABLE_IPV6` | Enabled | IPv6 is disabled in the Gemini transport unless this is exactly `0` |
+| `BRIDGE_IPV6` | `auto` | IPv6 transport mode: `auto`, `off` (disables IPv6; also set by `BRIDGE_DISABLE_IPV6=1`), or `on` |
 | `BRIDGE_ALLOW_PRIVATE_IMAGE_URLS` | Disabled | Exactly `1` permits private/loopback image destinations; weakens SSRF protection, so leave unset for untrusted requests |
 
 ### Generation and history
@@ -401,7 +401,7 @@ Duration values are in milliseconds.
 | `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Timeout between upstream generation frames |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Overall request timeout |
 | `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Background cookie rotation interval; accounts idle longer than two intervals rotate at half frequency (clamped to 60s–3600s) |
-| `BRIDGE_MODEL_REFRESH_MS` | `600000` | Model/quota refresh interval |
+| `BRIDGE_MODEL_REFRESH_MS` | `1800000` | Model/quota refresh interval |
 | `BRIDGE_IDLE_SESSION_MS` | `180000` | Idle transport-session expiry |
 | `BRIDGE_MAX_SESSIONS` | `16` | Transport session-pool limit |
 | `BRIDGE_MAX_QUEUE` | `4` | Per-session wait-queue bound |
@@ -449,7 +449,7 @@ curl -sS -X POST http://127.0.0.1:20133/v1/refresh \
 
 `--probe` bootstraps configured accounts and prints model/quota details; inspect per-account errors, not just the command's exit status. `--rotate` attempts cookie renewal, but cannot restore a revoked Google session. Re-import credentials when sign-in is required.
 
-Run `./gsb` directly for predictable environment handling. The optional Bash helper `./start.sh` builds a missing/outdated binary, then starts it. It also rewrites `BRIDGE_ACCOUNT_TOKENS` from account filenames when files exist, replacing a caller-supplied mapping; avoid it when managing custom token mappings.
+Run `./gsb` directly for predictable environment handling. The optional Bash helper `./start.sh` builds a missing or outdated binary when a Go toolchain is available (or runs the existing binary if not) and starts the daemon.
 
 ### Common failures
 

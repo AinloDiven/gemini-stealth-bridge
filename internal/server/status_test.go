@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 )
 
@@ -259,5 +262,134 @@ func TestAccountsEndpointExposesStatusAndQuotaWindow(t *testing.T) {
 	}
 	if got.QuotaWindow["weeklyExposed"] != false {
 		t.Fatal("weeklyExposed must be false: the RPC does not expose it")
+	}
+}
+
+func TestPoolKeyRequestDoesNotWipeInMemoryAccountState(t *testing.T) {
+	home := t.TempDir()
+	acctsDir := filepath.Join(home, "accounts")
+	t0 := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Second)
+	if _, err := cookies.SaveCredentialFile(filepath.Join(acctsDir, "acc1.json"), cookies.CredentialFile{
+		Name:       "acc1",
+		Email:      "acc1@example.com",
+		Cookies:    "SAPISID=sap1; __Secure-1PSID=p1",
+		CapturedAt: t0.Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("SaveCredentialFile: %v", err)
+	}
+
+	cfg := config.Load()
+	cfg.HomeDir = home
+	cfg.AccountsDir = acctsDir
+	cfg.APIKey = "public"
+	cfg.AccountTokens = nil
+	srv := New(cfg)
+	t.Cleanup(func() { srv.FlushSessionCacheNow() })
+
+	if n := srv.LoadCredentials(); n != 1 {
+		t.Fatalf("LoadCredentials = %d, want 1", n)
+	}
+	accts := srv.Accounts()
+	accts[0].mu.Lock()
+	accts[0].Client = &mockUpstream{}
+	accts[0].Models = []gemini.ModelInfo{testModel}
+	accts[0].ModelsAt = time.Now()
+	accts[0].Quota = []gemini.QuotaBucket{
+		{ID: "11", Label: "Gemini Flash", Total: 100, Remaining: 42, ResetAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)},
+	}
+	accts[0].subStrikes["sub:gemini-pro"] = 4
+	accts[0].totalRequests = 7
+	accts[0].mu.Unlock()
+
+	// Sending a pool-key request ("Bearer public") must not trigger hot-load or
+	// replace the loaded AccountState with a blank struct from disk.
+	req := httptest.NewRequest(http.MethodGet, "/v1/accounts", nil)
+	req.Header.Set("Authorization", "Bearer public")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	after := srv.Accounts()[0]
+	after.mu.RLock()
+	gotModels := len(after.Models)
+	gotQuota := len(after.Quota)
+	gotStrikes := after.subStrikes["sub:gemini-pro"]
+	gotReqs := after.totalRequests
+	after.mu.RUnlock()
+
+	if gotModels != 1 || gotQuota != 1 || gotStrikes != 4 || gotReqs != 7 {
+		t.Fatalf("in-memory account state wiped by pool-key request: models=%d quota=%d strikes=%d reqs=%d",
+			gotModels, gotQuota, gotStrikes, gotReqs)
+	}
+}
+
+func TestLoadCredentialsPreservesRuntimeStateAndClearsOnRecapture(t *testing.T) {
+	home := t.TempDir()
+	acctsDir := filepath.Join(home, "accounts")
+	t0 := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Second)
+	acc1Path := filepath.Join(acctsDir, "acc1.json")
+	if _, err := cookies.SaveCredentialFile(acc1Path, cookies.CredentialFile{
+		Name:       "acc1",
+		Email:      "acc1@example.com",
+		Cookies:    "SAPISID=sap1; __Secure-1PSID=p1",
+		CapturedAt: t0.Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("SaveCredentialFile acc1: %v", err)
+	}
+
+	cfg := config.Load()
+	cfg.HomeDir = home
+	cfg.AccountsDir = acctsDir
+	srv := New(cfg)
+	t.Cleanup(func() { srv.FlushSessionCacheNow() })
+	srv.LoadCredentials()
+
+	acc1 := srv.Accounts()[0]
+	acc1.mu.Lock()
+	acc1.Models = []gemini.ModelInfo{testModel}
+	acc1.subStrikes["sub:gemini-pro"] = 5
+	acc1.Fails = 2
+	acc1.LastError = "upstream_auth_error: session expired (code 1016)"
+	acc1.mu.Unlock()
+
+	// Adding a second account and reloading must preserve acc1's runtime state.
+	if _, err := cookies.SaveCredentialFile(filepath.Join(acctsDir, "acc2.json"), cookies.CredentialFile{
+		Name:       "acc2",
+		Email:      "acc2@example.com",
+		Cookies:    "SAPISID=sap2; __Secure-1PSID=p2",
+		CapturedAt: t0.Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("SaveCredentialFile acc2: %v", err)
+	}
+	if n := srv.LoadCredentials(); n != 2 {
+		t.Fatalf("LoadCredentials = %d, want 2", n)
+	}
+	acc1.mu.RLock()
+	if len(acc1.Models) != 1 || acc1.subStrikes["sub:gemini-pro"] != 5 || acc1.Fails != 2 {
+		acc1.mu.RUnlock()
+		t.Fatalf("acc1 state not preserved across reload: models=%d strikes=%d fails=%d",
+			len(acc1.Models), acc1.subStrikes["sub:gemini-pro"], acc1.Fails)
+	}
+	acc1.mu.RUnlock()
+
+	// Re-capturing acc1 with a newer CapturedAt must clear its expired error state.
+	t1 := t0.Add(5 * time.Minute)
+	if _, err := cookies.SaveCredentialFile(acc1Path, cookies.CredentialFile{
+		Name:       "acc1",
+		Email:      "acc1@example.com",
+		Cookies:    "SAPISID=sap1_new; __Secure-1PSID=p1_new",
+		CapturedAt: t1.Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("SaveCredentialFile acc1 recaptured: %v", err)
+	}
+	srv.LoadCredentials()
+	acc1.mu.RLock()
+	gotFails := acc1.Fails
+	gotErr := acc1.LastError
+	acc1.mu.RUnlock()
+	if gotFails != 0 || gotErr != "" {
+		t.Fatalf("expected recapture to clear fails/error, got fails=%d err=%q", gotFails, gotErr)
 	}
 }

@@ -287,7 +287,7 @@ func SaveCredentialFile(path string, cred CredentialFile) (int64, error) {
 		if cred.Email == "" {
 			cred.Email = prev.Email
 		}
-		if prev.CapturedAt != "" {
+		if cred.CapturedAt == "" && prev.CapturedAt != "" {
 			cred.CapturedAt = prev.CapturedAt
 		}
 		if cred.CookieDB == "" {

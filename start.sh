@@ -11,18 +11,6 @@ mkdir -p "$ACCOUNTS_DIR"
 export BRIDGE_HOME="$DIR"
 export PORT="${PORT:-20133}"
 
-pairs=""
-for f in "$ACCOUNTS_DIR"/*.json; do
-  [ -e "$f" ] || continue
-  id="$(basename "$f" .json)"
-  [ -n "$pairs" ] && pairs="$pairs,"
-  pairs="${pairs}gsb-${id}:${id},${id}:${id}"
-done
-
-if [ -n "$pairs" ]; then
-  export BRIDGE_ACCOUNT_TOKENS="$pairs"
-fi
-
 needs_build=0
 if [ ! -x "./gsb" ]; then
   needs_build=1
