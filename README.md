@@ -58,6 +58,7 @@ Version `0.2.0` focuses on making daily coding-agent workflows smoother, keeping
 - **Per-account load control enabled by default**: `BRIDGE_MAX_RPM_PER_ACCOUNT` now defaults to `10` and `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` to `2`, so a single account is no longer hammered by unbounded parallelism. Set either to `0` to disable that limit. Two new knobs control prompt assembly: `BRIDGE_HISTORY_OFFLOAD` (`false` keeps oversized history inline instead of uploading text attachments) and `BRIDGE_PERSONAL_CONTEXT` (`auto`, `on`, or `off`, instead of inferring the flag from protocol mode).
 - **Account posture and quieter idle accounts**: `/v1/accounts` now reports provenance (`importedFrom`, `profileId`, `proxyConfigured`), load counters (`activeStreams`, `recentRpm`, `peakRpm`, `totalRequests`, `offloadRequests`), and `lastUsedAt`. Accounts idle for longer than two rotation intervals rotate cookies at half frequency, and `--import-chrome` prints an advisory when the selected browser profile is still open or when the `Default` profile is chosen implicitly.
 - **Selectable pool routing**: `BRIDGE_ACCOUNT_STRATEGY=rotate` (default) stays on one account until it is exhausted, banned, rate-limited, or failing, then moves to the next account and wraps around, so a conversation keeps a single Gemini session and idle accounts retain their full quota. `lru` spreads work to the least recently used healthy account, and `fill-first` drains a fixed priority order set by `BRIDGE_ACCOUNT_PRIORITY`. Every strategy still skips quarantined, quota-exhausted, rate-limited, and busy accounts, prefers the account holding the conversation's continuation cache, and lets a failed account reclaim its turn after a 60-second cooldown.
+- **Clearer guidance for expired sessions**: `--import-chrome` now warns when the selected browser profile holds expired or soon-to-expire Google session cookies, and auth failures tell you to run `gsb --login <name>` and sign in again rather than re-exporting the same stale cookies. Import output repeats the same advice.
 
 ## Quick start
 
@@ -170,6 +171,15 @@ The same payload can be supplied on stdin:
 ```
 
 The helper opens Gemini Web and waits for terminal input. Sign in, then press Enter to import from the selected local profile, or paste a cookie header / single-line JSON export. It does not automatically detect completion of login. Without a profile hint, the opened default browser and the auto-detected cookie profile may differ.
+
+Prefer `--login` over copying cookies out of a browser that was never signed in to Gemini. A profile that has not completed Google sign-in holds cookies that expire within minutes, so an import can look successful and then fail almost immediately with `401 upstream_auth_error` or `code 1016`. Signing in first, then capturing, is the reliable path:
+
+1. Run `./gsb --login <name>` and complete Google sign-in in the opened browser, including any 2FA or "verify it's you" prompt.
+2. Open `https://gemini.google.com/app` and send one message, so the session is fully established.
+3. Press Enter in the terminal to capture the session.
+4. Run `./gsb --probe` and confirm the account reports models without an auth error.
+
+If an account later starts failing with an expired-session error, repeat the login instead of re-exporting the same stale cookies. `./gsb --rotate` only renews rotating cookies such as `__Secure-1PSIDTS`; it cannot restore a revoked or never-established sign-in.
 
 ### Additional accounts
 
@@ -372,6 +382,7 @@ Run `./gsb` directly for predictable environment handling. The optional Bash hel
 | `401 authentication_error` | Confirm the key, account filename, shared-key setting, and whether the mapped account is loaded |
 | Cookie import/decryption failure | Select the correct profile and OS user; unlock the keyring where applicable, or use a cookie export |
 | Bootstrap/sign-in failure | Open Gemini Web with the same account, complete any Google sign-in checks, then re-import |
+| `401 upstream_auth_error` / `code 1016` on a previously working account | The saved session expired. Run `gsb --login <name>`, complete sign-in, then `gsb --probe`. Re-exporting the same browser cookies will not help |
 | `404 model_not_found` | Query `/v1/models` with the same key; do not assume another account's model is available |
 | `429` quota/rate-limit error | Inspect `/v1/quota`; wait for reset or choose an account/model with available quota |
 | `429 model_substitution` | Gemini served a different model and downgrade rejection is enabled; retry after checking quota or explicitly select an available model |

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	"log"
 	"net/url"
 	"regexp"
@@ -12,8 +14,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 const (
@@ -516,7 +516,7 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 			return transport.NewUpstreamError("account banned or restricted upstream (TOS_VIOLATION / PERMISSION_DENIED)", 403, "account_banned", res.Headers, nil)
 		}
 		return transport.NewUpstreamError(
-			"could not extract SNlM0e (at token); session may be expired",
+			"could not extract SNlM0e (at token); the saved session is expired or incomplete — run `gsb --login <name>` to sign in again, then re-import (browser cookie exports copied without signing in usually expire immediately)",
 			401,
 			"upstream_auth_error",
 			res.Headers,
@@ -777,7 +777,7 @@ func (ac *AccountClient) AvailableModels(ctx context.Context, force bool) (*Avai
 	}
 
 	if isStatus1016(p) {
-		return nil, transport.NewUpstreamError("session is unauthenticated or cookies have expired (code 1016)", 401, "upstream_auth_error", res.Headers, nil)
+		return nil, transport.NewUpstreamError("session is unauthenticated or the saved cookies have expired (code 1016) — run `gsb --login <name>` to sign in again and re-import the account", 401, "upstream_auth_error", res.Headers, nil)
 	}
 
 	pArr, ok := p.([]any)

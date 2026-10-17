@@ -46,6 +46,65 @@ type CookieRow struct {
 	ExpiresAt int64
 }
 
+// LongLivedSessionCookies are the Google cookies that indicate whether a
+// browser profile was actually signed in. Short-lived rotating cookies such as
+// __Secure-1PSIDTS are deliberately excluded so routine rotation never triggers
+// a freshness warning.
+var LongLivedSessionCookies = []string{
+	"SID", "HSID", "SSID", "APISID", "SAPISID",
+	"__Secure-1PSID", "__Secure-3PSID",
+}
+
+// ExpiringCookies returns the long-lived session cookies in res that are already
+// expired or expire within the given window. An empty result means the export
+// looks usable for at least that long.
+func ExpiringCookies(res *ReadResult, within time.Duration) []CookieRow {
+	if res == nil {
+		return nil
+	}
+	wanted := make(map[string]bool, len(LongLivedSessionCookies))
+	for _, n := range LongLivedSessionCookies {
+		wanted[n] = true
+	}
+	cutoff := time.Now().Add(within).Unix()
+	var out []CookieRow
+	for _, c := range res.Cookies {
+		if !wanted[c.Name] || c.ExpiresAt <= 0 {
+			continue
+		}
+		if c.ExpiresAt <= cutoff {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// SessionCookieHint summarizes why a cookie export is likely to fail, or returns
+// an empty string when the long-lived session cookies look healthy.
+func SessionCookieHint(res *ReadResult, within time.Duration) string {
+	expiring := ExpiringCookies(res, within)
+	if len(expiring) == 0 {
+		return ""
+	}
+	now := time.Now()
+	var expired, soon []string
+	for _, c := range expiring {
+		if c.ExpiresAt <= now.Unix() {
+			expired = append(expired, c.Name)
+			continue
+		}
+		soon = append(soon, c.Name)
+	}
+	switch {
+	case len(expired) > 0 && len(soon) > 0:
+		return fmt.Sprintf("%s expired and %s expire soon", strings.Join(expired, ", "), strings.Join(soon, ", "))
+	case len(expired) > 0:
+		return fmt.Sprintf("%s expired", strings.Join(expired, ", "))
+	default:
+		return fmt.Sprintf("%s expire soon", strings.Join(soon, ", "))
+	}
+}
+
 // ReadResult summarizes a browser cookie DB extraction.
 type ReadResult struct {
 	Cookies     []CookieRow

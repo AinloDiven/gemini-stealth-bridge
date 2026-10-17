@@ -243,7 +243,13 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 		return err
 	}
 	if cookies.ExtractSAPISID(hdr) == "" {
-		return fmt.Errorf("no SAPISID cookie found in %s — sign in to gemini.google.com first", dbPath)
+		return fmt.Errorf("no SAPISID cookie found in %s — sign in to gemini.google.com first, then re-run --import-chrome", dbPath)
+	}
+	if res, resErr := cookies.ReadBrowserCookies(dbPath); resErr == nil {
+		if hint := cookies.SessionCookieHint(res, 7*24*time.Hour); hint != "" {
+			fmt.Printf("Warning: %s in this browser profile. A profile that is not signed in to Gemini Web produces cookies that expire almost immediately.\n", hint)
+			fmt.Printf("         Prefer `gsb --login %s` so you sign in first and the session is captured afterwards.\n", acctName)
+		}
 	}
 	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
 	srv := server.New(cfg)
@@ -426,6 +432,9 @@ func openBrowserURL(url, browser, profileDir string) {
 func printStandaloneConnectionInfo(cfg config.Config, acctName string) {
 	fmt.Printf("  base url: http://%s:%d/v1\n", cfg.Host, cfg.Port)
 	fmt.Printf("  api key : gsb-%s (or %s)\n", acctName, acctName)
+	fmt.Println("  note    : this session was captured from an already-signed-in browser.")
+	fmt.Println("            If Gemini later rejects it, run `gsb --login " + acctName + "` to sign in again")
+	fmt.Println("            instead of copying cookies from a browser that was never signed in.")
 }
 
 func runUnquarantine(cfg config.Config, acctID string) error {

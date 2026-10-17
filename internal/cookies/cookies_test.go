@@ -378,3 +378,50 @@ func TestDetectActiveProfileLock(t *testing.T) {
 		t.Fatalf("expected lock %q, got %q", lockPath, got)
 	}
 }
+
+func TestSessionCookieHint(t *testing.T) {
+	now := time.Now()
+	mk := func(name string, exp time.Time) CookieRow {
+		return CookieRow{Name: name, ExpiresAt: exp.Unix()}
+	}
+
+	t.Run("healthy session has no hint", func(t *testing.T) {
+		res := &ReadResult{Cookies: []CookieRow{
+			mk("SID", now.Add(365*24*time.Hour)),
+			mk("SAPISID", now.Add(365*24*time.Hour)),
+			// A rotating cookie near expiry must not trigger a warning.
+			mk("__Secure-1PSIDTS", now.Add(time.Minute)),
+		}}
+		if hint := SessionCookieHint(res, 7*24*time.Hour); hint != "" {
+			t.Fatalf("expected no hint, got %q", hint)
+		}
+	})
+
+	t.Run("expired long-lived cookie is reported", func(t *testing.T) {
+		res := &ReadResult{Cookies: []CookieRow{
+			mk("SID", now.Add(-time.Hour)),
+			mk("SAPISID", now.Add(365*24*time.Hour)),
+		}}
+		hint := SessionCookieHint(res, 7*24*time.Hour)
+		if !strings.Contains(hint, "SID") || !strings.Contains(hint, "expired") {
+			t.Fatalf("expected expired SID hint, got %q", hint)
+		}
+	})
+
+	t.Run("soon-to-expire cookie is reported", func(t *testing.T) {
+		res := &ReadResult{Cookies: []CookieRow{
+			mk("__Secure-1PSID", now.Add(24*time.Hour)),
+		}}
+		hint := SessionCookieHint(res, 7*24*time.Hour)
+		if !strings.Contains(hint, "expire soon") {
+			t.Fatalf("expected expire-soon hint, got %q", hint)
+		}
+	})
+
+	t.Run("cookies without expiry are ignored", func(t *testing.T) {
+		res := &ReadResult{Cookies: []CookieRow{{Name: "SID", ExpiresAt: 0}}}
+		if hint := SessionCookieHint(res, 7*24*time.Hour); hint != "" {
+			t.Fatalf("expected no hint for a session cookie, got %q", hint)
+		}
+	})
+}
