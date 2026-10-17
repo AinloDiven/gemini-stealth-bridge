@@ -54,6 +54,9 @@ Version `0.2.0` focuses on making daily coding-agent workflows smoother, keeping
 - **Accurate cached-token & CJK usage reporting**: When `gsb` reuses a conversation continuation or processes CJK text, token usage now reflects both the script density and the tokens saved by session caching (`cached_tokens`), giving coding agents a much more realistic view of your context budget.
 - **Smarter recovery when an account is busy or downgraded**: Instead of failing immediately when you send overlapping requests to a single account, `gsb` briefly waits for the active stream to finish. When Gemini Web silently downgrades a model, backoff now starts small (1 minute) and clears automatically as soon as the model responds normally again.
 - **Safer session lifecycle & account protection**: A single-writer lock prevents two `gsb` instances from corrupting the same credential directory, expired browser cookies are filtered out during import, in-flight requests no longer overwrite freshly rotated cookies, and accounts that hit an upstream restriction are automatically quarantined instead of being retried in a loop.
+- **Lower detection surface in prompts and tool contracts**: Prompt text no longer asserts an API identity, lists internal platform tool names, or tells the model to ignore platform notices and claim unlimited turns. Reminders use a neutral `[Tool reminder: ...]` prefix and offloaded history uses `[Context note: ...]`; the parser accepts the older prefixes so existing sessions keep working.
+- **Per-account load control enabled by default**: `BRIDGE_MAX_RPM_PER_ACCOUNT` now defaults to `10` and `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` to `2`, so a single account is no longer hammered by unbounded parallelism. Set either to `0` to disable that limit. Two new knobs control prompt assembly: `BRIDGE_HISTORY_OFFLOAD` (`false` keeps oversized history inline instead of uploading text attachments) and `BRIDGE_PERSONAL_CONTEXT` (`auto`, `on`, or `off`, instead of inferring the flag from protocol mode).
+- **Account posture and quieter idle accounts**: `/v1/accounts` now reports provenance (`importedFrom`, `profileId`, `proxyConfigured`), load counters (`activeStreams`, `recentRpm`, `peakRpm`, `totalRequests`, `offloadRequests`), and `lastUsedAt`. Accounts idle for longer than two rotation intervals rotate cookies at half frequency, and `--import-chrome` prints an advisory when the selected browser profile is still open or when the `Default` profile is chosen implicitly.
 
 ## Quick start
 
@@ -258,7 +261,7 @@ All `/v1/*` endpoints below use the same authentication resolver. Account keys s
 | `GET` | `/v1/models` | Model IDs, OpenRouter/OpenAI limits, and capability metadata (`ETag` / `If-None-Match` caching; `?fresh=1` forces live discovery) |
 | `POST` | `/v1/chat/completions` | Chat messages, tools, images, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
 | `POST` | `/v1/responses` | Responses input, instructions, tools, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
-| `GET` | `/v1/accounts` | Account IDs, email addresses, timestamps, quarantine state, surfaces, models, and cached quotas |
+| `GET` | `/v1/accounts` | Account IDs, email addresses, provenance (`importedFrom`, `profileId`, `proxyConfigured`), timestamps, quarantine state, surfaces, models, cached quotas, and load telemetry (`activeStreams`, `recentRpm`, `peakRpm`, `totalRequests`, `offloadRequests`, `lastUsedAt`) |
 | `GET` | `/v1/quota` | Cached or live (`?fresh=1`) upstream quota buckets for scoped accounts |
 | `GET` | `/v1/sessions` | Transport session status and continuation cache hit/miss counters |
 | `POST` | `/v1/refresh` | Reloads credential files and refreshes the model registry across the daemon |
@@ -324,7 +327,7 @@ Duration values are in milliseconds.
 | `BRIDGE_FIRST_BYTE_TIMEOUT_MS` | `60000` | Initial upstream response timeout |
 | `BRIDGE_STALL_TIMEOUT_MS` | `90000` | Timeout between upstream generation frames |
 | `BRIDGE_STREAM_TIMEOUT_MS` | `600000` | Overall request timeout |
-| `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Background cookie rotation interval |
+| `BRIDGE_ROTATE_COOKIES_MS` | `540000` | Background cookie rotation interval; accounts idle longer than two intervals rotate at half frequency (clamped to 60s–3600s) |
 | `BRIDGE_MODEL_REFRESH_MS` | `600000` | Model/quota refresh interval |
 | `BRIDGE_IDLE_SESSION_MS` | `180000` | Idle transport-session expiry |
 | `BRIDGE_MAX_SESSIONS` | `16` | Transport session-pool limit |
