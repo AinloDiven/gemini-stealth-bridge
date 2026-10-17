@@ -3,11 +3,11 @@ package gemini
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 // GeneratedImage represents a generated image returned inside a StreamGenerate frame.
@@ -84,8 +84,8 @@ var (
 			"(?:final\\s+answer|answer|response|最终答案|最終答案|最终回答|最終回答|回答|答案|최종\\s*답변|답변)" +
 			"(?:\\*\\*|__)?\\s*[:：]\\s*",
 	)
-	harnessReminderRe       = regexp.MustCompile(`(?is)^\s*\[(?:Harness|Tool) reminder:(?:[\s\S]*?block\.\]|[^\]\n]*\])\s*`)
-	assistantPrefixRe       = regexp.MustCompile(`(?i)^\s*Assistant:\s*`)
+	harnessReminderRe = regexp.MustCompile(`(?is)^\s*\[(?:Harness|Tool) reminder:(?:[\s\S]*?block\.\]|[^\]\n]*\])\s*`)
+	assistantPrefixRe = regexp.MustCompile(`(?i)^\s*Assistant:\s*`)
 )
 
 const (

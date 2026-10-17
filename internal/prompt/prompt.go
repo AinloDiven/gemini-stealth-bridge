@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	"io"
 	"net"
 	"net/http"
@@ -20,8 +22,6 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 var (

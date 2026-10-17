@@ -3,13 +3,13 @@ package gemini
 import (
 	"context"
 	"errors"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
+	fhttp "github.com/bogdanfinn/fhttp"
 	"io"
 	"strings"
 	"testing"
 	"unicode/utf8"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
-	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 func TestParseFrameLineSkipsNullKeepaliveAndExtractsMetadata(t *testing.T) {
@@ -342,10 +342,10 @@ func BenchmarkSanitizeCandidateTextAndThoughts_24KBStream(b *testing.B) {
 
 func TestMultilingualThinkingExtraction(t *testing.T) {
 	cases := []struct {
-		name         string
-		rawText      string
-		wantThought  string
-		wantText     string
+		name        string
+		rawText     string
+		wantThought string
+		wantText    string
 	}{
 		{
 			name:        "SimplifiedChineseWithFullwidthColon",
@@ -471,7 +471,7 @@ func TestConcurrentStreamCookieGenerationGuard(t *testing.T) {
 	pool := transport.NewPool(transport.PoolOptions{
 		ClientConfig: transport.ClientConfig{CustomDoer: doer},
 		MaxSessions:  2,
-		MaxQueue:    4,
+		MaxQueue:     4,
 	})
 	ac := NewAccountClient("acct_gen", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=initial_ts", "", pool, cookies.NewRotator())
 	ac.SetTokens("at_valid", "bl_valid", "fsid_1")

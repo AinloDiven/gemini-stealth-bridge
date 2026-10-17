@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	fhttp "github.com/bogdanfinn/fhttp"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,7 +13,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 type stubDoer struct {
