@@ -1837,3 +1837,82 @@ func TestGraceDisabledKeepsHeadersBuffered(t *testing.T) {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
 }
+
+func TestHeadersFlushOnVerifiedIdentity(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.EarlySSEGrace = 5 * time.Second
+
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			time.Sleep(200 * time.Millisecond)
+			// Identity frame without text: the model is proven, the answer is not ready.
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c1",
+				RID:             "r1",
+				AnsweredModelID: testModel.ModelID,
+			})
+			time.Sleep(300 * time.Millisecond)
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c1",
+				RID:             "r1",
+				AnsweredModelID: testModel.ModelID,
+				Frames:          []gemini.Frame{makeFrame("hello", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	acct.Client = client
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	start := time.Now()
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gemini-pro","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer audit")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("expected headers on identity verification (~200ms) instead of the 5s grace, got %v", elapsed)
+	}
+}
+
+func TestDowngradeStillReturnsHTTPError(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.EarlySSEGrace = 5 * time.Second
+
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			_ = onFrame(&gemini.LineParseResult{
+				CID:                "c1",
+				RID:                "r1",
+				AnsweredModelID:    "zzzzzzzzzzzzzzzz",
+				AnsweredModelLabel: "3.5 Flash-Lite",
+				Frames:             []gemini.Frame{makeFrame("wrong model", "", true, "zzzzzzzzzzzzzzzz")},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	acct.Client = client
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gemini-pro","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer audit")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 200 {
+		t.Fatal("expected a non-200 status for a downgraded model, got 200")
+	}
+}

@@ -398,6 +398,12 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						if sentText != "" && !strings.HasPrefix(text, sentText) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
+						// A matching served-model id proves no downgrade is in progress, so
+						// the headers no longer need to be held for an HTTP error. Flushing
+						// here keeps latency low without weakening downgrade detection.
+						if !headersSent && servedID != "" && !identityConflict && gemini.IsMatchingServedModel(*model, servedID, servedLabel) {
+							startStream(false)
+						}
 						identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && (servedID != "" || gemini.IsMatchingServedModel(*model, servedID, servedLabel) || servedID == ""))
 						if identityVerified && s.Cfg.LiveThoughts {
 							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {

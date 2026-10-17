@@ -803,6 +803,11 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
 						// Thoughts are normalized monotonically via mergeStreamedThoughts.
+						// A matching served-model id proves no downgrade is in progress, so
+						// the headers no longer need to be held for an HTTP error.
+						if !headersSent && servedID != "" && !identityConflict && gemini.IsMatchingServedModel(*model, servedID, servedLabel) {
+							startStream(false)
+						}
 						identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && (servedID == "" || gemini.IsMatchingServedModel(*model, servedID, servedLabel)))
 						if identityVerified && s.Cfg.LiveThoughts {
 							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
