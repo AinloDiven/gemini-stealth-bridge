@@ -425,3 +425,135 @@ func TestSessionCookieHint(t *testing.T) {
 		}
 	})
 }
+
+func TestParseProfileHint_Arc(t *testing.T) {
+	cases := []struct {
+		in          string
+		wantBrowser string
+		wantProfile string
+	}{
+		{"/Users/alice/Library/Application Support/Arc/User Data/Default", "arc", "Default"},
+		{"/Users/alice/Library/Application Support/Arc/User Data/Default/Network/Cookies", "arc", "Default"},
+		{`C:\Users\alice\AppData\Local\Packages\TheBrowserCompany.Arc_abc123\LocalCache\Local\Arc\User Data\Default`, "arc", "Default"},
+		{`C:\Users\alice\AppData\Local\Packages\TheBrowserCompany.Arc_abc123\LocalCache\Local\Arc\User Data\Profile 2\Network\Cookies`, "arc", "Profile 2"},
+		{"arc", "arc", "Default"},
+		{"arc:Profile 3", "arc", "Profile 3"},
+	}
+	for _, tc := range cases {
+		b, p := ParseProfileHint(tc.in)
+		if b != tc.wantBrowser || p != tc.wantProfile {
+			t.Errorf("ParseProfileHint(%q) = (%q, %q), want (%q, %q)", tc.in, b, p, tc.wantBrowser, tc.wantProfile)
+		}
+	}
+}
+
+func TestBrowserFromDBPath(t *testing.T) {
+	cases := map[string]string{
+		"/Users/a/Library/Application Support/Arc/User Data/Default/Network/Cookies":                                       "arc",
+		`C:\Users\a\AppData\Local\Packages\TheBrowserCompany.Arc_x\LocalCache\Local\Arc\User Data\Default\Network\Cookies`: "arc",
+		"/home/a/.config/google-chrome/Default/Cookies":                                                                    "chrome",
+		"/home/a/.config/BraveSoftware/Brave-Browser/Default/Cookies":                                                      "brave",
+		"/home/a/.config/chromium/Default/Cookies":                                                                         "chromium",
+		"/tmp/unknown/Cookies": "",
+	}
+	for in, want := range cases {
+		if got := browserFromDBPath(in); got != want {
+			t.Errorf("browserFromDBPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestKeychainServicesFor(t *testing.T) {
+	arcPath := "/Users/a/Library/Application Support/Arc/User Data/Default/Network/Cookies"
+	got := keychainServicesFor(arcPath)
+	if len(got) != 1 || got[0] != "Arc Safe Storage" {
+		t.Fatalf("Arc keychain services = %v, want [Arc Safe Storage]", got)
+	}
+	chromePath := "/Users/a/Library/Application Support/Google/Chrome/Default/Network/Cookies"
+	got = keychainServicesFor(chromePath)
+	if len(got) != 1 || got[0] != "Chrome Safe Storage" {
+		t.Fatalf("Chrome keychain services = %v, want [Chrome Safe Storage]", got)
+	}
+	// Unknown path falls back to every known Chromium fork.
+	if got := keychainServicesFor("/tmp/unknown/Cookies"); len(got) < 5 {
+		t.Fatalf("expected fallback to list all Safe Storage services, got %v", got)
+	}
+}
+
+func TestFindBrowserCookieDB_Arc(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("LOCALAPPDATA", filepath.Join(tmp, "AppData", "Local"))
+
+	arcProfile := filepath.Join(tmp, "Library", "Application Support", "Arc", "User Data", "Default")
+	if err := os.MkdirAll(filepath.Join(arcProfile, "Network"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	arcCookies := filepath.Join(arcProfile, "Network", "Cookies")
+	if err := os.WriteFile(arcCookies, []byte("sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := FindBrowserCookieDB("arc")
+	if err != nil || got != arcCookies {
+		t.Fatalf("FindBrowserCookieDB(arc) = %q, %v; want %q", got, err, arcCookies)
+	}
+
+	// Windows MSIX layout must be discovered too.
+	winArc := filepath.Join(tmp, "AppData", "Local", "Packages", "TheBrowserCompany.Arc_xyz", "LocalCache", "Local", "Arc", "User Data", "Default", "Network")
+	if err := os.MkdirAll(winArc, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	winCookies := filepath.Join(winArc, "Cookies")
+	if err := os.WriteFile(winCookies, []byte("sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = FindBrowserCookieDB(`%LOCALAPPDATA%\Packages\TheBrowserCompany.Arc_xyz\LocalCache\Local\Arc\User Data\Default`)
+	if err != nil || got != winCookies {
+		t.Fatalf("Windows Arc profile dir = %q, %v; want %q", got, err, winCookies)
+	}
+}
+
+func TestFindChromeCookieDB_PrefersSignedInProfile(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	t.Setenv("LOCALAPPDATA", filepath.Join(tmp, "AppData", "Local"))
+
+	mk := func(rel string, withSAPISID bool) string {
+		dir := filepath.Join(tmp, rel)
+		if err := os.MkdirAll(filepath.Join(dir, "Network"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		dbPath := filepath.Join(dir, "Network", "Cookies")
+		db, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT)`); err != nil {
+			t.Fatal(err)
+		}
+		if withSAPISID {
+			if _, err := db.Exec(`INSERT INTO cookies (host_key, name, value) VALUES ('.google.com', 'SAPISID', 'x')`); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return dbPath
+	}
+
+	// Chrome exists but was never signed in; Arc is signed in.
+	chromeDB := mk(filepath.Join("Library", "Application Support", "Google", "Chrome", "Default"), false)
+	arcDB := mk(filepath.Join("Library", "Application Support", "Arc", "User Data", "Default"), true)
+
+	if !hasSAPISIDCookieRow(arcDB) {
+		t.Fatal("expected Arc DB to report a SAPISID row")
+	}
+	if hasSAPISIDCookieRow(chromeDB) {
+		t.Fatal("expected Chrome DB to report no SAPISID row")
+	}
+	if got := FindChromeCookieDB(""); got != arcDB {
+		t.Fatalf("FindChromeCookieDB auto-detect = %q, want signed-in Arc profile %q", got, arcDB)
+	}
+}

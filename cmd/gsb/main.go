@@ -50,7 +50,7 @@ func init() {
 func main() {
 	var (
 		loginAcct        = flag.String("login", "", "Interactive browser sign-in to capture a fresh session into ~/.gemini-stealth-bridge/accounts/<name>.json")
-		importChrome     = flag.String("import-chrome", "", "Import Google cookies from local Chrome/Brave/Chromium/Edge/Firefox SQLite DB into accounts/<name>.json")
+		importChrome     = flag.String("import-chrome", "", "Import Google cookies from local Chrome/Brave/Chromium/Edge/Vivaldi/Arc/Firefox SQLite DB into accounts/<name>.json")
 		cookieDB         = flag.String("cookie-db", "", "Explicit path to browser Cookies SQLite database or profile directory for --import-chrome / --login")
 		chromeProfile    = flag.String("chrome-profile", "", "Browser profile name (e.g. \"Profile 4\"), profile directory, or Cookies SQLite path for --import-chrome / --login")
 		importCookie     = flag.String("import-cookie", "", "Import raw Cookie header or Cookie-Editor JSON from --cookie-value, --cookie-file, or stdin into accounts/<name>.json")
@@ -261,7 +261,7 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 			dbPath = cookies.FindChromeCookieDB("")
 		}
 		if dbPath == "" {
-			return fmt.Errorf("could not locate Chrome/Brave/Chromium Cookies SQLite database")
+			return fmt.Errorf("could not locate a Chrome/Chromium-family Cookies SQLite database (known: chrome, chromium, brave, edge, vivaldi, arc); pass --chrome-profile or --cookie-db")
 		}
 	}
 	if strings.TrimSpace(explicitDB) == "" && strings.TrimSpace(cfg.CookieDB) == "" {
@@ -388,6 +388,19 @@ func findBrowserBinary(browser string) string {
 			rels = []string{`Vivaldi\Application\vivaldi.exe`}
 		case "chromium":
 			rels = []string{`Chromium\Application\chrome.exe`}
+		case "arc":
+			// Arc ships as an MSIX package; the executable lives under a
+			// versioned package directory.
+			for _, root := range roots {
+				if root == "" {
+					continue
+				}
+				matches, _ := filepath.Glob(filepath.Join(root, "Packages", "TheBrowserCompany.Arc_*", "LocalCache", "Local", "Arc", "Arc.exe"))
+				if len(matches) > 0 {
+					return matches[0]
+				}
+			}
+			rels = nil
 		default:
 			rels = []string{`Google\Chrome\Application\chrome.exe`}
 		}
@@ -413,6 +426,8 @@ func findBrowserBinary(browser string) string {
 			names = []string{"vivaldi", "vivaldi-stable"}
 		case "chromium":
 			names = []string{"chromium", "chromium-browser"}
+		case "arc":
+			names = []string{"arc", "arc-browser"}
 		default:
 			names = []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser"}
 		}
@@ -438,6 +453,15 @@ func openBrowserURL(url, browser, profileDir string) {
 				appName = "Vivaldi"
 			case "chromium":
 				appName = "Chromium"
+			case "arc":
+				appName = "Arc"
+			}
+			if strings.EqualFold(browser, "arc") {
+				// Arc has no Chrome-style --profile-directory switch; opening
+				// the URL in the app is enough.
+				if err := exec.Command("open", "-a", appName, url).Start(); err == nil {
+					return
+				}
 			}
 			cmd := exec.Command("open", "-a", appName, "--args", "--profile-directory="+profileDir, url)
 			if err := cmd.Start(); err == nil {

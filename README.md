@@ -182,7 +182,19 @@ Despite its name, `--import-chrome` also recognizes other Chromium browsers and 
 
 `--chrome-profile` also accepts a directory or cookie database path. `--cookie-db` takes precedence when both are supplied.
 
-Decryption depends on the browser, OS, and access to the browser's encryption keys. Linux keyring-backed cookies may require `secret-tool` and an unlocked desktop keyring. macOS Keychain is not queried automatically; use `CHROME_PASS` with the browser's cookie-encryption password or import an export. Windows DPAPI decryption requires the same Windows user context; App-Bound (`v20`) encryption requires a manual export. A detected database is not a guarantee that its cookies can be decrypted.
+Arc is supported too. On macOS its profile lives at `~/Library/Application Support/Arc/User Data`; on Windows it lives under the MSIX package directory `%LOCALAPPDATA%\Packages\TheBrowserCompany.Arc_*\LocalCache\Local\Arc\User Data` (auto-detected via glob):
+
+```sh
+# macOS
+./gsb --import-chrome acc1 --cookie-db "$HOME/Library/Application Support/Arc/User Data/Default"
+
+# Or just name the browser and let gsb find the profile.
+./gsb --import-chrome acc1 --chrome-profile arc
+```
+
+When no profile is given, auto-detection scans every known browser and prefers the first database that actually contains a `SAPISID` cookie, so an unsigned-in Chrome install no longer shadows a signed-in Arc, Brave, or Edge profile.
+
+Decryption depends on the browser, OS, and access to the browser's encryption keys. Linux keyring-backed cookies may require `secret-tool` and an unlocked desktop keyring. On macOS `gsb` queries the login Keychain for the matching `<Browser> Safe Storage` item (`Chrome Safe Storage`, `Arc Safe Storage`, `Brave Safe Storage`, …) and macOS asks you to allow access the first time; `CHROME_PASS` overrides the lookup when Keychain access is unavailable. Windows DPAPI decryption requires the same Windows user context; App-Bound (`v20`) encryption requires a manual export. A detected database is not a guarantee that its cookies can be decrypted.
 
 ### Cookie header or JSON export
 

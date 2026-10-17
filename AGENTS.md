@@ -23,6 +23,8 @@ Only when the browser profile is **already signed in** to Gemini:
 gsb --import-chrome <name> --chrome-profile "<Profile Name>"
 ```
 
+Arc is a supported Chromium fork: use `--chrome-profile arc` (macOS: `~/Library/Application Support/Arc/User Data`; Windows: the MSIX `TheBrowserCompany.Arc_*` package directory). On macOS the cookie key is read from the login Keychain as `<Browser> Safe Storage` (e.g. `Arc Safe Storage`), so the first import triggers a Keychain prompt; `CHROME_PASS` is the escape hatch.
+
 Cookie export via `--import-cookie` is the fallback when browser decryption is unavailable (for example Chrome App-Bound `v20` encryption). Both paths bootstrap the account before reporting success, but neither can create a session that was never established.
 
 ## Never recommend

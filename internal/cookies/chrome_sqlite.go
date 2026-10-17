@@ -32,11 +32,31 @@ var BrowserProfiles = map[string]string{
 }
 
 var (
-	keyringApps   = []string{"chrome", "brave", "chromium", "microsoft-edge", "vivaldi", "opera"}
-	knownBrowsers = []string{"chrome", "brave", "chromium", "edge", "vivaldi"}
+	keyringApps   = []string{"chrome", "brave", "chromium", "microsoft-edge", "vivaldi", "opera", "arc"}
+	knownBrowsers = []string{"chrome", "brave", "chromium", "edge", "vivaldi", "arc"}
 	// dpapiUnprotect decrypts a Windows DPAPI blob; overridable in tests.
 	dpapiUnprotect = platformDPAPIUnprotect
 )
+
+// macSafeStorageServices maps a browser identifier to the macOS Keychain
+// generic-password service that holds its cookie-encryption secret. Chromium
+// forks all store the key under "<Product> Safe Storage"; reading it requires
+// the user to approve the Keychain prompt once.
+var macSafeStorageServices = map[string]string{
+	"chrome":   "Chrome Safe Storage",
+	"chromium": "Chromium Safe Storage",
+	"brave":    "Brave Safe Storage",
+	"edge":     "Microsoft Edge Safe Storage",
+	"vivaldi":  "Vivaldi Safe Storage",
+	"opera":    "Opera Safe Storage",
+	"arc":      "Arc Safe Storage",
+}
+
+// safeStorageService returns the macOS Keychain service name for a browser.
+func safeStorageService(browser string) (string, bool) {
+	svc, ok := macSafeStorageServices[strings.ToLower(strings.TrimSpace(browser))]
+	return svc, ok
+}
 
 // CookieRow represents a decrypted cookie from a browser SQLite database.
 type CookieRow struct {
@@ -118,7 +138,7 @@ type ReadResult struct {
 
 func isKnownBrowser(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "chrome", "chromium", "brave", "edge", "vivaldi":
+	case "chrome", "chromium", "brave", "edge", "vivaldi", "arc":
 		return true
 	default:
 		return false
@@ -235,6 +255,12 @@ func browserUserDataDirs(browser string) []string {
 			dirs = append(dirs, filepath.Join(localAppData, "Microsoft", "Edge", "User Data"))
 		case "vivaldi":
 			dirs = append(dirs, filepath.Join(localAppData, "Vivaldi", "User Data"))
+		case "arc":
+			// Arc ships as an MSIX package, so the profile lives under a
+			// versioned package directory that has to be globbed.
+			matches, _ := filepath.Glob(filepath.Join(localAppData, "Packages", "TheBrowserCompany.Arc_*", "LocalCache", "Local", "Arc", "User Data"))
+			dirs = append(dirs, matches...)
+			dirs = append(dirs, filepath.Join(localAppData, "Arc", "User Data"))
 		}
 	}
 	addMac := func() {
@@ -253,6 +279,8 @@ func browserUserDataDirs(browser string) []string {
 			dirs = append(dirs, filepath.Join(appSupport, "Microsoft Edge"))
 		case "vivaldi":
 			dirs = append(dirs, filepath.Join(appSupport, "Vivaldi"))
+		case "arc":
+			dirs = append(dirs, filepath.Join(appSupport, "Arc", "User Data"))
 		}
 	}
 	addLinux := func() {
@@ -316,6 +344,9 @@ func ParseProfileHint(nameOrPath string) (browser, profileDir string) {
 		browser = "chromium"
 	case strings.Contains(lower, "chrome"):
 		browser = "chrome"
+	}
+	if browser == "" {
+		browser = browserFromDBPath(p)
 	}
 	if !strings.ContainsAny(p, `/\`) {
 		return browser, p
@@ -401,7 +432,7 @@ func FindBrowserCookieDB(nameOrPath string) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("unknown browser %q (known: chrome, chromium, brave, edge, vivaldi; or pass a profile directory/path)", nameOrPath)
+	return "", fmt.Errorf("unknown browser %q (known: chrome, chromium, brave, edge, vivaldi, arc; or pass a profile directory/path)", nameOrPath)
 }
 
 // ReadBrowserCookies reads and decrypts Google session cookies from a Chrome/Chromium
@@ -608,24 +639,97 @@ func findLocalStatePaths(dbPath string) []string {
 	return out
 }
 
-func candidatePasswords() []string {
+// browserFromDBPath infers which browser owns a cookie database from its path.
+// It is used to pick the right macOS Keychain service without prompting the
+// user for every installed browser.
+func browserFromDBPath(dbPath string) string {
+	// Backslashes are normalised explicitly: filepath.ToSlash is a no-op for
+	// Windows-style paths on non-Windows hosts, and callers may pass either.
+	s := strings.ReplaceAll(strings.ToLower(dbPath), `\`, "/")
+	s = "/" + strings.TrimPrefix(s, "/")
+	has := func(marker string) bool { return strings.Contains(s, marker) }
+	switch {
+	// Arc ships as "TheBrowserCompany.Arc_*" on Windows and stores its profile
+	// under "Application Support/Arc/User Data" on macOS.
+	case has("/thebrowsercompany.arc_"), has("/application support/arc/"), has("/local/arc/"):
+		return "arc"
+	case has("/bravesoftware/"), has("/brave-browser/"):
+		return "brave"
+	case has("/microsoft edge/"), has("/microsoft-edge/"):
+		return "edge"
+	case has("/vivaldi/"):
+		return "vivaldi"
+	case has("/opera software/"), has("/opera/"):
+		return "opera"
+	case has("/chromium/"):
+		return "chromium"
+	case has("/google/chrome/"), has("/google-chrome/"):
+		return "chrome"
+	}
+	return ""
+}
+
+// keychainServicesFor returns the macOS Keychain services worth trying for a
+// cookie database. A recognised profile only queries its own browser; an
+// unrecognised path falls back to every known Chromium fork.
+func keychainServicesFor(dbPath string) []string {
+	if b := browserFromDBPath(dbPath); b != "" {
+		if svc, ok := safeStorageService(b); ok {
+			return []string{svc}
+		}
+	}
+	out := make([]string, 0, len(knownBrowsers))
+	for _, b := range knownBrowsers {
+		if svc, ok := safeStorageService(b); ok {
+			out = append(out, svc)
+		}
+	}
+	return out
+}
+
+// keychainPassword reads a macOS Keychain generic password. An empty result
+// means the item is absent or the user declined the access prompt.
+func keychainPassword(service string) string {
+	out, err := exec.Command("security", "find-generic-password", "-s", service, "-w").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func candidatePasswords(dbPath string) []string {
 	var passes []string
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		passes = append(passes, p)
+	}
 	if envPass := os.Getenv("CHROME_PASS"); envPass != "" {
-		passes = append(passes, envPass)
-	} else if runtime.GOOS != "windows" {
-		seen := map[string]bool{}
-		for _, app := range keyringApps {
-			out, err := exec.Command("secret-tool", "lookup", "application", app).Output()
-			if err == nil {
-				p := strings.TrimSpace(string(out))
-				if p != "" && !seen[p] {
-					seen[p] = true
-					passes = append(passes, p)
+		add(envPass)
+	} else {
+		switch runtime.GOOS {
+		case "darwin":
+			// Chromium forks keep their cookie key in the login Keychain under
+			// "<Product> Safe Storage"; macOS prompts once per item.
+			for _, svc := range keychainServicesFor(dbPath) {
+				add(keychainPassword(svc))
+			}
+		case "windows":
+			// The key is DPAPI-wrapped inside "Local State"; see detectBestKey.
+		default:
+			for _, app := range keyringApps {
+				out, err := exec.Command("secret-tool", "lookup", "application", app).Output()
+				if err == nil {
+					add(strings.TrimSpace(string(out)))
 				}
 			}
 		}
 	}
-	passes = append(passes, "peanuts", "")
+	add("peanuts")
+	passes = append(passes, "")
 	return passes
 }
 
@@ -643,7 +747,7 @@ func detectBestKey(rows []rawChromiumRow, dbPath string) (best256, best128 []byt
 			localStateKeyFound = true
 		}
 	}
-	passes := candidatePasswords()
+	passes := candidatePasswords(dbPath)
 	for _, p := range passes {
 		k256 := pbkdf2.Key([]byte(p), []byte("saltysalt"), 1, 32, sha1.New)
 		k128 := pbkdf2.Key([]byte(p), []byte("saltysalt"), 1, 16, sha1.New)
@@ -792,7 +896,32 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// FindChromeCookieDB locates an existing Chrome/Brave/Chromium SQLite Cookie DB.
+// hasSAPISIDCookieRow reports whether the cookie database contains a SAPISID
+// row, without decrypting anything. Auto-detection uses it to prefer a browser
+// profile that is actually signed in to Google over one that merely exists.
+func hasSAPISIDCookieRow(dbPath string) bool {
+	if strings.TrimSpace(dbPath) == "" {
+		return false
+	}
+	// immutable=1 keeps the probe lock-free while the browser is running; a
+	// stale snapshot is fine for a yes/no presence check.
+	dsn := "file:" + filepath.ToSlash(dbPath) + "?mode=ro&immutable=1"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM cookies WHERE name = 'SAPISID'`).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
+// FindChromeCookieDB locates an existing Chromium-family SQLite Cookie DB.
+// With no explicit path it scans every known browser and prefers the first
+// profile that holds a SAPISID cookie, so a stray unsigned-in Chrome profile
+// does not shadow a signed-in Arc/Brave/Edge profile.
 func FindChromeCookieDB(explicitPath string) string {
 	if strings.TrimSpace(explicitPath) != "" {
 		if p, err := FindBrowserCookieDB(explicitPath); err == nil {
@@ -800,10 +929,17 @@ func FindChromeCookieDB(explicitPath string) string {
 		}
 		return ""
 	}
+	var found []string
 	for _, browser := range knownBrowsers {
 		if p, err := FindBrowserCookieDB(browser); err == nil {
-			return p
+			if hasSAPISIDCookieRow(p) {
+				return p
+			}
+			found = append(found, p)
 		}
+	}
+	if len(found) > 0 {
+		return found[0]
 	}
 	return ""
 }
@@ -841,7 +977,17 @@ func ReadChromeCookies(dbPath string) (string, error) {
 		return "", err
 	}
 	if res.Header == "" && res.Failed > 0 && res.Decrypted == 0 && res.Plain == 0 {
-		return "", fmt.Errorf("failed to decrypt %d Google cookie(s) in %s (key_found=%v) — if Chrome uses App-Bound (v20) encryption, export cookies via Cookie-Editor and use --import-cookie", res.Failed, dbPath, res.KeyFound)
+		hint := "if Chrome uses App-Bound (v20) encryption, export cookies via Cookie-Editor and use --import-cookie"
+		if runtime.GOOS == "darwin" {
+			svc := "Chrome Safe Storage"
+			if b := browserFromDBPath(dbPath); b != "" {
+				if s, ok := safeStorageService(b); ok {
+					svc = s
+				}
+			}
+			hint = fmt.Sprintf("approve the macOS Keychain prompt for %q (or set CHROME_PASS), otherwise export cookies via Cookie-Editor and use --import-cookie", svc)
+		}
+		return "", fmt.Errorf("failed to decrypt %d Google cookie(s) in %s (key_found=%v) — %s", res.Failed, dbPath, res.KeyFound, hint)
 	}
 	return res.Header, nil
 }
