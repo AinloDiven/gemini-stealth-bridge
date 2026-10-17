@@ -26,6 +26,12 @@ const (
 	StatusCooling = "cooling"
 	// StatusDegraded means the account is usable but has recorded recent failures.
 	StatusDegraded = "degraded"
+	// StatusUnknown means nothing is known yet about this account's quota because
+	// no upstream check has run in this process. Reporting "ok" here would be a
+	// guess: a fresh process reading account files has no quota data, and claiming
+	// health it has not verified is exactly the confusion this status is meant to
+	// remove.
+	StatusUnknown = "unknown"
 )
 
 // AccountStatus derives the status and a short human reason for one account.
@@ -84,6 +90,10 @@ func AccountStatus(a *AccountState, now time.Time) (status string, reason string
 
 	if fails > 0 {
 		return StatusDegraded, truncateReason(lastError)
+	}
+
+	if len(quota) == 0 {
+		return StatusUnknown, "no quota check yet; run with --accounts-live or query /v1/accounts on the running daemon"
 	}
 
 	return StatusOK, ""

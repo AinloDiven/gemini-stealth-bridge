@@ -160,6 +160,15 @@ func TestAccountStatusCoolingAndDegraded(t *testing.T) {
 	}
 }
 
+func TestAccountStatusUnknownWithoutQuotaData(t *testing.T) {
+	// A fresh process reading account files has no quota data. Claiming "ok" would
+	// assert health it never verified.
+	a := &AccountState{ID: "a"}
+	if status, _ := AccountStatus(a, time.Now()); status != StatusUnknown {
+		t.Fatalf("status = %q, want %q", status, StatusUnknown)
+	}
+}
+
 func TestAccountStatusOK(t *testing.T) {
 	a := &AccountState{
 		ID: "a",

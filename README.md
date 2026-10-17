@@ -445,6 +445,7 @@ curl -sS -X POST http://127.0.0.1:20133/v1/refresh \
 | `quarantined` | Upstream restricted the account |
 | `cooling` | A recent failure put the account in a short cooldown |
 | `degraded` | Usable, but has recorded failures |
+| `unknown` | No quota check has run in this process; use `--accounts-live` or read the running daemon |
 
 `--probe` bootstraps configured accounts and prints model/quota details; inspect per-account errors, not just the command's exit status. `--rotate` attempts cookie renewal, but cannot restore a revoked Google session. Re-import credentials when sign-in is required.
 
