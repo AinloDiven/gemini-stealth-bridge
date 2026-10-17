@@ -52,6 +52,7 @@ type AccountState struct {
 	ImportedFrom     string
 	ProfileID        string
 	AccountGroup     string
+	ProxyURL         string
 	Quarantined      bool
 	QuarantineReason string
 	Surfaces         map[string]string
@@ -61,6 +62,9 @@ type AccountState struct {
 	QuotaNextAllowAt time.Time
 	reqTimestamps    []time.Time
 	activeStreams    int
+	peakRPM          int
+	totalRequests    int
+	offloadRequests  int
 	subStrikes       map[string]int
 	Client           UpstreamClient
 	Models           []gemini.ModelInfo
@@ -351,13 +355,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.EnsureModels(ctx, false)
 		pool := s.scopedAccounts(scope)
 		list := make([]map[string]any, 0, len(pool))
+		now := s.now()
+		rpmCutoff := now.Add(-60 * time.Second)
 		for _, a := range pool {
 			a.mu.RLock()
 			mNames := make([]string, 0, len(a.Models))
 			for _, m := range a.Models {
 				mNames = append(mNames, m.ModelName)
 			}
-			var capAtStr, rotAtStr, modAtStr, qAtStr string
+			var capAtStr, rotAtStr, modAtStr, qAtStr, lastUsedStr string
 			if !a.CapturedAt.IsZero() {
 				capAtStr = a.CapturedAt.UTC().Format(time.RFC3339)
 			}
@@ -369,6 +375,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if !a.QuotaAt.IsZero() {
 				qAtStr = a.QuotaAt.UTC().Format(time.RFC3339)
+			}
+			if !a.LastUsed.IsZero() {
+				lastUsedStr = a.LastUsed.UTC().Format(time.RFC3339)
+			}
+			recentRPM := 0
+			for _, ts := range a.reqTimestamps {
+				if ts.After(rpmCutoff) {
+					recentRPM++
+				}
 			}
 			surfCopy := make(map[string]string, len(a.Surfaces))
 			for k, v := range a.Surfaces {
@@ -385,9 +400,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"rotatedAt":        rotAtStr,
 				"modelsAt":         modAtStr,
 				"quotaAt":          qAtStr,
+				"lastUsedAt":       lastUsedStr,
 				"quarantined":      a.Quarantined,
 				"quarantineReason": a.QuarantineReason,
 				"accountGroup":     a.AccountGroup,
+				"importedFrom":     a.ImportedFrom,
+				"profileId":        a.ProfileID,
+				"proxyConfigured":  a.ProxyURL != "" || s.Cfg.ProxyURL != "",
+				"activeStreams":    a.activeStreams,
+				"recentRpm":        recentRPM,
+				"peakRpm":          a.peakRPM,
+				"totalRequests":    a.totalRequests,
+				"offloadRequests":  a.offloadRequests,
 				"surfaces":         surfCopy,
 			})
 			a.mu.RUnlock()
@@ -769,6 +793,7 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 		quarantined := a.Quarantined
 		nextRot := a.NextRotateAt
 		nextRef := a.NextModelRefAt
+		lastUsed := a.LastUsed
 		a.mu.RUnlock()
 		if quarantined {
 			continue
@@ -788,6 +813,9 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 				base := cookies.ClampRotateInterval(0, s.Cfg.RotateCookiesEvery)
 				if res != nil && res.NextInterval > 0 {
 					base = cookies.ClampRotateInterval(res.NextInterval, s.Cfg.RotateCookiesEvery)
+				}
+				if lastUsed.IsZero() || now.Sub(lastUsed) > 2*base {
+					base = cookies.ClampRotateInterval(base*2, s.Cfg.RotateCookiesEvery)
 				}
 				nextTime := now.Add(base + randDuration(base/3))
 				a.mu.Lock()

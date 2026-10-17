@@ -231,6 +231,13 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 			return fmt.Errorf("could not locate Chrome/Brave/Chromium Cookies SQLite database")
 		}
 	}
+	if strings.TrimSpace(explicitDB) == "" && strings.TrimSpace(cfg.CookieDB) == "" {
+		fmt.Printf("Note: No --chrome-profile or --cookie-db specified; auto-selected %s\n", dbPath)
+		fmt.Println("      Pass --chrome-profile \"<Profile Name>\" to target a dedicated browser profile.")
+	}
+	if lockPath := cookies.DetectActiveProfileLock(dbPath); lockPath != "" {
+		fmt.Printf("Note: Browser profile lock detected (%s); concurrent browser and bridge rotation on the same session can cause __Secure-1PSIDTS conflicts.\n", filepath.Base(lockPath))
+	}
 	hdr, err := cookies.ReadChromeCookies(dbPath)
 	if err != nil {
 		return err

@@ -13,7 +13,7 @@ import (
 )
 
 // Version is the build version of gemini-stealth-bridge (overridable via -ldflags).
-var Version = "0.2.0-dev"
+var Version = "0.2.0"
 
 // Config holds all runtime settings for the gemini-stealth-bridge daemon.
 // Environment variables are 100% compatible with gemini-app-bridge.
@@ -73,6 +73,8 @@ type Config struct {
 	MaxConcurrentPerAccount int
 	QuietHours              string
 	AccountGroups           map[string]string
+	HistoryOffload          bool
+	PersonalContext         string
 	EgressPerAccount        map[string]string
 	Warnings                []string
 }
@@ -138,6 +140,7 @@ func FromEnv() *Config {
 	quotaPreflight := envEnum("BRIDGE_QUOTA_PREFLIGHT", "strict", []string{"strict", "advisory", "off"}, &warnings)
 	tlsExtOrder := envEnum("BRIDGE_TLS_EXT_ORDER", "fixed", []string{"fixed", "random"}, &warnings)
 	protocolMode := envEnum("BRIDGE_PROTOCOL_MODE", "bridge", []string{"bridge", "web"}, &warnings)
+	personalContext := envEnum("BRIDGE_PERSONAL_CONTEXT", "auto", []string{"auto", "off", "on"}, &warnings)
 
 	ipv6Default := "auto"
 	if strings.TrimSpace(os.Getenv("BRIDGE_DISABLE_IPV6")) == "1" {
@@ -208,8 +211,10 @@ func FromEnv() *Config {
 		BLOverride:              strings.TrimSpace(os.Getenv("BRIDGE_BL_OVERRIDE")),
 		Locale:                  locale,
 		AcceptLanguage:          acceptLang,
-		MaxRPMPerAccount:        envNonNegInt("BRIDGE_MAX_RPM_PER_ACCOUNT", 0, &warnings),
-		MaxConcurrentPerAccount: envNonNegInt("BRIDGE_MAX_CONCURRENT_PER_ACCOUNT", 0, &warnings),
+		MaxRPMPerAccount:        envNonNegInt("BRIDGE_MAX_RPM_PER_ACCOUNT", 10, &warnings),
+		MaxConcurrentPerAccount: envNonNegInt("BRIDGE_MAX_CONCURRENT_PER_ACCOUNT", 2, &warnings),
+		HistoryOffload:          envBool("BRIDGE_HISTORY_OFFLOAD", true),
+		PersonalContext:         personalContext,
 		QuietHours:              quietHours,
 		AccountGroups:           accountGroups,
 		EgressPerAccount:        egressPerAccount,

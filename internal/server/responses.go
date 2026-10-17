@@ -955,7 +955,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 								StartIndex:      0,
 								MaxPromptChars:  100000,
 								MaxOldToolChars: 12000,
-								AllowOverflow:   true,
+								AllowOverflow:   s.Cfg.HistoryOffload,
 							}); cErr == nil {
 								curPrompt = compacted
 								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(imageParts))

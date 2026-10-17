@@ -355,3 +355,26 @@ func TestSQLiteImportFiltersExpired(t *testing.T) {
 		t.Fatalf("expected valid cookies in header, got: %s", res.Header)
 	}
 }
+
+func TestDetectActiveProfileLock(t *testing.T) {
+	tmp := t.TempDir()
+	profDir := filepath.Join(tmp, "Default")
+	netDir := filepath.Join(profDir, "Network")
+	if err := os.MkdirAll(netDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(netDir, "Cookies")
+	if err := os.WriteFile(dbPath, []byte("sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := DetectActiveProfileLock(dbPath); got != "" {
+		t.Fatalf("expected no lock initially, got %q", got)
+	}
+	lockPath := filepath.Join(tmp, "SingletonLock")
+	if err := os.WriteFile(lockPath, []byte("host-1234"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := DetectActiveProfileLock(dbPath); got != lockPath {
+		t.Fatalf("expected lock %q, got %q", lockPath, got)
+	}
+}

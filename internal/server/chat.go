@@ -563,7 +563,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								StartIndex:      0,
 								MaxPromptChars:  100000,
 								MaxOldToolChars: 12000,
-								AllowOverflow:   true,
+								AllowOverflow:   s.Cfg.HistoryOffload,
 							}); cErr == nil {
 								curPrompt = compacted
 								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(imageParts))

@@ -749,6 +749,32 @@ func FindChromeCookieDB(explicitPath string) string {
 	return ""
 }
 
+// DetectActiveProfileLock checks whether the browser profile or User Data directory
+// containing dbPath has an active browser lock indicator (e.g. SingletonLock, lockfile,
+// parent.lock, .parentlock). Strictly read-only and informational.
+func DetectActiveProfileLock(dbPath string) string {
+	if strings.TrimSpace(dbPath) == "" {
+		return ""
+	}
+	profDir := filepath.Dir(dbPath)
+	if strings.EqualFold(filepath.Base(profDir), "Network") {
+		profDir = filepath.Dir(profDir)
+	}
+	userDataDir := filepath.Dir(profDir)
+	for _, dir := range []string{profDir, userDataDir} {
+		if dir == "" || dir == "." || dir == "/" {
+			continue
+		}
+		for _, name := range []string{"SingletonLock", "lockfile", "parent.lock", ".parentlock"} {
+			cand := filepath.Join(dir, name)
+			if _, err := os.Lstat(cand); err == nil {
+				return cand
+			}
+		}
+	}
+	return ""
+}
+
 // ReadChromeCookies reads and decrypts Google cookies from dbPath and returns the canonical Cookie header.
 func ReadChromeCookies(dbPath string) (string, error) {
 	res, err := ReadBrowserCookies(dbPath)

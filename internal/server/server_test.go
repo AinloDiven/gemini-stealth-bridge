@@ -1444,3 +1444,54 @@ func TestQuarantineOn403TOSViolation(t *testing.T) {
 		t.Fatalf("expected pickFallbackAccount to skip quarantined acct1 and pick acct2, got %+v", cand)
 	}
 }
+
+func TestAccountsEndpointPostureAndIdleRotationBackoff(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	baseNow := time.Date(2026, 10, 17, 15, 0, 0, 0, time.UTC)
+	srv.clock = func() time.Time { return baseNow }
+	srv.Cfg.RotateCookiesEvery = 9 * time.Minute
+	acct.ImportedFrom = "chrome"
+	acct.ProfileID = "Default"
+	acct.ProxyURL = "socks5://127.0.0.1:1080"
+
+	client := clientFromFrames([]gemini.Frame{
+		makeFrame("ok", "", true, testModel.ModelID),
+	})
+	rec := runChat(t, srv, acct, client, nil)
+	if rec.Code != 200 {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/accounts", nil)
+	req.Header.Set("Authorization", "Bearer audit")
+	aRec := httptest.NewRecorder()
+	srv.ServeHTTP(aRec, req)
+	if aRec.Code != 200 {
+		t.Fatalf("expected 200 on /v1/accounts, got %d: %s", aRec.Code, aRec.Body.String())
+	}
+	var body map[string][]map[string]any
+	if err := json.Unmarshal(aRec.Body.Bytes(), &body); err != nil || len(body["accounts"]) != 1 {
+		t.Fatalf("unexpected /v1/accounts body: %s (err=%v)", aRec.Body.String(), err)
+	}
+	entry := body["accounts"][0]
+	if entry["importedFrom"] != "chrome" || entry["profileId"] != "Default" || entry["proxyConfigured"] != true {
+		t.Fatalf("expected provenance & proxy fields in /v1/accounts, got: %+v", entry)
+	}
+	if entry["totalRequests"] != float64(1) || entry["recentRpm"] != float64(1) || entry["peakRpm"] != float64(1) {
+		t.Fatalf("expected RPM and request counters in /v1/accounts, got: %+v", entry)
+	}
+
+	// Verify idle account rotation stretches interval by 2x when LastUsed is old
+	acct.mu.Lock()
+	acct.LastUsed = baseNow.Add(-2 * time.Hour)
+	acct.NextRotateAt = baseNow.Add(-time.Second)
+	acct.NextModelRefAt = baseNow.Add(time.Hour)
+	acct.mu.Unlock()
+	srv.RunSchedulerStep(context.Background(), baseNow)
+	acct.mu.RLock()
+	nextRot := acct.NextRotateAt
+	acct.mu.RUnlock()
+	if nextRot.Sub(baseNow) < 18*time.Minute {
+		t.Fatalf("expected idle account rotation interval stretched to >= 18m, got %v", nextRot.Sub(baseNow))
+	}
+}

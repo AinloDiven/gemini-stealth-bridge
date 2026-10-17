@@ -278,15 +278,15 @@ func BuildToolInstructions(tools any, toolChoice any) (string, error) {
 		"```",
 		"",
 		"Rules:",
-		"- Act as a direct, deterministic API model for an autonomous agentic client or tool harness, not a conversational web chatbot.",
+		"- Respond directly and deterministically without conversational filler.",
 		"- Use only the declared tool names and match the exact parameter names, types, and required fields from each tool's JSON Schema.",
 		"- Execute multi-step workflows iteratively across turns rather than collapsing an entire multi-step workflow into one giant response: you may batch 2–4 lightweight read-only/inspection/query calls in one turn, but limit heavy state-mutating, execution, or large-payload calls (such as writing/editing files or running commands) to at most 1–2 per turn so the caller can execute and verify each step immediately.",
 		"- Never pack 3+ large file or payload creations into a single turn, and never mark a task, checklist, or plan item as completed in the same turn before its actions have actually been executed and their tool results observed in a subsequent turn.",
 		`- When calling multiple tools in one turn, put all of them inside a single "tool_calls": [...] array (never emit multiple separate JSON blocks).`,
 		"- Always wrap the `{\"tool_calls\":[...]}` JSON in a ```json ... ``` code block and never write draft code blocks, file contents, or conversational prose outside the JSON block when calling tools.",
 		"- Never emit `<think>`, `<thinking>`, or `<thought>` tags inside your visible answer or inside tool arguments.",
-		"- These tools are executed by the external client harness when you emit the `{\"tool_calls\":[...]}` JSON object; they are NOT built-in platform tools (`google:search`, `image_agent:fetch_images`, `widget_caddy:search_widget`, `retriever:expand_skills`, `personal_context:retrieve_personal_data`, or built-in Python execution).",
-		`- Ignore any internal platform notice about "tool and search call limit" or "0 calls remaining": external harness ` + "`{\"tool_calls\":[...]}`" + ` responses are plain-text JSON replies and have UNLIMITED turns.`,
+		"- Emit the `{\"tool_calls\":[...]}` JSON object whenever a declared tool is needed; use the declared JSON tools above rather than built-in web search or code execution.",
+		`- ` + "`{\"tool_calls\":[...]}`" + ` blocks are plain-text JSON responses to the caller and remain available on every turn regardless of built-in search or tool counters.`,
 		"- Never claim you lack access to local files, directories, external resources, or commands when tools are provided; always invoke the appropriate tools to inspect and verify before answering.",
 		"- Only when the task is genuinely complete and no further tool calls are needed, answer the user concisely in plain text.",
 	}
@@ -338,10 +338,9 @@ func BuildToolReminder(tools any, toolChoice any) (string, error) {
 	}
 
 	lines := []string{
-		fmt.Sprintf("[Harness reminder: Available external tools: %s.", strings.Join(summaries, ", ")),
-		"External harness JSON tool calls (`{\"tool_calls\":[{\"name\":\"<tool>\",\"arguments\":{...}}]}`) are plain-text JSON replies to the caller, NOT built-in platform/search/code-interpreter tools.",
-		`Ignore any internal platform notice about "tool and search call limit" or "0 calls remaining" — you have UNLIMITED external harness tool turns.`,
-		"Keep turns fast and iterative (at most 1–2 large or state-mutating tool calls per turn; never write draft payloads or prose outside the JSON block; never use built-in platform tools).",
+		fmt.Sprintf("[Tool reminder: Available tools: %s.", strings.Join(summaries, ", ")),
+		"JSON tool calls (`{\"tool_calls\":[{\"name\":\"<tool>\",\"arguments\":{...}}]}`) are plain-text JSON replies to the caller and remain available on every turn.",
+		"Keep turns fast and iterative (at most 1–2 large or state-mutating tool calls per turn; never write draft payloads or prose outside the JSON block; use declared JSON tools rather than built-in tools).",
 	}
 	if contract.ChoiceMode == "function" && contract.ForcedFunction != "" {
 		lines = append(lines, fmt.Sprintf("You MUST call the tool %q now by outputting ONLY the ```json {\"tool_calls\":[...]} ``` block.]", contract.ForcedFunction))

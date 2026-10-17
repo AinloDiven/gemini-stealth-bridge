@@ -95,6 +95,14 @@ func TestBuildInnerRequestAndModelHeader(t *testing.T) {
 	if !strings.Contains(hdr, `"954c0abcba24364"`) || !strings.Contains(hdr, `"fsid_123"`) {
 		t.Fatalf("unexpected model header: %s", hdr)
 	}
+	innerOn, _, _ := ac.BuildInnerRequest("Hi", StreamOptions{
+		Model:           m,
+		ThinkingLevel:   1,
+		PersonalContext: "on",
+	})
+	if strings.Contains(innerOn, ",1,1,null,[") {
+		t.Fatalf("expected PersonalContext=on to set inner[67]/inner[68] to 0, got: %s", innerOn)
+	}
 }
 
 func marshalJSONString(s string) (string, error) {

@@ -178,6 +178,7 @@ func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error
 		ImportedFrom:     importedFrom,
 		ProfileID:        profileID,
 		AccountGroup:     acctGroup,
+		ProxyURL:         proxyURL,
 		Quarantined:      quarantined,
 		QuarantineReason: qReason,
 		Surfaces:         surfaces,
@@ -372,30 +373,32 @@ func (s *Server) checkAccountRateLimit(a *AccountState) error {
 	if s.Cfg.MaxConcurrentPerAccount > 0 && a.activeStreams >= s.Cfg.MaxConcurrentPerAccount {
 		return transport.NewUpstreamError("account concurrent stream limit reached", 429, "rate_limit_error", map[string]string{"retry-after": "2"}, nil)
 	}
-	if s.Cfg.MaxRPMPerAccount > 0 {
-		cutoff := now.Add(-60 * time.Second)
-		kept := a.reqTimestamps[:0]
-		for _, ts := range a.reqTimestamps {
-			if ts.After(cutoff) {
-				kept = append(kept, ts)
-			}
+	cutoff := now.Add(-60 * time.Second)
+	kept := a.reqTimestamps[:0]
+	for _, ts := range a.reqTimestamps {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
 		}
-		a.reqTimestamps = kept
-		if len(a.reqTimestamps) >= s.Cfg.MaxRPMPerAccount {
-			waitSec := int(math.Ceil(a.reqTimestamps[0].Add(60 * time.Second).Sub(now).Seconds()))
-			if waitSec < 1 {
-				waitSec = 1
-			}
-			return transport.NewUpstreamError(
-				fmt.Sprintf("account %s RPM limit (%d/min) reached", a.ID, s.Cfg.MaxRPMPerAccount),
-				429,
-				"rate_limit_error",
-				map[string]string{"retry-after": strconv.Itoa(waitSec)},
-				nil,
-			)
-		}
-		a.reqTimestamps = append(a.reqTimestamps, now)
 	}
+	a.reqTimestamps = kept
+	if s.Cfg.MaxRPMPerAccount > 0 && len(a.reqTimestamps) >= s.Cfg.MaxRPMPerAccount {
+		waitSec := int(math.Ceil(a.reqTimestamps[0].Add(60 * time.Second).Sub(now).Seconds()))
+		if waitSec < 1 {
+			waitSec = 1
+		}
+		return transport.NewUpstreamError(
+			fmt.Sprintf("account %s RPM limit (%d/min) reached", a.ID, s.Cfg.MaxRPMPerAccount),
+			429,
+			"rate_limit_error",
+			map[string]string{"retry-after": strconv.Itoa(waitSec)},
+			nil,
+		)
+	}
+	a.reqTimestamps = append(a.reqTimestamps, now)
+	if len(a.reqTimestamps) > a.peakRPM {
+		a.peakRPM = len(a.reqTimestamps)
+	}
+	a.totalRequests++
 	return nil
 }
 
@@ -1097,7 +1100,7 @@ func (s *Server) prepareGeneration(
 		StartIndex:      0,
 		MaxPromptChars:  s.Cfg.MaxPromptChars,
 		MaxOldToolChars: s.Cfg.MaxOldToolChars,
-		AllowOverflow:   true,
+		AllowOverflow:   s.Cfg.HistoryOffload,
 	})
 	if err != nil {
 		return nil, err
@@ -1136,7 +1139,8 @@ func (s *Server) prepareGeneration(
 		Language:      s.Cfg.Locale,
 		DisableTools:  !strings.EqualFold(s.Cfg.ProtocolMode, "web") || hasTools,
 		HasTools:      hasTools,
-		ProtocolMode:  s.Cfg.ProtocolMode,
+		ProtocolMode:    s.Cfg.ProtocolMode,
+		PersonalContext: s.Cfg.PersonalContext,
 	}
 
 	curPrompt := fullPrompt
@@ -1158,6 +1162,11 @@ func (s *Server) prepareGeneration(
 				break
 			}
 		}
+	}
+	if len(overflowParts) > 0 && len(opts.Metadata) == 0 {
+		account.mu.Lock()
+		account.offloadRequests++
+		account.mu.Unlock()
 	}
 
 	return &preparedGeneration{

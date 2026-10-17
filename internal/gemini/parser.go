@@ -84,7 +84,7 @@ var (
 			"(?:final\\s+answer|answer|response|最终答案|最終答案|最终回答|最終回答|回答|答案|최종\\s*답변|답변)" +
 			"(?:\\*\\*|__)?\\s*[:：]\\s*",
 	)
-	harnessReminderRe       = regexp.MustCompile(`(?is)^\s*\[Harness reminder:(?:[\s\S]*?block\.\]|[^\]\n]*\])\s*`)
+	harnessReminderRe       = regexp.MustCompile(`(?is)^\s*\[(?:Harness|Tool) reminder:(?:[\s\S]*?block\.\]|[^\]\n]*\])\s*`)
 	assistantPrefixRe       = regexp.MustCompile(`(?i)^\s*Assistant:\s*`)
 )
 
@@ -266,7 +266,7 @@ func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string,
 			"思考过程：", "思考过程:", "**思考过程", "### 思考过程",
 			"思考過程：", "思维链：", "推理过程：", "思考：",
 			"思考プロセス：", "생각 과정:", "💭", "🧠",
-			"[harness reminder:", "assistant:",
+			"[harness reminder:", "[tool reminder:", "assistant:",
 		} {
 			if len(lowerTrimmed) < len(prefix) && strings.HasPrefix(prefix, lowerTrimmed) {
 				return "", joinThoughts(thoughts, extraThoughts)
@@ -275,7 +275,7 @@ func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string,
 	}
 
 	// 3. Handle echoed [Harness reminder: ... at start
-	if strings.HasPrefix(lowerTrimmed, "[harness reminder:") {
+	if strings.HasPrefix(lowerTrimmed, "[harness reminder:") || strings.HasPrefix(lowerTrimmed, "[tool reminder:") {
 		if harnessReminderRe.MatchString(text) {
 			text = harnessReminderRe.ReplaceAllString(text, "")
 			trimmed = strings.TrimLeft(text, " \t\r\n")

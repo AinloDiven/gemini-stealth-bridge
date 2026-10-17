@@ -310,6 +310,10 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 | `BRIDGE_TOOL_PREAMBLE` | `false` | Preserve assistant text before tool calls as answer text rather than moving it into reasoning |
 | `BRIDGE_MAX_PROMPT_CHARS` | `850000` | Inline history budget before older turns are offloaded; not a token count |
 | `BRIDGE_MAX_OLD_TOOL_CHARS` | `32000` | Compaction threshold for older tool-result messages |
+| `BRIDGE_HISTORY_OFFLOAD` | `true` | Upload older conversation turns as text attachments when inline budget is exceeded; `false` forces inline compaction only |
+| `BRIDGE_PERSONAL_CONTEXT` | `auto` | Personal context flag (`inner[67]`/`inner[68]`): `auto` (disabled in `bridge` mode, enabled in pure `web` mode), `on`, or `off` |
+| `BRIDGE_MAX_RPM_PER_ACCOUNT` | `10` | Per-account requests-per-minute limit (`0` disables the limit) |
+| `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | Per-account concurrent active stream limit (`0` disables the limit) |
 
 ### Timeouts and background work
 

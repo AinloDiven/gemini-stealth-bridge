@@ -25,16 +25,17 @@ type UploadedFile struct {
 
 // StreamOptions configures a StreamGenerate request.
 type StreamOptions struct {
-	Model         *ModelInfo
-	ThinkingLevel int
-	Temporary     bool
-	Language      string
-	Metadata      []any // 10-element [cid, rid, rcid, null, null, null, null, null, null, contextToken]
-	Files         []UploadedFile
-	DisableTools  bool
-	HasTools      bool
-	ProtocolMode  string // "bridge" | "web"
-	FreshSocket   bool
+	Model           *ModelInfo
+	ThinkingLevel   int
+	Temporary       bool
+	Language        string
+	Metadata        []any // 10-element [cid, rid, rcid, null, null, null, null, null, null, contextToken]
+	Files           []UploadedFile
+	DisableTools    bool
+	HasTools        bool
+	ProtocolMode    string // "bridge" | "web"
+	PersonalContext string // "auto" | "off" | "on"
+	FreshSocket     bool
 }
 
 // StreamResponse captures the final HTTP status, headers, and conversation state from StreamGenerateLive.
@@ -265,12 +266,21 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 	}
 	inner[53] = 0
 	inner[61] = []any{}
-	if isPureWeb {
+	switch strings.ToLower(strings.TrimSpace(opts.PersonalContext)) {
+	case "on":
 		inner[67] = 0
 		inner[68] = 0
-	} else {
-		inner[67] = 1 // is_personal_context_disabled
+	case "off":
+		inner[67] = 1
 		inner[68] = 1
+	default:
+		if isPureWeb {
+			inner[67] = 0
+			inner[68] = 0
+		} else {
+			inner[67] = 1 // is_personal_context_disabled
+			inner[68] = 1
+		}
 	}
 	if len(meta) >= 10 {
 		cid, _ := meta[0].(string)

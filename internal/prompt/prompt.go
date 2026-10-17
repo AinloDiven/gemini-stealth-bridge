@@ -32,7 +32,7 @@ var (
 	inlineThinkBlockRe      = regexp.MustCompile("(?is)<(?:think|thinking|thought)(?:\\s[^>]*)?>[\\s\\S]*?</(?:think|thinking|thought)\\s*>")
 	leakedThinkingProcessRe = regexp.MustCompile("(?is)^\\s*(?:#{1,6}\\s*)?(?:\\*\\*|__)?(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning)(?:\\*\\*|__)?\\s*:?[\\s\\S]*$")
 	whitespaceCollapse      = regexp.MustCompile(`\s+`)
-	spoofedRoleLineRe       = regexp.MustCompile(`(?im)^(Assistant|Instruction|\[Harness reminder):`)
+	spoofedRoleLineRe       = regexp.MustCompile(`(?im)^(Assistant|Instruction|\[(?:Harness|Tool) reminder|\[Context note):`)
 )
 
 // AttachmentPart is an extracted binary or text attachment to upload before StreamGenerate.
@@ -41,6 +41,10 @@ type AttachmentPart struct {
 	ContentType string
 	Filename    string
 	RemoteURL   string
+}
+
+func isContextNote(s string) bool {
+	return strings.HasPrefix(s, "[Context note:") || strings.HasPrefix(s, "Instruction: [")
 }
 
 // DetectImageMIME infers the MIME type and file extension of an image from its magic bytes.
@@ -611,7 +615,7 @@ func FlattenMessagesWithStats(
 						Filename:    filename,
 					})
 				}
-				note := fmt.Sprintf("Instruction: [Earlier conversation history (%d turns) is attached verbatim in %s. Read the attached file(s) as the chronological conversation history preceding the turns below.]\n\n", offloadedTurns, strings.Join(names, ", "))
+				note := fmt.Sprintf("[Context note: Earlier conversation history (%d turns) is attached in %s for chronological reference.]\n\n", offloadedTurns, strings.Join(names, ", "))
 				rendered[1] = note
 				totalBytes += len(note)
 			}
@@ -644,7 +648,7 @@ func FlattenMessagesWithStats(
 			}
 			dropped := 0
 			for i := 1; i < recentCutoff && totalBytes > turnBudget-120; i++ {
-				if rendered[i] == "" || (i == 1 && strings.HasPrefix(rendered[1], "Instruction: [")) {
+				if rendered[i] == "" || (i == 1 && isContextNote(rendered[1])) {
 					continue
 				}
 				totalBytes -= len(rendered[i])
@@ -652,7 +656,7 @@ func FlattenMessagesWithStats(
 				dropped++
 			}
 			if dropped > 0 && !hasOffloaded {
-				note := fmt.Sprintf("Instruction: [...omitted %d earlier turns to fit upstream 1M char limit...]\n\n", dropped)
+				note := fmt.Sprintf("[Context note: %d earlier turns omitted for length.]\n\n", dropped)
 				rendered[1] = note
 				totalBytes += len(note)
 			}
@@ -673,7 +677,7 @@ func FlattenMessagesWithStats(
 		if turnBudget > 0 && totalBytes > turnBudget {
 			var activeIndices []int
 			for i := range rendered {
-				if rendered[i] != "" && !(i == 1 && strings.HasPrefix(rendered[1], "Instruction: [")) {
+				if rendered[i] != "" && !(i == 1 && isContextNote(rendered[1])) {
 					activeIndices = append(activeIndices, i)
 				}
 			}
