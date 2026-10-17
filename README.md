@@ -307,6 +307,7 @@ All `/v1/*` endpoints below use the same authentication resolver. Account keys s
 | `GET` | `/health` | Unauthenticated daemon status and account/model counts; does not prove upstream readiness |
 | `GET` | `/readyz` | Readiness probe reporting per-account `models_fresh`, `quota_fresh`, `auth_ok`, and `quarantined` (`?strict=1` returns HTTP `503` when no healthy account is available) |
 | `GET` | `/v1/models` | Model IDs, per-model documented token limits, registry-discovered thinking levels, and OpenRouter/OpenAI capability metadata (`ETag` / `If-None-Match` caching; `?fresh=1` forces live discovery) |
+| `GET` | `/v1/accounts` | Per-account computed `status` with `statusReason`, last error, load counters, quota buckets, and `quotaWindow` describing which limit the numbers cover |
 | `POST` | `/v1/chat/completions` | Chat messages, tools, images, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
 | `POST` | `/v1/responses` | Responses input, instructions, tools, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
 | `GET` | `/v1/accounts` | Account IDs, email addresses, provenance (`importedFrom`, `profileId`, `proxyConfigured`), timestamps, quarantine state, surfaces, models, cached quotas, and load telemetry (`activeStreams`, `recentRpm`, `peakRpm`, `totalRequests`, `offloadRequests`, `lastUsedAt`) |
@@ -378,6 +379,7 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 | `BRIDGE_PERSONAL_CONTEXT` | `auto` | Personal context flag (`inner[67]`/`inner[68]`): `auto` (disabled in `bridge` mode, enabled in pure `web` mode), `on`, or `off` |
 | `BRIDGE_CONTEXT_WINDOW` | `1048576` | Fallback context window for models Google has not published limits for. Models with a documented limit always use the documented value |
 | `BRIDGE_MAX_OUTPUT_TOKENS` | `65536` | Fallback output limit, used on the same terms as `BRIDGE_CONTEXT_WINDOW` |
+| `BRIDGE_QUOTA_PREFLIGHT` | `strict` | What to do when the rolling quota window looks spent: `strict` skips the account, `advisory` logs and proceeds, `off` disables the check |
 | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `10` | Per-account requests-per-minute limit (`0` disables the limit) |
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | Per-account concurrent active stream limit (`0` disables the limit) |
 | `BRIDGE_ACCOUNT_STRATEGY` | `rotate` | Pool routing for the pool key. `rotate` keeps using one account until it is exhausted, banned, rate-limited, or failing, then advances to the next and wraps around. `lru` spreads load to the least recently used healthy account. `fill-first` drains the highest-priority account first |
@@ -427,6 +429,22 @@ curl -sS http://127.0.0.1:20133/v1/quota \
 curl -sS -X POST http://127.0.0.1:20133/v1/refresh \
   -H 'Authorization: Bearer gsb-acc1'
 ```
+
+`--accounts` prints one row per loaded account with a computed status, so you can see at a glance which accounts are usable without calling `/v1/accounts` and interpreting raw fields:
+
+```sh
+./gsb --accounts              # read the saved account files
+./gsb --accounts --accounts-live   # query upstream for fresh models and quota first
+```
+
+| Status | Meaning |
+|---|---|
+| `ok` | Loaded, authenticated, no known limit |
+| `exhausted` | A quota window is fully spent, or a model stayed exhausted across retries |
+| `expired` | The saved session is no longer valid; run `gsb --login <name>` |
+| `quarantined` | Upstream restricted the account |
+| `cooling` | A recent failure put the account in a short cooldown |
+| `degraded` | Usable, but has recorded failures |
 
 `--probe` bootstraps configured accounts and prints model/quota details; inspect per-account errors, not just the command's exit status. `--rotate` attempts cookie renewal, but cannot restore a revoked Google session. Re-import credentials when sign-in is required.
 

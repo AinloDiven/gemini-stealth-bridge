@@ -68,7 +68,18 @@ func (s *Server) loadSessionCacheFromDisk() {
 	}
 }
 
+// FlushSessionCacheNow writes the cache synchronously and waits for any
+// asynchronous write already in flight. Callers that flush at shutdown, or a test
+// flushing during cleanup, would otherwise return while a background writer is
+// still creating its temp file in a directory that may already be removed.
 func (s *Server) FlushSessionCacheNow() {
+	s.cacheFlushWG.Wait()
+	s.flushSessionCacheLocked()
+}
+
+// flushSessionCacheLocked performs the write without waiting on the wait group, so
+// the background writer can call it without deadlocking on itself.
+func (s *Server) flushSessionCacheLocked() {
 	p := s.sessionCacheDiskPath()
 	if p == "" {
 		return
@@ -111,8 +122,10 @@ func (s *Server) flushSessionCacheToDisk() {
 	if !s.cacheFlushPending.CompareAndSwap(false, true) {
 		return
 	}
+	s.cacheFlushWG.Add(1)
 	go func() {
-		s.FlushSessionCacheNow()
+		defer s.cacheFlushWG.Done()
+		s.flushSessionCacheLocked()
 	}()
 }
 

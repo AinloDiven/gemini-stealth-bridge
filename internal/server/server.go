@@ -113,6 +113,7 @@ type Server struct {
 	cacheMisses       atomic.Uint64
 	cacheFlushMu      sync.Mutex
 	cacheFlushPending atomic.Bool
+	cacheFlushWG      sync.WaitGroup
 	clientFactory     func(a *AccountState) UpstreamClient
 
 	// rotateMu guards the sticky rotation cursor used by the "rotate" strategy.
@@ -393,13 +394,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			for k, v := range a.Surfaces {
 				surfCopy[k] = v
 			}
+			status, statusReason := AccountStatus(a, now)
+			quotaCopy := append([]gemini.QuotaBucket(nil), a.Quota...)
+			var lastFailStr string
+			if !a.LastFail.IsZero() {
+				lastFailStr = a.LastFail.UTC().Format(time.RFC3339)
+			}
+			lastError := a.LastError
 			list = append(list, map[string]any{
 				"id":               a.ID,
 				"email":            a.Email,
+				"status":           status,
+				"statusReason":     statusReason,
 				"capacity":         a.Capacity,
 				"fails":            a.Fails,
+				"lastError":        lastError,
+				"lastFailAt":       lastFailStr,
 				"models":           mNames,
-				"quota":            a.Quota,
+				"quota":            quotaCopy,
+				"quotaWindow":      quotaWindowInfo(quotaCopy, now),
 				"capturedAt":       capAtStr,
 				"rotatedAt":        rotAtStr,
 				"modelsAt":         modAtStr,
@@ -777,6 +790,45 @@ func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
 		data = append(data, entry)
 	}
 	return map[string]any{"object": "list", "data": data}
+}
+
+// quotaWindowInfo describes what the quota numbers actually cover, so a caller
+// does not mistake the rolling 5-hour window for the account's whole allowance.
+//
+// Gemini enforces two limits at once: a short rolling window (about 5 hours) and a
+// weekly cap. The 5-hour window is not a separate allowance; it is a slice of the
+// weekly one, so when the weekly cap is spent the short window cannot be used
+// either. The quota RPC gsb consumes only exposes the short window, which is why
+// this field exists: it states the scope plainly instead of letting a healthy
+// remaining count imply the account is fully available.
+func quotaWindowInfo(quota []gemini.QuotaBucket, now time.Time) map[string]any {
+	info := map[string]any{
+		"scope": "rolling",
+		"label": "5h",
+		// The short window is bounded by the weekly cap, so a healthy value here
+		// does not prove the account can serve traffic.
+		"nestedUnderWeekly": true,
+		"weeklyExposed":     false,
+		"note":              "gsb only receives the rolling ~5h window; the weekly cap is not exposed by the upstream RPC, so a nonzero remaining count does not guarantee the account is usable",
+	}
+	soonest := time.Time{}
+	for _, q := range quota {
+		if q.Synthetic || q.Unlimited || q.ResetAt == "" {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, q.ResetAt)
+		if err != nil || !t.After(now) {
+			continue
+		}
+		if soonest.IsZero() || t.Before(soonest) {
+			soonest = t
+		}
+	}
+	if !soonest.IsZero() {
+		info["nextResetAt"] = soonest.UTC().Format(time.RFC3339)
+		info["nextResetInSeconds"] = int(soonest.Sub(now).Seconds())
+	}
+	return info
 }
 
 // ScheduleAccountTimers initializes staggered per-account rotation and model refresh deadlines.

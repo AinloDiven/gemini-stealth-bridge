@@ -38,6 +38,7 @@ func init() {
 		fmt.Fprint(out, "First run (recommended):\n")
 		fmt.Fprint(out, "  gsb --login <name>   sign in to Gemini in a browser, then capture that session\n")
 		fmt.Fprint(out, "  gsb --probe          verify the captured account can reach Gemini\n")
+		fmt.Fprint(out, "  gsb --accounts       show which accounts are usable, limited, or expired\n")
 		fmt.Fprint(out, "  gsb                  start the daemon on 127.0.0.1:20133\n\n")
 		fmt.Fprint(out, "Reuse browser cookies only when that profile is already signed in to Gemini.\n")
 		fmt.Fprint(out, "Cookies copied from a profile that never signed in expire within minutes.\n\n")
@@ -62,6 +63,8 @@ func main() {
 		modelsJSON       = flag.Bool("models-json", false, "Print canonical /v1/models JSON payload and exit")
 		unquarantineAcct = flag.String("unquarantine", "", "Clear quarantine state for account <id> and exit")
 		captureRef       = flag.Bool("capture-reference", false, "Capture reference headers from local Chrome login profile via CDP or dump instructions")
+		listAccounts     = flag.Bool("accounts", false, "Print a status table for every loaded account and exit")
+		accountsLive     = flag.Bool("accounts-live", false, "With --accounts, query upstream for fresh models and quota before printing")
 	)
 	flag.Parse()
 
@@ -100,6 +103,11 @@ func main() {
 		if err := runCaptureReference(cfg, dbOrProfile); err != nil {
 			log.Fatalf("[capture-reference] failed: %v", err)
 		}
+		return
+	}
+
+	if *listAccounts {
+		runAccountsTable(cfg, *accountsLive)
 		return
 	}
 
@@ -550,6 +558,76 @@ func runModelsJSON(cfg config.Config) {
 	payload := srv.BuildModelsPayload(models)
 	b, _ := json.MarshalIndent(payload, "", "  ")
 	fmt.Println(string(b))
+}
+
+// runAccountsTable prints the same status the HTTP API reports, so an operator can
+// tell at a glance which accounts are usable without calling /v1/accounts and
+// cross-referencing raw JSON fields.
+func runAccountsTable(cfg config.Config, live bool) {
+	srv := server.New(cfg)
+	if n := srv.LoadCredentials(); n == 0 {
+		fmt.Fprintf(os.Stderr, "no accounts found in %s\n", cfg.AccountsDir)
+		os.Exit(1)
+	}
+	if live {
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
+		srv.EnsureModels(ctx, true)
+	}
+	accts := srv.Accounts()
+	now := time.Now()
+
+	idW, emailW := len("ACCOUNT"), len("EMAIL")
+	type row struct {
+		id, email, status, reason string
+		remaining, total          int
+		resetAt                   string
+	}
+	rows := make([]row, 0, len(accts))
+	for _, a := range accts {
+		email, quota := server.AccountSnapshot(a)
+		status, reason := server.AccountStatus(a, now)
+
+		remaining, total := 0, 0
+		resetAt := "-"
+		for _, q := range quota {
+			if q.Synthetic || q.Unlimited || q.Total <= 0 {
+				continue
+			}
+			remaining += q.Remaining
+			total += q.Total
+			if q.ResetAt != "" && resetAt == "-" {
+				resetAt = q.ResetAt
+			}
+		}
+		rows = append(rows, row{id: a.ID, email: email, status: status, reason: reason,
+			remaining: remaining, total: total, resetAt: resetAt})
+		if len(a.ID) > idW {
+			idW = len(a.ID)
+		}
+		if len(email) > emailW {
+			emailW = len(email)
+		}
+	}
+
+	fmt.Printf("%-*s  %-*s  %-12s  %-12s  %s\n", idW, "ACCOUNT", emailW, "EMAIL", "STATUS", "5H QUOTA", "DETAIL")
+	for _, r := range rows {
+		quota := "-"
+		if r.total > 0 {
+			quota = fmt.Sprintf("%d/%d", r.remaining, r.total)
+		}
+		detail := r.reason
+		if detail == "" && r.resetAt != "-" {
+			detail = "resets " + r.resetAt
+		}
+		fmt.Printf("%-*s  %-*s  %-12s  %-12s  %s\n", idW, r.id, emailW, r.email, r.status, quota, detail)
+	}
+
+	fmt.Println()
+	fmt.Println("Note: the 5H QUOTA column is the rolling ~5-hour window only. Gemini also")
+	fmt.Println("enforces a weekly cap that the upstream RPC does not expose, so a nonzero")
+	fmt.Println("quota does not prove the account can serve traffic. An account stuck at")
+	fmt.Println("\"still exhausted after N retries\" is the weekly cap; it recovers on its own.")
 }
 
 func runCaptureReference(cfg config.Config, explicitProfile string) error {

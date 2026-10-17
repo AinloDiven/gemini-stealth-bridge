@@ -602,6 +602,35 @@ func modelFamilyTokens(modelName string) []string {
 	return family
 }
 
+// quotaExhaustionBackoff escalates a model's cooldown each time it is observed
+// exhausted again after a retry. The old ceiling of 15 minutes assumed every
+// limit resets within the hour, which is only true for the rolling 5-hour window.
+// Gemini also enforces a weekly limit that lasts for days, so an account whose
+// weekly quota is spent would be retried every 15 minutes indefinitely, burning
+// real requests against an account that cannot serve them. The later steps cover
+// that case while still letting a genuinely short limit recover quickly.
+var quotaExhaustionBackoff = []time.Duration{
+	1 * time.Minute,
+	5 * time.Minute,
+	15 * time.Minute,
+	1 * time.Hour,
+	6 * time.Hour,
+	24 * time.Hour,
+}
+
+// quotaExhaustionCooldown returns how long to avoid a model after `strikes`
+// consecutive exhaustion observations.
+func quotaExhaustionCooldown(strikes int) time.Duration {
+	if strikes <= 0 {
+		return quotaExhaustionBackoff[0]
+	}
+	idx := strikes - 1
+	if idx >= len(quotaExhaustionBackoff) {
+		idx = len(quotaExhaustionBackoff) - 1
+	}
+	return quotaExhaustionBackoff[idx]
+}
+
 func (s *Server) recordModelExhausted(a *AccountState, modelName string) {
 	if a == nil || modelName == "" {
 		return
@@ -615,15 +644,7 @@ func (s *Server) recordModelExhausted(a *AccountState, modelName string) {
 	}
 	strikes := a.subStrikes[subID] + 1
 	a.subStrikes[subID] = strikes
-	var dur time.Duration
-	switch {
-	case strikes == 1:
-		dur = 1 * time.Minute
-	case strikes == 2:
-		dur = 5 * time.Minute
-	default:
-		dur = 15 * time.Minute
-	}
+	dur := quotaExhaustionCooldown(strikes)
 	resetAt := now.UTC().Add(dur).Format(time.RFC3339)
 	bucket := gemini.QuotaBucket{
 		ID:        subID,
