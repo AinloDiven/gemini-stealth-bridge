@@ -143,8 +143,11 @@ func FromEnv() *Config {
 	tlsExtOrder := envEnum("BRIDGE_TLS_EXT_ORDER", "fixed", []string{"fixed", "random"}, &warnings)
 	protocolMode := envEnum("BRIDGE_PROTOCOL_MODE", "bridge", []string{"bridge", "web"}, &warnings)
 	personalContext := envEnum("BRIDGE_PERSONAL_CONTEXT", "auto", []string{"auto", "off", "on"}, &warnings)
-	accountStrategy := envEnum("BRIDGE_ACCOUNT_STRATEGY", "lru", []string{"lru", "fill-first"}, &warnings)
+	accountStrategy := envEnum("BRIDGE_ACCOUNT_STRATEGY", "rotate", []string{"rotate", "lru", "fill-first"}, &warnings)
 	accountPriority := parseCSVList(os.Getenv("BRIDGE_ACCOUNT_PRIORITY"))
+	if accountStrategy == "rotate" && len(accountPriority) > 0 {
+		warnings = append(warnings, "BRIDGE_ACCOUNT_PRIORITY is ignored when BRIDGE_ACCOUNT_STRATEGY=rotate")
+	}
 
 	ipv6Default := "auto"
 	if strings.TrimSpace(os.Getenv("BRIDGE_DISABLE_IPV6")) == "1" {

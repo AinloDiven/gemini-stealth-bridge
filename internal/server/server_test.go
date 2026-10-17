@@ -1548,9 +1548,10 @@ func TestAccountStrategyLRUIsDefault(t *testing.T) {
 	cfg.HomeDir = "/synthetic"
 	cfg.AccountTokens = nil
 	cfg.SessionCache = false
+	cfg.AccountStrategy = "lru"
 	srv := New(cfg)
-	if srv.fillFirst() {
-		t.Fatal("expected fill-first to be disabled by default")
+	if srv.fillFirst() || srv.rotate() {
+		t.Fatal("expected an explicit lru strategy to disable fill-first and rotate")
 	}
 	mk := func(id string, used time.Time) *AccountState {
 		return &AccountState{
@@ -1641,5 +1642,122 @@ func TestFillFirstReturnsToRankOneAfterFailureCooldown(t *testing.T) {
 	cand, _ := srv.pickFallbackAccount(srv.Accounts(), map[string]bool{"acctA": true}, "", testModel.ModelName, nil)
 	if cand == nil || cand.ID != "acctB" {
 		t.Fatalf("expected fallback to pick acctB while acctA cools down, got %+v", cand)
+	}
+}
+
+func rotateServer(t *testing.T) *Server {
+	t.Helper()
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.AccountTokens = nil
+	cfg.SessionCache = false
+	cfg.AccountStrategy = "rotate"
+	srv := New(cfg)
+	mk := func(id string) *AccountState {
+		return &AccountState{
+			ID:       id,
+			Email:    id + "@example.com",
+			Models:   []gemini.ModelInfo{testModel},
+			ModelsAt: time.Now(),
+		}
+	}
+	srv.SetAccounts([]*AccountState{mk("acctA"), mk("acctB"), mk("acctC")})
+	return srv
+}
+
+func TestRotateSticksUntilAccountExhausted(t *testing.T) {
+	srv := rotateServer(t)
+	pick := func() string {
+		got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil)
+		if got == nil {
+			t.Fatal("expected an account, got nil")
+		}
+		return got.ID
+	}
+
+	// Sticky: repeated calls stay on the first account.
+	for i := 0; i < 5; i++ {
+		if id := pick(); id != "acctA" {
+			t.Fatalf("call %d: expected acctA to stay sticky, got %s", i, id)
+		}
+	}
+
+	// Exhaust acctA -> advance to acctB and stay there.
+	acctA := srv.Accounts()[0]
+	acctA.mu.Lock()
+	acctA.Quota = []gemini.QuotaBucket{{
+		ID: "4", Label: "Gemini Pro", Total: 2400, Remaining: 0,
+		ResetAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+	acctA.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		if id := pick(); id != "acctB" {
+			t.Fatalf("call %d: expected acctB after acctA exhausted, got %s", i, id)
+		}
+	}
+
+	// Exhaust acctB -> advance to acctC.
+	acctB := srv.Accounts()[1]
+	acctB.mu.Lock()
+	acctB.Quota = []gemini.QuotaBucket{{
+		ID: "4", Label: "Gemini Pro", Total: 2400, Remaining: 0,
+		ResetAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+	acctB.mu.Unlock()
+	if id := pick(); id != "acctC" {
+		t.Fatalf("expected acctC after acctB exhausted, got %s", id)
+	}
+
+	// acctA recovers -> rotation wraps back to acctA only after acctC is exhausted.
+	acctA.mu.Lock()
+	acctA.Quota = nil
+	acctA.mu.Unlock()
+	if id := pick(); id != "acctC" {
+		t.Fatalf("expected to keep acctC while it is healthy, got %s", id)
+	}
+	acctC := srv.Accounts()[2]
+	acctC.mu.Lock()
+	acctC.Quota = []gemini.QuotaBucket{{
+		ID: "4", Label: "Gemini Pro", Total: 2400, Remaining: 0,
+		ResetAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+	acctC.mu.Unlock()
+	if id := pick(); id != "acctA" {
+		t.Fatalf("expected rotation to wrap back to acctA, got %s", id)
+	}
+}
+
+func TestRotateSkipsCoolingAccount(t *testing.T) {
+	srv := rotateServer(t)
+	acctA := srv.Accounts()[0]
+	srv.markAccountFailure(acctA, "synthetic failure")
+
+	got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil)
+	if got == nil || got.ID != "acctB" {
+		t.Fatalf("expected rotation to skip the cooling account and pick acctB, got %+v", got)
+	}
+
+	acctA.mu.Lock()
+	acctA.LastFail = time.Now().Add(-2 * fillFirstFailCooldown)
+	acctA.mu.Unlock()
+	// The cursor moved to acctB, so acctB keeps serving; acctA is reused only
+	// after the cursor account stops being available.
+	if got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil); got.ID != "acctB" {
+		t.Fatalf("expected acctB to stay sticky after acctA cooldown, got %s", got.ID)
+	}
+}
+
+func TestRotateFallbackAdvancesAndWraps(t *testing.T) {
+	srv := rotateServer(t)
+	if got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil); got.ID != "acctA" {
+		t.Fatalf("expected acctA first, got %s", got.ID)
+	}
+	cand, _ := srv.pickFallbackAccount(srv.Accounts(), map[string]bool{"acctA": true}, "", testModel.ModelName, nil)
+	if cand == nil || cand.ID != "acctB" {
+		t.Fatalf("expected fallback to advance to acctB, got %+v", cand)
+	}
+	cand, _ = srv.pickFallbackAccount(srv.Accounts(), map[string]bool{"acctA": true, "acctB": true, "acctC": true}, "", testModel.ModelName, nil)
+	if cand != nil {
+		t.Fatalf("expected no fallback when every account was tried, got %s", cand.ID)
 	}
 }

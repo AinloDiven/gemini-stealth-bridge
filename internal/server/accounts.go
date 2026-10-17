@@ -710,6 +710,9 @@ func (s *Server) hasSessionCacheHit(a *AccountState, modelName string, hasher *p
 }
 
 func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]bool, originGroup string, requested string, hasher *prompt.HistoryHasher) (*AccountState, *gemini.ModelInfo) {
+	if s.rotate() {
+		return s.pickRotateFallback(accts, tried, originGroup, requested)
+	}
 	var idleCand *AccountState
 	var idleModel *gemini.ModelInfo
 	var busyCand *AccountState
@@ -906,6 +909,184 @@ func (s *Server) fillFirst() bool {
 	return strings.EqualFold(strings.TrimSpace(s.Cfg.AccountStrategy), "fill-first")
 }
 
+func (s *Server) rotate() bool {
+	return strings.EqualFold(strings.TrimSpace(s.Cfg.AccountStrategy), "rotate")
+}
+
+// rotateIndex returns the position of the sticky rotation cursor, or 0 when the
+// cursor account is no longer loaded.
+func (s *Server) rotateIndex(accts []*AccountState) int {
+	s.rotateMu.Lock()
+	cur := s.rotateCursor
+	s.rotateMu.Unlock()
+	for i, a := range accts {
+		if a.ID == cur {
+			return i
+		}
+	}
+	return 0
+}
+
+func (s *Server) setRotateCursor(id string) {
+	s.rotateMu.Lock()
+	s.rotateCursor = id
+	s.rotateMu.Unlock()
+}
+
+// accountRateLimited reports whether the account would reject a new request
+// because of the per-account RPM or concurrency limit, without recording a
+// request the way checkAccountRateLimit does.
+func (s *Server) accountRateLimited(a *AccountState) bool {
+	if a == nil {
+		return false
+	}
+	if s.Cfg.MaxConcurrentPerAccount <= 0 && s.Cfg.MaxRPMPerAccount <= 0 {
+		return false
+	}
+	cutoff := s.now().Add(-60 * time.Second)
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if s.Cfg.MaxConcurrentPerAccount > 0 && a.activeStreams >= s.Cfg.MaxConcurrentPerAccount {
+		return true
+	}
+	if s.Cfg.MaxRPMPerAccount > 0 {
+		n := 0
+		for _, ts := range a.reqTimestamps {
+			if ts.After(cutoff) {
+				n++
+			}
+		}
+		if n >= s.Cfg.MaxRPMPerAccount {
+			return true
+		}
+	}
+	return false
+}
+
+// accountReady reports whether an account can serve the requested model right
+// now: not quarantined, model available, quota not exhausted, and not cooling
+// down after a recent failure.
+func (s *Server) accountReady(a *AccountState, requested string) (*gemini.ModelInfo, bool) {
+	if a == nil {
+		return nil, false
+	}
+	a.mu.RLock()
+	qState := a.Quarantined
+	a.mu.RUnlock()
+	if qState {
+		return nil, false
+	}
+	m := resolveModelOnAccount(a, requested)
+	if m == nil {
+		return nil, false
+	}
+	if err := s.checkPreFlightQuotaInternal(a, *m, m.ModelName, true); err != nil {
+		return nil, false
+	}
+	if s.accountCooling(a) {
+		return nil, false
+	}
+	if s.accountRateLimited(a) {
+		return nil, false
+	}
+	return m, true
+}
+
+// resolveRotateAccount walks the account list from the sticky cursor and uses
+// the first account that can serve the request. The cursor only advances when
+// the current account cannot serve, so consecutive conversations stay on one
+// Gemini session until that account is exhausted, banned, or failing.
+func (s *Server) resolveRotateAccount(accts []*AccountState, requested string, hasher *prompt.HistoryHasher) *AccountState {
+	if len(accts) == 0 {
+		return nil
+	}
+	start := s.rotateIndex(accts)
+	at := func(i int) *AccountState { return accts[(start+i)%len(accts)] }
+
+	// Prefer the account that already holds this conversation's continuation.
+	if s.Cfg.SessionCache && hasher != nil && hasher.Len() >= 3 {
+		for i := 0; i < len(accts); i++ {
+			a := at(i)
+			m, ok := s.accountReady(a, requested)
+			if !ok {
+				continue
+			}
+			if s.hasSessionCacheHit(a, m.ModelName, hasher) {
+				s.setRotateCursor(a.ID)
+				return a
+			}
+		}
+	}
+
+	// Sticky: the cursor account keeps serving until it cannot.
+	for i := 0; i < len(accts); i++ {
+		a := at(i)
+		if _, ok := s.accountReady(a, requested); ok {
+			s.setRotateCursor(a.ID)
+			return a
+		}
+	}
+
+	// Nothing is ready. Prefer an account that can at least serve the model so the
+	// caller receives an accurate quota error rather than model_not_found.
+	for i := 0; i < len(accts); i++ {
+		a := at(i)
+		a.mu.RLock()
+		qState := a.Quarantined
+		a.mu.RUnlock()
+		if qState {
+			continue
+		}
+		if resolveModelOnAccount(a, requested) != nil {
+			return a
+		}
+	}
+	for i := 0; i < len(accts); i++ {
+		a := at(i)
+		a.mu.RLock()
+		qState := a.Quarantined
+		a.mu.RUnlock()
+		if !qState {
+			return a
+		}
+	}
+	return nil
+}
+
+// pickRotateFallback advances the rotation from the failed account to the next
+// one that can serve the request, wrapping around the list.
+func (s *Server) pickRotateFallback(accts []*AccountState, tried map[string]bool, originGroup string, requested string) (*AccountState, *gemini.ModelInfo) {
+	if len(accts) == 0 {
+		return nil, nil
+	}
+	start := s.rotateIndex(accts)
+	at := func(i int) *AccountState { return accts[(start+i)%len(accts)] }
+	for pass := 0; pass < 2; pass++ {
+		for i := 1; i <= len(accts); i++ {
+			cand := at(i)
+			if tried[cand.ID] {
+				continue
+			}
+			cand.mu.RLock()
+			cGroup := cand.AccountGroup
+			cand.mu.RUnlock()
+			if (originGroup != "" || cGroup != "") && cGroup != originGroup {
+				continue
+			}
+			m, ok := s.accountReady(cand, requested)
+			if !ok {
+				continue
+			}
+			if pass == 0 && s.isAccountBusy(cand.ID) {
+				continue
+			}
+			s.setRotateCursor(cand.ID)
+			return cand, m
+		}
+	}
+	return nil, nil
+}
+
 func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requested string, hasher *prompt.HistoryHasher) *AccountState {
 	if scope.AccountID != "" {
 		for _, a := range accts {
@@ -922,6 +1103,9 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 		if explicitTokens {
 			return nil
 		}
+	}
+	if s.rotate() {
+		return s.resolveRotateAccount(accts, requested, hasher)
 	}
 	var best *AccountState
 	bestBusy := false

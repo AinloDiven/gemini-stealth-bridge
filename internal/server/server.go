@@ -114,6 +114,10 @@ type Server struct {
 	cacheFlushMu      sync.Mutex
 	cacheFlushPending atomic.Bool
 	clientFactory     func(a *AccountState) UpstreamClient
+
+	// rotateMu guards the sticky rotation cursor used by the "rotate" strategy.
+	rotateMu     sync.Mutex
+	rotateCursor string
 }
 
 // New constructs a new Server from cfg.
