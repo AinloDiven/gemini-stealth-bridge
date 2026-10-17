@@ -1570,3 +1570,76 @@ func TestAccountStrategyLRUIsDefault(t *testing.T) {
 		t.Fatalf("expected LRU to pick the least recently used account acctB, got %+v", got)
 	}
 }
+
+func fillFirstServer(t *testing.T) *Server {
+	t.Helper()
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.AccountTokens = nil
+	cfg.SessionCache = false
+	cfg.AccountStrategy = "fill-first"
+	cfg.AccountPriority = []string{"acctA", "acctB", "acctC"}
+	srv := New(cfg)
+	mk := func(id string) *AccountState {
+		return &AccountState{
+			ID:       id,
+			Email:    id + "@example.com",
+			Models:   []gemini.ModelInfo{testModel},
+			ModelsAt: time.Now(),
+		}
+	}
+	srv.SetAccounts([]*AccountState{mk("acctA"), mk("acctB"), mk("acctC")})
+	return srv
+}
+
+func TestFillFirstReturnsToRankOneAfterQuotaReset(t *testing.T) {
+	srv := fillFirstServer(t)
+	now := time.Now()
+	acctA := srv.Accounts()[0]
+
+	acctA.mu.Lock()
+	acctA.Quota = []gemini.QuotaBucket{{
+		ID: "4", Label: "Gemini Pro", Total: 2400, Remaining: 0,
+		ResetAt: now.Add(time.Hour).UTC().Format(time.RFC3339),
+	}}
+	acctA.mu.Unlock()
+	if got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil); got.ID != "acctB" {
+		t.Fatalf("expected failover to acctB while acctA is exhausted, got %s", got.ID)
+	}
+
+	acctA.mu.Lock()
+	acctA.Quota = []gemini.QuotaBucket{{
+		ID: "4", Label: "Gemini Pro", Total: 2400, Remaining: 2400,
+		ResetAt: now.Add(24 * time.Hour).UTC().Format(time.RFC3339),
+	}}
+	acctA.mu.Unlock()
+	if got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil); got.ID != "acctA" {
+		t.Fatalf("expected fill-first to return to acctA after quota reset, got %s", got.ID)
+	}
+}
+
+func TestFillFirstReturnsToRankOneAfterFailureCooldown(t *testing.T) {
+	srv := fillFirstServer(t)
+	acctA := srv.Accounts()[0]
+
+	srv.markAccountFailure(acctA, "synthetic failure")
+	if got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil); got.ID != "acctB" {
+		t.Fatalf("expected acctB right after acctA failed, got %s", got.ID)
+	}
+
+	acctA.mu.Lock()
+	acctA.LastFail = time.Now().Add(-2 * fillFirstFailCooldown)
+	acctA.mu.Unlock()
+	if got := srv.resolveChatAccount(srv.Accounts(), AuthScope{OK: true, Admin: true}, testModel.ModelName, nil); got.ID != "acctA" {
+		t.Fatalf("expected acctA to reclaim rank 1 after cooldown, got %s", got.ID)
+	}
+
+	// Fallback selection must follow the same recovery rule.
+	acctA.mu.Lock()
+	acctA.LastFail = time.Now()
+	acctA.mu.Unlock()
+	cand, _ := srv.pickFallbackAccount(srv.Accounts(), map[string]bool{"acctA": true}, "", testModel.ModelName, nil)
+	if cand == nil || cand.ID != "acctB" {
+		t.Fatalf("expected fallback to pick acctB while acctA cools down, got %+v", cand)
+	}
+}

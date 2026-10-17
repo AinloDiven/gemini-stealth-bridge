@@ -715,8 +715,10 @@ func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]boo
 	var busyCand *AccountState
 	var busyModel *gemini.ModelInfo
 	candidates := accts
-	if s.fillFirst() {
-		ranks := s.accountRanks(accts)
+	fillFirst := s.fillFirst()
+	var ranks map[string]int
+	if fillFirst {
+		ranks = s.accountRanks(accts)
 		candidates = make([]*AccountState, len(accts))
 		copy(candidates, accts)
 		sort.SliceStable(candidates, func(i, j int) bool { return ranks[candidates[i].ID] < ranks[candidates[j].ID] })
@@ -746,13 +748,27 @@ func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]boo
 			if s.hasSessionCacheHit(cand, m.ModelName, hasher) {
 				return cand, m
 			}
-			cand.mu.RLock()
-			cFails := cand.Fails
-			cand.mu.RUnlock()
 			if idleCand == nil {
 				idleCand = cand
 				idleModel = m
+			} else if fillFirst {
+				// Keep the highest-ranked candidate; a recent failure demotes only
+				// until its cooldown expires.
+				cCooling := s.accountCooling(cand)
+				iCooling := s.accountCooling(idleCand)
+				if cCooling != iCooling {
+					if !cCooling {
+						idleCand = cand
+						idleModel = m
+					}
+				} else if ranks[cand.ID] < ranks[idleCand.ID] {
+					idleCand = cand
+					idleModel = m
+				}
 			} else {
+				cand.mu.RLock()
+				cFails := cand.Fails
+				cand.mu.RUnlock()
 				idleCand.mu.RLock()
 				iFails := idleCand.Fails
 				idleCand.mu.RUnlock()
@@ -848,6 +864,25 @@ func (s *Server) markAccountFailure(a *AccountState, msg string) {
 	a.LastFail = s.now()
 	a.LastError = msg
 	a.mu.Unlock()
+}
+
+// fillFirstFailCooldown temporarily demotes an account that just failed so a
+// broken top-priority account is not hammered, while still letting it win again
+// once the cooldown elapses (rank alone would otherwise demote it forever,
+// because a demoted account never gets the success that resets Fails).
+const fillFirstFailCooldown = 60 * time.Second
+
+func (s *Server) accountCooling(a *AccountState) bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	failAt := a.LastFail
+	a.mu.RUnlock()
+	if failAt.IsZero() {
+		return false
+	}
+	return s.now().Sub(failAt) < fillFirstFailCooldown
 }
 
 // accountRanks assigns a selection rank to every loaded account. Accounts named
@@ -951,6 +986,29 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 		if bestHasCache && !aHasCache {
 			continue
 		}
+		if fillFirst {
+			// Rank decides; a recent failure only demotes for a bounded cooldown so
+			// the account can reclaim its rank instead of being stuck behind a
+			// healthy lower-ranked account forever.
+			aCooling := s.accountCooling(a)
+			bCooling := s.accountCooling(best)
+			if aCooling != bCooling {
+				if !aCooling {
+					best = a
+					bestBusy = aBusy
+					bestHasCache = aHasCache
+					bestQuotaOK = aQuotaOK
+				}
+				continue
+			}
+			if ranks[a.ID] < ranks[best.ID] {
+				best = a
+				bestBusy = aBusy
+				bestHasCache = aHasCache
+				bestQuotaOK = aQuotaOK
+			}
+			continue
+		}
 		a.mu.RLock()
 		aFails, aUsed := a.Fails, a.LastUsed
 		a.mu.RUnlock()
@@ -959,15 +1017,6 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 		best.mu.RUnlock()
 		if aFails != bFails {
 			if aFails < bFails {
-				best = a
-				bestBusy = aBusy
-				bestHasCache = aHasCache
-				bestQuotaOK = aQuotaOK
-			}
-			continue
-		}
-		if fillFirst {
-			if ranks[a.ID] < ranks[best.ID] {
 				best = a
 				bestBusy = aBusy
 				bestHasCache = aHasCache
