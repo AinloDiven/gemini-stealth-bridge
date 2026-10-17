@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
@@ -108,7 +109,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	eagerStream := strings.EqualFold(s.Cfg.StreamBufferMode, "eager")
 
 	headersSent := false
-	ttftMs := int64(-1)
+	var ttftMs atomic.Int64
+	ttftMs.Store(-1)
 	curAttempt := 0
 	lastUpstreamStatus := 0
 	lastRetryReason := ""
@@ -157,20 +159,27 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	}
 	defer stopKeepalive()
 
-	startStream := func() {
+	// streamStarted closes as soon as the response headers are flushed, so the
+	// grace timer below does not keep a goroutine alive after streaming begins.
+	streamStarted := make(chan struct{})
+	var streamStartedOnce sync.Once
+	markStreamStarted := func() { streamStartedOnce.Do(func() { close(streamStarted) }) }
+
+	startStreamWith := func(early bool, attempt, upstreamStatus int, retryReason string) {
 		streamMu.Lock()
 		if headersSent || ctx.Err() != nil {
 			streamMu.Unlock()
 			return
 		}
-		setGSBHeaders(w, false, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+		setGSBHeaders(w, false, account.ID, mid, attempt, upstreamStatus, retryReason)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(200)
 		headersSent = true
-		if ttftMs < 0 {
-			ttftMs = time.Since(reqStartedAt).Milliseconds()
+		markStreamStarted()
+		if ttftMs.Load() < 0 && !early {
+			ttftMs.Store(time.Since(reqStartedAt).Milliseconds())
 		}
 		_, _ = io.WriteString(w, ": ping\n\n")
 		if flusher != nil {
@@ -203,8 +212,33 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		}()
 	}
 
+	// startStream reads the caller-owned attempt diagnostics, so it must only be
+	// called from the request goroutine.
+	startStream := func(early bool) {
+		startStreamWith(early, curAttempt, lastUpstreamStatus, lastRetryReason)
+	}
+
 	if stream && s.Cfg.EarlySSE {
-		startStream()
+		startStream(false)
+	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 {
+		// Buffered mode normally holds the response headers until the first frame so
+		// a detected model downgrade can still become an HTTP error. Thinking-heavy
+		// models can exceed a proxy's response-header timeout, so flush headers once
+		// the grace period elapses and keep the remaining downgrade check on the
+		// stream body instead.
+		go func() {
+			timer := time.NewTimer(s.Cfg.EarlySSEGrace)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				// No upstream call has completed yet, so attempt/status/retry are
+				// unknown here; pass -1 to omit them instead of reading variables owned
+				// by the request goroutine.
+				startStreamWith(true, -1, 0, "")
+			case <-ctx.Done():
+			case <-streamStarted:
+			}
+		}()
 	}
 
 	account.mu.RLock()
@@ -258,7 +292,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		preambleFlushed := false
 		if stream && buffered && hasTools {
 			toolStreamer = toolbridge.NewLiveToolCallStreamer(toolsRaw, toolChoiceRaw, func(d map[string]any) {
-				startStream()
+				startStream(false)
 				if !preambleFlushed {
 					preambleFlushed = true
 					if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
@@ -303,8 +337,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			account.activeStreams++
 			account.mu.Unlock()
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
-				if ttftMs < 0 {
-					ttftMs = time.Since(reqStartedAt).Milliseconds()
+				if ttftMs.Load() < 0 {
+					ttftMs.Store(time.Since(reqStartedAt).Milliseconds())
 				}
 				attemptStateMu.Lock()
 				observeIdentity(update.AnsweredModelID, update.AnsweredModelLabel)
@@ -350,7 +384,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
 						if len(text) > len(sentText) || (s.Cfg.LiveThoughts && len(thoughts) > len(sentThought)) {
-							startStream()
+							startStream(false)
 							if len(text) > len(sentText) {
 								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
 								sentText = text
@@ -367,12 +401,12 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && (servedID != "" || gemini.IsMatchingServedModel(*model, servedID, servedLabel) || servedID == ""))
 						if identityVerified && s.Cfg.LiveThoughts {
 							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
-								startStream()
+								startStream(false)
 								emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
 								sentThought = thoughts
 								lastActiveKeepaliveAt = time.Now()
 							} else if servedID != "" && time.Since(attemptStartedAt) >= 5*time.Second {
-								startStream()
+								startStream(false)
 								if time.Since(lastActiveKeepaliveAt) >= 5*time.Second {
 									emit(map[string]any{"role": "assistant"}, nil, nil)
 									lastActiveKeepaliveAt = time.Now()
@@ -382,13 +416,13 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						canStreamText := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
 						if canStreamText {
 							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
-								startStream()
+								startStream(false)
 								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
 								sentText = text
 								lastActiveKeepaliveAt = time.Now()
 							} else if hasTools && s.Cfg.KeepToolPreamble && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
 								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
-									startStream()
+									startStream(false)
 									emit(sseDeltaContent{Content: safePrefix[len(sentText):]}, nil, nil)
 									sentText = safePrefix
 									lastActiveKeepaliveAt = time.Now()
@@ -610,7 +644,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"body_bytes":    flattenStats.BodyBytes,
 				"footer_bytes":  flattenStats.FooterBytes,
 				"tool_bytes":    flattenStats.ToolSchemaBytes,
-				"ttft_ms":       ttftMs,
+				"ttft_ms":       ttftMs.Load(),
 				"total_ms":      time.Since(reqStartedAt).Milliseconds(),
 				"status":        errStatus,
 				"error_code":    errCode,
@@ -656,7 +690,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 		if len(calls) > 0 {
 			if stream && buffered {
-				startStream()
+				startStream(false)
 				if toolStreamer == nil || !toolStreamer.SentAny() {
 					if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 						emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
@@ -685,7 +719,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		}
 
 		if stream {
-			startStream()
+			startStream(false)
 			if buffered && len(calls) == 0 {
 				if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 					emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
@@ -754,7 +788,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			"body_bytes":    flattenStats.BodyBytes,
 			"footer_bytes":  flattenStats.FooterBytes,
 			"tool_bytes":    flattenStats.ToolSchemaBytes,
-			"ttft_ms":       ttftMs,
+			"ttft_ms":       ttftMs.Load(),
 			"total_ms":      time.Since(reqStartedAt).Milliseconds(),
 			"status":        200,
 			"error_code":    "",

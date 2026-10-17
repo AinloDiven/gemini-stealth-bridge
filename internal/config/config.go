@@ -52,6 +52,7 @@ type Config struct {
 	MaxOutputTokens         int
 	TokenEstimator          string
 	EarlySSE                bool
+	EarlySSEGrace           time.Duration
 	StreamBufferMode        string
 	MaxAttempts             int
 	MaxUpstreamAttempts     int
@@ -201,6 +202,7 @@ func FromEnv() *Config {
 		MaxOutputTokens:         envPositiveInt("BRIDGE_MAX_OUTPUT_TOKENS", 65536, 256, &warnings),
 		TokenEstimator:          tokenEstimator,
 		EarlySSE:                envBool("BRIDGE_EARLY_SSE", false),
+		EarlySSEGrace:           time.Duration(envNonNegInt("BRIDGE_EARLY_SSE_GRACE_MS", 20000, &warnings)) * time.Millisecond,
 		StreamBufferMode:        streamBuffer,
 		MaxAttempts:             maxAttempts,
 		MaxUpstreamAttempts:     maxUpstream,

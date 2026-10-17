@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
@@ -471,7 +472,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	eagerStream := strings.EqualFold(s.Cfg.StreamBufferMode, "eager")
 
 	headersSent := false
-	ttftMs := int64(-1)
+	var ttftMs atomic.Int64
+	ttftMs.Store(-1)
 	curAttempt := 0
 	lastUpstreamStatus := 0
 	lastRetryReason := ""
@@ -514,20 +516,27 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	}
 	defer stopKeepalive()
 
-	startStream := func() {
+	// streamStarted closes as soon as the response headers are flushed, so the
+	// grace timer below does not keep a goroutine alive after streaming begins.
+	streamStarted := make(chan struct{})
+	var streamStartedOnce sync.Once
+	markStreamStarted := func() { streamStartedOnce.Do(func() { close(streamStarted) }) }
+
+	startStreamWith := func(early bool, attempt, upstreamStatus int, retryReason string) {
 		streamMu.Lock()
 		if headersSent || ctx.Err() != nil {
 			streamMu.Unlock()
 			return
 		}
-		setGSBHeaders(w, false, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+		setGSBHeaders(w, false, account.ID, mid, attempt, upstreamStatus, retryReason)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.WriteHeader(200)
 		headersSent = true
-		if ttftMs < 0 {
-			ttftMs = time.Since(reqStartedAt).Milliseconds()
+		markStreamStarted()
+		if ttftMs.Load() < 0 && !early {
+			ttftMs.Store(time.Since(reqStartedAt).Milliseconds())
 		}
 		_, _ = io.WriteString(w, ": ping\n\n")
 		if flusher != nil {
@@ -570,15 +579,35 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}()
 	}
 
+	// startStream reads the caller-owned attempt diagnostics, so it must only be
+	// called from the request goroutine.
+	startStream := func(early bool) {
+		startStreamWith(early, curAttempt, lastUpstreamStatus, lastRetryReason)
+	}
+
 	if stream && s.Cfg.EarlySSE {
-		startStream()
+		startStream(false)
+	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 {
+		go func() {
+			timer := time.NewTimer(s.Cfg.EarlySSEGrace)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				// No upstream call has completed yet, so attempt/status/retry are
+				// unknown here; pass -1 to omit them instead of reading variables owned
+				// by the request goroutine.
+				startStreamWith(true, -1, 0, "")
+			case <-ctx.Done():
+			case <-streamStarted:
+			}
+		}()
 	}
 
 	emitReasoningDelta := func(delta string) {
 		if delta == "" {
 			return
 		}
-		startStream()
+		startStream(false)
 		if !reasoningAdded {
 			reasoningAdded = true
 			emitSSE("response.output_item.added", map[string]any{
@@ -611,7 +640,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		if delta == "" {
 			return
 		}
-		startStream()
+		startStream(false)
 		outIdx := 0
 		if reasoningAdded {
 			outIdx = 1
@@ -714,8 +743,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			account.activeStreams++
 			account.mu.Unlock()
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
-				if ttftMs < 0 {
-					ttftMs = time.Since(reqStartedAt).Milliseconds()
+				if ttftMs.Load() < 0 {
+					ttftMs.Store(time.Since(reqStartedAt).Milliseconds())
 				}
 				attemptStateMu.Lock()
 				observeIdentity(update.AnsweredModelID, update.AnsweredModelLabel)
@@ -780,7 +809,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 								emitReasoningDelta(thoughts[len(sentThought):])
 								sentThought = thoughts
 							} else if servedID != "" && time.Since(attemptStartedAt) >= 5*time.Second {
-								startStream()
+								startStream(false)
 							}
 						}
 						canStreamText := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
@@ -1001,7 +1030,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"body_bytes":    flattenStats.BodyBytes,
 				"footer_bytes":  flattenStats.FooterBytes,
 				"tool_bytes":    flattenStats.ToolSchemaBytes,
-				"ttft_ms":       ttftMs,
+				"ttft_ms":       ttftMs.Load(),
 				"total_ms":      time.Since(reqStartedAt).Milliseconds(),
 				"status":        errStatus,
 				"error_code":    errCode,
@@ -1091,7 +1120,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}
 
 		if stream {
-			startStream()
+			startStream(false)
 			if s.Cfg.LiveThoughts && thoughts != "" {
 				if len(thoughts) > len(sentThought) {
 					emitReasoningDelta(thoughts[len(sentThought):])
@@ -1232,7 +1261,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			"body_bytes":    flattenStats.BodyBytes,
 			"footer_bytes":  flattenStats.FooterBytes,
 			"tool_bytes":    flattenStats.ToolSchemaBytes,
-			"ttft_ms":       ttftMs,
+			"ttft_ms":       ttftMs.Load(),
 			"total_ms":      time.Since(reqStartedAt).Milliseconds(),
 			"status":        200,
 			"error_code":    "",
