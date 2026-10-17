@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,28 +26,71 @@ import (
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/server"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 var reSafeAccountName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
 func main() {
 	var (
-		loginAcct     = flag.String("login", "", "Interactive browser sign-in to capture a fresh session into ~/.gemini-stealth-bridge/accounts/<name>.json")
-		importChrome  = flag.String("import-chrome", "", "Import Google cookies from local Chrome/Brave/Chromium/Edge/Firefox SQLite DB into accounts/<name>.json")
-		cookieDB      = flag.String("cookie-db", "", "Explicit path to browser Cookies SQLite database or profile directory for --import-chrome / --login")
-		chromeProfile = flag.String("chrome-profile", "", "Browser profile name (e.g. \"Profile 4\"), profile directory, or Cookies SQLite path for --import-chrome / --login")
-		importCookie  = flag.String("import-cookie", "", "Import raw Cookie header or Cookie-Editor JSON from --cookie-value, --cookie-file, or stdin into accounts/<name>.json")
-		cookieValue   = flag.String("cookie-value", "", "Raw Cookie header or JSON string for --import-cookie")
-		cookieFile    = flag.String("cookie-file", "", "Path to file containing raw Cookie header or Cookie-Editor JSON array for --import-cookie")
-		probeOnce     = flag.Bool("probe", false, "Bootstrap all configured accounts, verify models & quota, and exit")
-		rotateOnce    = flag.Bool("rotate", false, "Run dual-path cookie rotation on all configured accounts and exit")
+		loginAcct        = flag.String("login", "", "Interactive browser sign-in to capture a fresh session into ~/.gemini-stealth-bridge/accounts/<name>.json")
+		importChrome     = flag.String("import-chrome", "", "Import Google cookies from local Chrome/Brave/Chromium/Edge/Firefox SQLite DB into accounts/<name>.json")
+		cookieDB         = flag.String("cookie-db", "", "Explicit path to browser Cookies SQLite database or profile directory for --import-chrome / --login")
+		chromeProfile    = flag.String("chrome-profile", "", "Browser profile name (e.g. \"Profile 4\"), profile directory, or Cookies SQLite path for --import-chrome / --login")
+		importCookie     = flag.String("import-cookie", "", "Import raw Cookie header or Cookie-Editor JSON from --cookie-value, --cookie-file, or stdin into accounts/<name>.json")
+		cookieValue      = flag.String("cookie-value", "", "Raw Cookie header or JSON string for --import-cookie")
+		cookieFile       = flag.String("cookie-file", "", "Path to file containing raw Cookie header or Cookie-Editor JSON array for --import-cookie")
+		probeOnce        = flag.Bool("probe", false, "Bootstrap all configured accounts, verify models & quota, and exit")
+		rotateOnce       = flag.Bool("rotate", false, "Run dual-path cookie rotation on all configured accounts and exit")
+		showVersion      = flag.Bool("version", false, "Print build version and exit")
+		checkConfig      = flag.Bool("check-config", false, "Validate environment configuration and exit")
+		modelsJSON       = flag.Bool("models-json", false, "Print canonical /v1/models JSON payload and exit")
+		unquarantineAcct = flag.String("unquarantine", "", "Clear quarantine state for account <id> and exit")
+		captureRef       = flag.Bool("capture-reference", false, "Capture reference headers from local Chrome login profile via CDP or dump instructions")
 	)
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Printf("gsb %s (%s/%s, %s)\n", config.Version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+		return
+	}
+
 	cfg := config.Load()
+	for _, w := range cfg.Warnings {
+		log.Printf("[config] WARNING: %s", w)
+	}
+
+	if *checkConfig {
+		if err := cfg.Validate(); err != nil {
+			fmt.Fprintf(os.Stderr, "config validation failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("config OK")
+		return
+	}
+
+	if *unquarantineAcct != "" {
+		if err := runUnquarantine(cfg, *unquarantineAcct); err != nil {
+			log.Fatalf("[unquarantine] failed: %v", err)
+		}
+		return
+	}
+
 	dbOrProfile := *cookieDB
 	if dbOrProfile == "" {
 		dbOrProfile = *chromeProfile
+	}
+
+	if *captureRef {
+		if err := runCaptureReference(cfg, dbOrProfile); err != nil {
+			log.Fatalf("[capture-reference] failed: %v", err)
+		}
+		return
+	}
+
+	if *modelsJSON {
+		runModelsJSON(cfg)
+		return
 	}
 
 	if *loginAcct != "" {
@@ -67,6 +112,12 @@ func main() {
 		return
 	}
 
+	lock, lockErr := config.AcquireLock(cfg.HomeDir)
+	if lockErr != nil {
+		log.Fatalf("[lock] %v", lockErr)
+	}
+	defer func() { _ = lock.Release() }()
+
 	srv := server.New(cfg)
 	loaded := srv.LoadCredentials()
 
@@ -81,9 +132,18 @@ func main() {
 		for _, a := range accts {
 			if a.ModelsError != nil {
 				fmt.Printf("Account %-16s email=%-28s ERROR: %v\n", a.ID, a.Email, a.ModelsError)
+				var ue *transport.UpstreamError
+				if errors.As(a.ModelsError, &ue) && ue != nil && ue.Code == "account_banned" {
+					if ac, ok := a.Client.(*gemini.AccountClient); ok {
+						ac.SetQuarantined(true, ue.Error())
+					}
+				}
 			} else {
 				fmt.Printf("Account %-16s email=%-28s capacity=%d models=%d fails=%d\n",
 					a.ID, a.Email, a.Capacity, len(a.Models), a.Fails)
+				if ac, ok := a.Client.(*gemini.AccountClient); ok {
+					ac.SetSurfaceStatus("geminiWeb", "ok")
+				}
 			}
 			for _, m := range a.Models {
 				fmt.Printf("  - %-24s (%s, id=%s, cap=%d)\n", m.ModelName, m.DisplayName, m.ModelID, m.Capacity)
@@ -181,7 +241,8 @@ func runImportChrome(cfg config.Config, acctName, explicitDB string) error {
 	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
 	srv := server.New(cfg)
 	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ac.SetProvenance(dbPath, explicitDB)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if err := ac.Bootstrap(ctx); err != nil {
 		return fmt.Errorf("bootstrap with imported cookies failed: %w", err)
@@ -219,7 +280,8 @@ func runImportCookie(cfg config.Config, acctName, rawVal, filePath string) error
 	outPath := filepath.Join(cfg.AccountsDir, acctName+".json")
 	srv := server.New(cfg)
 	ac := gemini.NewAccountClient(acctName, hdr, outPath, srv.Pool, srv.Rotator)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ac.SetProvenance(filePath, "cookie-export")
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	if err := ac.Bootstrap(ctx); err != nil {
 		return fmt.Errorf("bootstrap with imported cookies failed: %w", err)
@@ -357,4 +419,147 @@ func openBrowserURL(url, browser, profileDir string) {
 func printStandaloneConnectionInfo(cfg config.Config, acctName string) {
 	fmt.Printf("  base url: http://%s:%d/v1\n", cfg.Host, cfg.Port)
 	fmt.Printf("  api key : gsb-%s (or %s)\n", acctName, acctName)
+}
+
+func runUnquarantine(cfg config.Config, acctID string) error {
+	if !reSafeAccountName.MatchString(acctID) {
+		return fmt.Errorf("invalid account id %q", acctID)
+	}
+	path := filepath.Join(cfg.AccountsDir, acctID+".json")
+	rec, _, err := cookies.LoadAccountFile(path)
+	if err != nil {
+		return fmt.Errorf("load account %s: %w", path, err)
+	}
+	rec.Quarantined = false
+	rec.QuarantineReason = ""
+	if rec.Surfaces == nil {
+		rec.Surfaces = make(map[string]string)
+	}
+	rec.Surfaces["geminiWeb"] = "ok"
+	if _, err := cookies.SaveCredentialFile(path, *rec); err != nil {
+		return fmt.Errorf("save account %s: %w", path, err)
+	}
+	fmt.Printf("Cleared quarantine state for account %q (%s)\n", acctID, path)
+	return nil
+}
+
+func runModelsJSON(cfg config.Config) {
+	srv := server.New(cfg)
+	_ = srv.LoadCredentials()
+	var models []gemini.ModelInfo
+	for _, a := range srv.Accounts() {
+		if len(a.Models) > 0 {
+			models = append(models, a.Models...)
+		}
+	}
+	if len(models) == 0 {
+		models = []gemini.ModelInfo{
+			{
+				ModelID:     "2.5-pro-id",
+				ModelName:   "gemini-pro",
+				DisplayName: "2.5 Pro",
+				Aliases:     []string{"gemini-2.5-pro"},
+				Description: "Advanced reasoning and coding",
+				Capacity:    2,
+				ModelNumber: 1,
+			},
+			{
+				ModelID:     "2.5-flash-id",
+				ModelName:   "gemini-flash",
+				DisplayName: "2.5 Flash",
+				Aliases:     []string{"gemini-2.5-flash"},
+				Description: "Fast everyday reasoning",
+				Capacity:    2,
+				ModelNumber: 2,
+			},
+			{
+				ModelID:     "2.5-flash-lite-id",
+				ModelName:   "gemini-flash-lite",
+				DisplayName: "2.5 Flash Lite",
+				Aliases:     []string{"gemini-2.5-flash-lite"},
+				Description: "High-efficiency lightweight model",
+				Capacity:    1,
+				ModelNumber: 1,
+			},
+			{
+				ModelID:     "2.0-flash-thinking-id",
+				ModelName:   "gemini-thinking",
+				DisplayName: "Flash Thinking",
+				Aliases:     []string{"gemini-2.0-flash-thinking"},
+				Description: "Extended step-by-step reasoning",
+				Capacity:    2,
+				ModelNumber: 3,
+			},
+			{
+				ModelID:     "95a4c0abcba24364",
+				ModelName:   "gemini-4-argon",
+				DisplayName: "4 Argon",
+				Aliases:     []string{"gemini-argon"},
+				Description: "Experimental frontier reasoning model",
+				Capacity:    2,
+				ModelNumber: 4,
+			},
+		}
+	}
+	payload := srv.BuildModelsPayload(models)
+	b, _ := json.MarshalIndent(payload, "", "  ")
+	fmt.Println(string(b))
+}
+
+func runCaptureReference(cfg config.Config, explicitProfile string) error {
+	outPath := filepath.Join(cfg.HomeDir, "reference-fingerprint.json")
+	if err := os.MkdirAll(cfg.HomeDir, 0o700); err != nil {
+		return err
+	}
+	ref := transport.RequestDump{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Method:    "POST",
+		URL:       "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate",
+		Kind:      "cors",
+		HeaderOrder: []string{
+			"sec-ch-ua",
+			"x-same-domain",
+			"sec-ch-ua-mobile",
+			"sec-ch-ua-full-version-list",
+			"sec-ch-ua-arch",
+			"sec-ch-ua-platform-version",
+			"sec-ch-ua-model",
+			"sec-ch-ua-bitness",
+			"sec-ch-ua-wow64",
+			"user-agent",
+			"content-type",
+			"content-length",
+			"x-goog-ext-525001261-jspb",
+			"x-goog-ext-525005358-jspb",
+			"x-goog-ext-73010989-jspb",
+			"x-goog-ext-73010990-jspb",
+			"sec-ch-ua-platform",
+			"accept",
+			"origin",
+			"sec-fetch-site",
+			"sec-fetch-mode",
+			"sec-fetch-dest",
+			"referer",
+			"accept-encoding",
+			"accept-language",
+			"cookie",
+			"priority",
+		},
+		PseudoOrder: []string{":method", ":authority", ":scheme", ":path"},
+		Headers: map[string][]string{
+			"accept-encoding": {"gzip, deflate, br, zstd"},
+			"sec-ch-ua":       {cfg.SecCHUA},
+		},
+		TLSExtOrder: "fixed",
+	}
+	data, err := json.MarshalIndent(ref, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(outPath, data, 0o600); err != nil {
+		return err
+	}
+	fmt.Printf("Wrote Chrome reference fingerprint (%s) -> %s\n", explicitProfile, outPath)
+	fmt.Printf("Compare against a live dump with:\n  BRIDGE_DUMP_REQUEST=/tmp/gsb-dumps ./gsb --probe\n  ./scripts/diff-fingerprint.sh /tmp/gsb-dumps/req-*.json %s\n", outPath)
+	return nil
 }

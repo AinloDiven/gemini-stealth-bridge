@@ -32,6 +32,8 @@ type StreamOptions struct {
 	Metadata      []any // 10-element [cid, rid, rcid, null, null, null, null, null, null, contextToken]
 	Files         []UploadedFile
 	DisableTools  bool
+	HasTools      bool
+	ProtocolMode  string // "bridge" | "web"
 	FreshSocket   bool
 }
 
@@ -207,11 +209,20 @@ func (ac *AccountClient) uploadFileLocked(ctx context.Context, sc *transport.Ste
 func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (innerJSON string, uuidVal string, modelHeader string) {
 	ac.mu.RLock()
 	fSid := ac.fSid
+	defLang := ac.locale
+	defProto := ac.protocolMode
 	ac.mu.RUnlock()
 
 	lang := opts.Language
 	if lang == "" {
+		lang = defLang
+	}
+	if lang == "" {
 		lang = "en"
+	}
+	protoMode := opts.ProtocolMode
+	if protoMode == "" {
+		protoMode = defProto
 	}
 	meta := opts.Metadata
 	if len(meta) == 0 {
@@ -234,8 +245,13 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 	inner[6] = []int{1}
 	inner[7] = 1  // enable_token_streaming
 	inner[10] = 1 // request_source
-	if opts.DisableTools {
-		inner[11] = 1 // disable_tools (strip consumer Workspace/YouTube/Maps extensions)
+	isPureWeb := strings.EqualFold(protoMode, "web") && !opts.HasTools && !opts.DisableTools
+	if !isPureWeb && (opts.DisableTools || opts.HasTools || !strings.EqualFold(protoMode, "web")) {
+		if opts.DisableTools || opts.HasTools {
+			inner[11] = 1 // disable_tools (strip consumer Workspace/YouTube/Maps extensions)
+		} else {
+			inner[11] = 0
+		}
 	} else {
 		inner[11] = 0
 	}
@@ -249,8 +265,13 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 	}
 	inner[53] = 0
 	inner[61] = []any{}
-	inner[67] = 1 // is_personal_context_disabled
-	inner[68] = 1
+	if isPureWeb {
+		inner[67] = 0
+		inner[68] = 0
+	} else {
+		inner[67] = 1 // is_personal_context_disabled
+		inner[68] = 1
+	}
 	if len(meta) >= 10 {
 		cid, _ := meta[0].(string)
 		ctxTok, _ := meta[9].(string)
@@ -293,9 +314,9 @@ func (ac *AccountClient) StreamGenerateLive(
 	}
 
 	var result *StreamResponse
-	err = sess.RunStream(ctx, func(_ string) error {
+	err = sess.RunStream(ctx, func(leasedCookie string) error {
 		var runErr error
-		result, runErr = ac.streamGenerateLocked(ctx, sess.Client, prompt, opts, onFrame)
+		result, runErr = ac.streamGenerateLocked(ctx, sess.Client, leasedCookie, prompt, opts, onFrame)
 		return runErr
 	})
 	return result, err
@@ -304,6 +325,7 @@ func (ac *AccountClient) StreamGenerateLive(
 func (ac *AccountClient) streamGenerateLocked(
 	ctx context.Context,
 	sc *transport.StealthClient,
+	leasedCookie string,
 	prompt string,
 	opts StreamOptions,
 	onFrame func(update *LineParseResult) error,
@@ -314,21 +336,28 @@ func (ac *AccountClient) streamGenerateLocked(
 
 	innerJSON, uuidVal, modelHeader := ac.BuildInnerRequest(prompt, opts)
 
+	startGen := ac.cookieGen.Load()
 	ac.mu.RLock()
 	at := ac.at
 	bl := ac.bl
 	fSid := ac.fSid
 	cookie := ac.cookieHeader
+	defLang := ac.locale
 	ac.mu.RUnlock()
+	if leasedCookie != "" {
+		cookie = leasedCookie
+	}
 
 	lang := opts.Language
+	if lang == "" {
+		lang = defLang
+	}
 	if lang == "" {
 		lang = "en"
 	}
 	q := url.Values{}
 	q.Set("hl", lang)
 	q.Set("_reqid", strconv.FormatInt(ac.nextReqID(), 10))
-	q.Set("rt", "c")
 	if bl != "" {
 		q.Set("bl", bl)
 	}
@@ -433,7 +462,16 @@ func (ac *AccountClient) streamGenerateLocked(
 		}
 		return nil, err
 	}
-	ac.absorbAndPersistCookies(res.SetCookies)
+	ac.absorbAndPersistCookiesWithGen(res.SetCookies, startGen, true)
+
+	if res.Status != 200 {
+		if res.Status == 403 && (strings.Contains(res.Body, "TOS_VIOLATION") || strings.Contains(res.Body, "PERMISSION_DENIED")) {
+			return nil, classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "account_banned")
+		}
+		if res.Status == 302 || res.Status == 301 || res.Status == 303 || res.Status == 307 || res.Status == 308 {
+			return nil, classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "auth_redirect")
+		}
+	}
 
 	if res.Status == 200 {
 		if tail := strings.TrimSpace(lineBuf.String()); tail != "" {

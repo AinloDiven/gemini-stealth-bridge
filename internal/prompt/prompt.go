@@ -16,9 +16,10 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
-
+	"unicode/utf8"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
@@ -89,6 +90,14 @@ type FlattenOptions struct {
 	MaxPromptChars  int
 	MaxOldToolChars int
 	AllowOverflow   bool
+}
+
+// FlattenStats records the byte breakdown of a flattened prompt.
+type FlattenStats struct {
+	HeaderBytes     int `json:"headerBytes"`
+	BodyBytes       int `json:"bodyBytes"`
+	FooterBytes     int `json:"footerBytes"`
+	ToolSchemaBytes int `json:"toolSchemaBytes"`
 }
 
 // ParseDataURLImage decodes a data:image/...;base64,... URL into an AttachmentPart.
@@ -319,6 +328,18 @@ func FlattenMessages(
 	toolChoice any,
 	opts FlattenOptions,
 ) (string, []AttachmentPart, error) {
+	out, files, _, err := FlattenMessagesWithStats(messages, tools, toolChoice, opts)
+	return out, files, err
+}
+
+// FlattenMessagesWithStats converts an OpenAI/Anthropic message history + tools into a single
+// structured prompt, optional overflow attachments, and byte-level composition statistics.
+func FlattenMessagesWithStats(
+	messages []map[string]any,
+	tools any,
+	toolChoice any,
+	opts FlattenOptions,
+) (string, []AttachmentPart, FlattenStats, error) {
 	var (
 		sys          []string
 		turns        []turnEntry
@@ -461,16 +482,18 @@ func FlattenMessages(
 
 	contract, err := toolbridge.ValidateToolRequest(tools, toolChoice)
 	if err != nil {
-		return "", nil, err
+		return "", nil, FlattenStats{}, err
 	}
 	hasTools := len(contract.Tools) > 0 && contract.ChoiceMode != "none"
 
+	toolSchemaBytes := 0
 	if hasTools && opts.StartIndex == 0 {
 		instr, err := toolbridge.BuildToolInstructions(tools, toolChoice)
 		if err != nil {
-			return "", nil, err
+			return "", nil, FlattenStats{}, err
 		}
 		if instr != "" {
+			toolSchemaBytes += len(instr)
 			sys = append(sys, instr)
 		}
 	}
@@ -486,6 +509,7 @@ func FlattenMessages(
 	}
 	footer := ""
 	if reminder != "" {
+		toolSchemaBytes += len(reminder)
 		footer = reminder + "\n\n"
 	}
 	if len(turns) > 1 || hasTools {
@@ -695,25 +719,103 @@ func FlattenMessages(
 		}
 	}
 
-	return header + body + footer, overflowFiles, nil
+	stats := FlattenStats{
+		HeaderBytes:     len(header),
+		BodyBytes:       len(body),
+		FooterBytes:     len(footer),
+		ToolSchemaBytes: toolSchemaBytes,
+	}
+	return header + body + footer, overflowFiles, stats, nil
 }
 
-// EstimateTokens estimates token count at ~4 UTF-8 bytes per token.
+var (
+	estimatorMu   sync.RWMutex
+	estimatorMode = "script"
+)
+
+// SetTokenEstimatorMode configures EstimateTokens to use "script" (CJK-aware, default)
+// or "bytes4" (~4 UTF-8 bytes per token).
+func SetTokenEstimatorMode(mode string) {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	if m != "bytes4" && m != "script" {
+		m = "script"
+	}
+	estimatorMu.Lock()
+	estimatorMode = m
+	estimatorMu.Unlock()
+}
+
+func getTokenEstimatorMode() string {
+	estimatorMu.RLock()
+	defer estimatorMu.RUnlock()
+	return estimatorMode
+}
+
+func isCJKRune(r rune) bool {
+	return (r >= 0x4E00 && r <= 0x9FFF) || // CJK Unified Ideographs
+		(r >= 0x3400 && r <= 0x4DBF) || // CJK Extension A
+		(r >= 0x3040 && r <= 0x30FF) || // Hiragana & Katakana
+		(r >= 0xAC00 && r <= 0xD7AF) || // Hangul Syllables
+		(r >= 0x3000 && r <= 0x303F) || // CJK Symbols & Punctuation
+		(r >= 0xFF00 && r <= 0xFFEF) // Halfwidth and Fullwidth Forms
+}
+
+// EstimateTokens estimates token count using either script-aware CJK counting (~1.5 tokens/CJK rune)
+// or ~4 UTF-8 bytes per token when mode is "bytes4".
 func EstimateTokens(s string) int {
 	n := len(s)
 	if n == 0 {
 		return 0
 	}
-	t := (n + 3) / 4
-	if t < 1 {
+	if getTokenEstimatorMode() == "bytes4" {
+		t := (n + 3) / 4
+		if t < 1 {
+			return 1
+		}
+		return t
+	}
+	cjkRunes := 0
+	otherBytes := 0
+	for _, r := range s {
+		if isCJKRune(r) {
+			cjkRunes++
+		} else {
+			otherBytes += utf8.RuneLen(r)
+		}
+	}
+	if cjkRunes == 0 {
+		t := (n + 3) / 4
+		if t < 1 {
+			return 1
+		}
+		return t
+	}
+	cjkTokens := (cjkRunes*3 + 1) / 2
+	otherTokens := 0
+	if otherBytes > 0 {
+		otherTokens = (otherBytes + 3) / 4
+	}
+	total := cjkTokens + otherTokens
+	if total < 1 {
 		return 1
 	}
-	return t
+	return total
 }
 
-// BuildUsage constructs the OpenAI usage object including reasoning_tokens details.
+// BuildUsage constructs the OpenAI usage object including reasoning_tokens and prompt_tokens_details.
 func BuildUsage(promptText, completionText, reasoningText string) map[string]any {
-	promptTokens := EstimateTokens(promptText)
+	return BuildUsageWithCache(promptText, promptText, completionText, reasoningText)
+}
+
+// BuildUsageWithCache constructs the OpenAI usage object, computing cached_tokens
+// from the difference between the logical prompt and the delta prompt actually uploaded.
+func BuildUsageWithCache(logicalPrompt, uploadedPrompt, completionText, reasoningText string) map[string]any {
+	promptTokens := EstimateTokens(logicalPrompt)
+	uploadedTokens := EstimateTokens(uploadedPrompt)
+	cachedTokens := 0
+	if uploadedPrompt != "" && uploadedPrompt != logicalPrompt && promptTokens > uploadedTokens {
+		cachedTokens = promptTokens - uploadedTokens
+	}
 	textTokens := EstimateTokens(completionText)
 	reasoningTokens := EstimateTokens(reasoningText)
 	completionTokens := textTokens + reasoningTokens
@@ -721,6 +823,9 @@ func BuildUsage(promptText, completionText, reasoningText string) map[string]any
 		"prompt_tokens":     promptTokens,
 		"completion_tokens": completionTokens,
 		"total_tokens":      promptTokens + completionTokens,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": cachedTokens,
+		},
 	}
 	if reasoningTokens > 0 {
 		usage["completion_tokens_details"] = map[string]any{

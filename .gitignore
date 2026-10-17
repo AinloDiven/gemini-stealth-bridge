@@ -9,3 +9,7 @@
 cookies.json
 web-credentials.json
 session-cache.json
+
+# Personal backlog & internal update plans, not part of the published repo
+/ROADMAP.md
+/PLAN_UPDATE_v0.2.0.md

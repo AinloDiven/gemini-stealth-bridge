@@ -27,6 +27,24 @@ type QuotaBucket struct {
 	Remaining       int      `json:"remaining"`
 	ResetAt         string   `json:"resetAt,omitempty"`
 	Unlimited       bool     `json:"unlimited"`
+	Synthetic       bool     `json:"synthetic,omitempty"`
+	Strikes         int      `json:"-"`
+}
+
+// ModelLimits defines the context window and maximum output tokens for a model.
+type ModelLimits struct {
+	ContextWindow int `json:"contextWindow"`
+	MaxOutput     int `json:"maxOutput"`
+}
+
+// ModelCapabilities describes the features and reasoning effort support of a model.
+type ModelCapabilities struct {
+	Reasoning     bool     `json:"reasoning"`
+	Vision        bool     `json:"vision"`
+	Tools         bool     `json:"tools"`
+	Search        bool     `json:"search"`
+	EffortLevels  []string `json:"effortLevels,omitempty"`
+	DefaultEffort string   `json:"defaultEffort"`
 }
 
 // ThinkingLevels maps Gemini Web's 3 thinking levels ("low", "medium", "high") to
@@ -46,9 +64,70 @@ var SupportedThinkingEfforts = []string{"low", "medium", "high"}
 
 var reThinkingCapable = regexp.MustCompile(`(?i)thinking|pro|argon|flash`)
 
+var explicitReasoningModels = map[string]bool{
+	"gemini-pro":                true,
+	"gemini-flash":              true,
+	"gemini-thinking":           true,
+	"gemini-argon":              true,
+	"gemini-4-argon":            true,
+	"gemini-3-pro":              true,
+	"gemini-2.5-pro":            true,
+	"gemini-2.5-flash":          true,
+	"gemini-2.0-flash-thinking": true,
+	"gemini-flash-lite":         false,
+	"gemini-2.5-flash-lite":     false,
+	"gemini-2.0-flash-lite":     false,
+}
+
 // IsReasoningModel reports whether modelName supports extended thinking/reasoning.
 func IsReasoningModel(modelName string) bool {
-	return reThinkingCapable.MatchString(modelName)
+	clean, _ := ParseModelRequest(modelName)
+	lower := strings.ToLower(strings.TrimSpace(clean))
+	if strings.Contains(lower, "lite") {
+		return false
+	}
+	if val, ok := explicitReasoningModels[lower]; ok {
+		return val
+	}
+	return reThinkingCapable.MatchString(lower)
+}
+
+// ResolveModelCapabilities returns the structured capabilities for a ModelInfo.
+func ResolveModelCapabilities(m ModelInfo) ModelCapabilities {
+	lowerName := strings.ToLower(strings.TrimSpace(m.ModelName))
+	lowerDisp := strings.ToLower(strings.TrimSpace(m.DisplayName))
+	if strings.Contains(lowerName, "lite") || strings.Contains(lowerDisp, "lite") {
+		return ModelCapabilities{
+			Reasoning:     false,
+			Vision:        true,
+			Tools:         true,
+			Search:        true,
+			EffortLevels:  nil,
+			DefaultEffort: "low",
+		}
+	}
+	reasoning := IsReasoningModel(m.ModelName)
+	if !reasoning && m.DisplayName != "" {
+		reasoning = IsReasoningModel(m.DisplayName)
+	}
+	if reasoning {
+		return ModelCapabilities{
+			Reasoning:     true,
+			Vision:        true,
+			Tools:         true,
+			Search:        true,
+			EffortLevels:  SupportedThinkingEfforts,
+			DefaultEffort: "high",
+		}
+	}
+	return ModelCapabilities{
+		Reasoning:     false,
+		Vision:        true,
+		Tools:         true,
+		Search:        true,
+		EffortLevels:  nil,
+		DefaultEffort: "low",
+	}
 }
 
 // ComputeCapacity derives the account's capacity and capacityField (12 or 13)
@@ -221,7 +300,7 @@ func resolveDefaultThinkingLevel(defaultEffort string) int {
 func ThinkingLevelFor(rawEffort any, modelName, defaultEffort string) int {
 	defLvl := resolveDefaultThinkingLevel(defaultEffort)
 	if rawEffort == nil || rawEffort == "" {
-		if reThinkingCapable.MatchString(modelName) {
+		if IsReasoningModel(modelName) {
 			return defLvl
 		}
 		return 1
@@ -230,7 +309,7 @@ func ThinkingLevelFor(rawEffort any, modelName, defaultEffort string) int {
 	case string:
 		key := strings.ToLower(strings.TrimSpace(v))
 		if key == "" {
-			if reThinkingCapable.MatchString(modelName) {
+			if IsReasoningModel(modelName) {
 				return defLvl
 			}
 			return 1

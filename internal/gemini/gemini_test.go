@@ -6,7 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
-
+	"unicode/utf8"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	fhttp "github.com/bogdanfinn/fhttp"
@@ -329,5 +329,166 @@ func BenchmarkSanitizeCandidateTextAndThoughts_24KBStream(b *testing.B) {
 		for idx, f := range frames {
 			_, _ = sanitizeCandidateTextAndThoughts(f, "", idx == len(frames)-1)
 		}
+	}
+}
+
+func TestMultilingualThinkingExtraction(t *testing.T) {
+	cases := []struct {
+		name         string
+		rawText      string
+		wantThought  string
+		wantText     string
+	}{
+		{
+			name:        "SimplifiedChineseWithFullwidthColon",
+			rawText:     "思考过程：\n1. 分析问题\n\n最终答案：\n这是最终回复。",
+			wantThought: "1. 分析问题",
+			wantText:    "这是最终回复。",
+		},
+		{
+			name:        "EmojiMarkdownThinking",
+			rawText:     "💭 **Thinking Process**:\nEvaluating options A and B.\n\nAnswer: Option A.",
+			wantThought: "Evaluating options A and B.",
+			wantText:    "Option A.",
+		},
+		{
+			name:        "KoreanThinkingProcess",
+			rawText:     "생각 과정:\n단계별 분석입니다.\n\n최종 답변: 완료되었습니다.",
+			wantThought: "단계별 분석입니다.",
+			wantText:    "완료되었습니다.",
+		},
+		{
+			name:        "JapaneseThinkingProcess",
+			rawText:     "思考プロセス：\nまず要件を確認します。\n\n回答：実装が完了しました。",
+			wantThought: "まず要件を確認します。",
+			wantText:    "実装が完了しました。",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Streaming partial chunks must never emit invalid UTF-8 (\ufffd) or leak thinking headers
+			runes := []rune(tc.rawText)
+			for i := 1; i < len(runes); i++ {
+				partial := string(runes[:i])
+				txt, th := sanitizeCandidateTextAndThoughts(partial, "", false)
+				if !utf8.ValidString(txt) || strings.ContainsRune(txt, utf8.RuneError) {
+					t.Fatalf("invalid UTF-8 in streaming text at rune %d: %q", i, txt)
+				}
+				if !utf8.ValidString(th) || strings.ContainsRune(th, utf8.RuneError) {
+					t.Fatalf("invalid UTF-8 in streaming thoughts at rune %d: %q", i, th)
+				}
+			}
+
+			finalTxt, finalTh := sanitizeCandidateTextAndThoughts(tc.rawText, "", true)
+			if finalTxt != tc.wantText {
+				t.Fatalf("got text=%q, want %q", finalTxt, tc.wantText)
+			}
+			if finalTh != tc.wantThought {
+				t.Fatalf("got thought=%q, want %q", finalTh, tc.wantThought)
+			}
+		})
+	}
+}
+
+func TestBootstrapRotation429NotAuthError(t *testing.T) {
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			u := req.URL.String()
+			switch {
+			case strings.HasSuffix(u, "/app"):
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{},
+					Body:       io.NopCloser(strings.NewReader(`<html>no token</html>`)),
+				}, nil
+			case strings.Contains(u, "RotateCookies"):
+				return &fhttp.Response{
+					StatusCode: 429,
+					Header:     fhttp.Header{"Retry-After": []string{"60"}},
+					Body:       io.NopCloser(strings.NewReader(`rate limited`)),
+				}, nil
+			default:
+				return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}
+		},
+	}
+	pool := transport.NewPool(transport.PoolOptions{
+		ClientConfig: transport.ClientConfig{CustomDoer: doer},
+		MaxSessions:  2,
+	})
+	ac := NewAccountClient("acct_429", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1", "", pool, cookies.NewRotator())
+	err := ac.Bootstrap(context.Background())
+	var ue *transport.UpstreamError
+	if !errors.As(err, &ue) || ue.StatusCode != 429 || ue.Code != "rate_limit_error" {
+		t.Fatalf("expected 429 rate_limit_error on rotation 429 during bootstrap, got %+v (%v)", ue, err)
+	}
+}
+
+func TestConcurrentStreamCookieGenerationGuard(t *testing.T) {
+	streamStarted := make(chan struct{})
+	releaseStream := make(chan struct{})
+
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			u := req.URL.String()
+			switch {
+			case strings.Contains(u, "StreamGenerate"):
+				close(streamStarted)
+				<-releaseStream
+				inner := `[null,["c_1","r_1"],null,null,[["rc_1",["done"],null,null,null,null,null,null,[2]]],{"40":"95a4c0abcba24364","43":"4 Argon"}]`
+				esc, _ := marshalJSONString(inner)
+				body := ")]}'\n\n" + `[["wrb.fr",null,` + esc + `]]` + "\n"
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header: fhttp.Header{
+						"Set-Cookie": []string{"__Secure-1PSIDTS=stale_stream_ts; Path=/; Secure; HttpOnly"},
+					},
+					Body: io.NopCloser(strings.NewReader(body)),
+				}, nil
+			case strings.Contains(u, "RotateCookies"):
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header: fhttp.Header{
+						"Set-Cookie": []string{"__Secure-1PSIDTS=newer_rotated_ts; Path=/; Secure; HttpOnly"},
+					},
+					Body: io.NopCloser(strings.NewReader(`[]`)),
+				}, nil
+			default:
+				return &fhttp.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}
+		},
+	}
+
+	pool := transport.NewPool(transport.PoolOptions{
+		ClientConfig: transport.ClientConfig{CustomDoer: doer},
+		MaxSessions:  2,
+		MaxQueue:    4,
+	})
+	ac := NewAccountClient("acct_gen", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=initial_ts", "", pool, cookies.NewRotator())
+	ac.SetTokens("at_valid", "bl_valid", "fsid_1")
+
+	doneCh := make(chan error, 1)
+	go func() {
+		_, err := ac.StreamGenerateLive(context.Background(), "hi", StreamOptions{
+			Model:         &ModelInfo{ModelID: "95a4c0abcba24364", ModelName: "gemini-argon"},
+			ThinkingLevel: 1,
+		}, nil)
+		doneCh <- err
+	}()
+
+	<-streamStarted
+	// While stream (started at generation G0) is in flight, RotateCookies updates jar to generation G1
+	rotRes, err := ac.RotateCookies(context.Background())
+	if err != nil || !rotRes.Rotated {
+		t.Fatalf("RotateCookies failed: res=%+v err=%v", rotRes, err)
+	}
+	close(releaseStream)
+	if sErr := <-doneCh; sErr != nil {
+		t.Fatalf("StreamGenerateLive failed: %v", sErr)
+	}
+
+	if !strings.Contains(ac.CookieHeader(), "__Secure-1PSIDTS=newer_rotated_ts") {
+		t.Fatalf("stale stream Set-Cookie overwrote newer rotated cookie! got: %s", ac.CookieHeader())
 	}
 }

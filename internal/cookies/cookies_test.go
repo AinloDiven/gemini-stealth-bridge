@@ -9,13 +9,15 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"fmt"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
-	fhttp "github.com/bogdanfinn/fhttp"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
+	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 type stubCookieDoer struct {
@@ -290,5 +292,66 @@ func TestParseProfileHint(t *testing.T) {
 		if b != tc.wantBrowser || p != tc.wantProfile {
 			t.Errorf("ParseProfileHint(%q) = (%q, %q), want (%q, %q)", tc.in, b, p, tc.wantBrowser, tc.wantProfile)
 		}
+	}
+}
+
+func TestAbsorbSetCookieDeletion(t *testing.T) {
+	initial := "SID=s1; SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=old_ts; SIDCC=old_cc; __Secure-3PSIDCC=old_3cc"
+	merged, changed := AbsorbSetCookie(initial, []string{
+		"__Secure-1PSIDTS=; Max-Age=0; Path=/; Secure; HttpOnly",
+		"SIDCC=deleted; Path=/",
+		"__Secure-3PSIDCC=stale_val; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path=/",
+	})
+	if !changed {
+		t.Fatal("expected changed=true on cookie deletion")
+	}
+	if strings.Contains(merged, "__Secure-1PSIDTS=") || strings.Contains(merged, "SIDCC=") || strings.Contains(merged, "__Secure-3PSIDCC=") {
+		t.Fatalf("expected deleted cookies removed from canonical header, got: %s", merged)
+	}
+	if !strings.Contains(merged, "SID=s1") || !strings.Contains(merged, "SAPISID=sap1") {
+		t.Fatalf("expected remaining cookies preserved, got: %s", merged)
+	}
+}
+
+func TestSQLiteImportFiltersExpired(t *testing.T) {
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "Cookies")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE cookies (host_key TEXT, name TEXT, encrypted_value BLOB, value TEXT, has_expires INTEGER, expires_utc INTEGER, is_persistent INTEGER)`)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+
+	pastUnix := time.Now().Add(-2 * time.Hour).Unix()
+	futureUnix := time.Now().Add(24 * time.Hour).Unix()
+	pastChromium := (pastUnix + chromiumEpochOffsetSec) * 1_000_000
+	futureChromium := (futureUnix + chromiumEpochOffsetSec) * 1_000_000
+
+	// Insert expired SID and valid SID + valid SAPISID + valid __Secure-1PSID
+	_, err = db.Exec(`INSERT INTO cookies VALUES
+		('.google.com', 'SID', X'', 'expired_sid', 1, ?, 1),
+		('.google.com', 'SID', X'', 'valid_sid', 1, ?, 1),
+		('.google.com', 'SAPISID', X'', 'valid_sap', 1, ?, 1),
+		('.google.com', '__Secure-1PSID', X'', 'valid_psid', 0, 0, 0)
+	`, pastChromium, futureChromium, futureChromium)
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	db.Close()
+
+	res, err := ReadBrowserCookies(dbPath)
+	if err != nil {
+		t.Fatalf("ReadBrowserCookies failed: %v", err)
+	}
+	if strings.Contains(res.Header, "expired_sid") {
+		t.Fatalf("expected expired_sid to be filtered out, got header: %s", res.Header)
+	}
+	if !strings.Contains(res.Header, "SID=valid_sid") || !strings.Contains(res.Header, "SAPISID=valid_sap") {
+		t.Fatalf("expected valid cookies in header, got: %s", res.Header)
 	}
 }

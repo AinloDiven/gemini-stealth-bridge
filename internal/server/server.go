@@ -2,21 +2,27 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
@@ -37,23 +43,37 @@ type UpstreamClient interface {
 
 // AccountState holds the server-side state and cached metadata for one Google account.
 type AccountState struct {
-	mu              sync.RWMutex
-	ID              string
-	Email           string
-	FilePath        string
-	CapturedAt      time.Time
-	Client          UpstreamClient
-	Models          []gemini.ModelInfo
-	Capacity        int
-	Quota           []gemini.QuotaBucket
-	QuotaAt         time.Time
-	quotaRefreshing bool
-	ModelsAt        time.Time
-	ModelsError     error
-	Fails           int
-	LastFail        time.Time
-	LastError       string
-	LastUsed        time.Time
+	mu               sync.RWMutex
+	ID               string
+	Email            string
+	FilePath         string
+	CapturedAt       time.Time
+	RotatedAt        time.Time
+	ImportedFrom     string
+	ProfileID        string
+	AccountGroup     string
+	Quarantined      bool
+	QuarantineReason string
+	Surfaces         map[string]string
+	NextRotateAt     time.Time
+	NextModelRefAt   time.Time
+	QuotaBackoffStep int
+	QuotaNextAllowAt time.Time
+	reqTimestamps    []time.Time
+	activeStreams    int
+	subStrikes       map[string]int
+	Client           UpstreamClient
+	Models           []gemini.ModelInfo
+	Capacity         int
+	Quota            []gemini.QuotaBucket
+	QuotaAt          time.Time
+	quotaRefreshing  bool
+	ModelsAt         time.Time
+	ModelsError      error
+	Fails            int
+	LastFail         time.Time
+	LastError        string
+	LastUsed         time.Time
 }
 
 // AuthScope represents the caller's resolved token scope.
@@ -74,16 +94,22 @@ type Server struct {
 	Pool    *transport.Pool
 	Rotator *cookies.Rotator
 
-	mu             sync.RWMutex
-	accounts       []*AccountState
-	tokenToAcct    map[string]string
-	sessionCache   map[string][]any
-	sessionCacheAt map[string]time.Time
-	sessionOrder   []string
-	uploadCache    map[string]cachedUpload
-	uploadOrder    []string
-	lastHotLoadAt  time.Time
-	clientFactory  func(a *AccountState) UpstreamClient
+	mu                sync.RWMutex
+	accounts          []*AccountState
+	tokenToAcct       map[string]string
+	sessionCache      map[string][]any
+	sessionCacheAt    map[string]time.Time
+	sessionOrder      []string
+	uploadCache       map[string]cachedUpload
+	uploadOrder       []string
+	lastHotLoadAt     time.Time
+	startedAt         time.Time
+	clock             func() time.Time
+	cacheHits         atomic.Uint64
+	cacheMisses       atomic.Uint64
+	cacheFlushMu      sync.Mutex
+	cacheFlushPending atomic.Bool
+	clientFactory     func(a *AccountState) UpstreamClient
 }
 
 // New constructs a new Server from cfg.
@@ -92,6 +118,11 @@ func New(cfg config.Config) *Server {
 	if maxSessions <= 0 {
 		maxSessions = 16
 	}
+	if cfg.TokenEstimator != "" {
+		prompt.SetTokenEstimatorMode(cfg.TokenEstimator)
+	}
+	toolbridge.SetCompactOptions(cfg.ToolSchemaCompact, cfg.ToolDescMaxChars)
+
 	pool := transport.NewPool(transport.PoolOptions{
 		ClientConfig: transport.ClientConfig{
 			ProfileName:      cfg.ImpersonateProfile,
@@ -99,6 +130,11 @@ func New(cfg config.Config) *Server {
 			UserAgent:        cfg.UserAgent,
 			SecCHUA:          cfg.SecCHUA,
 			SecCHUAPlatform:  cfg.SecCHUAPlatform,
+			AcceptLanguage:   cfg.AcceptLanguage,
+			TLSExtOrder:      cfg.TLSExtOrder,
+			FollowRedirects:  cfg.FollowRedirects,
+			IPv6Mode:         cfg.IPv6Mode,
+			DumpRequestDir:   cfg.DumpRequestDir,
 			Timeout:          cfg.StreamTimeout,
 			FirstByteTimeout: cfg.FirstByteTimeout,
 			StallTimeout:     cfg.StallTimeout,
@@ -122,9 +158,18 @@ func New(cfg config.Config) *Server {
 		sessionCache:   make(map[string][]any),
 		sessionCacheAt: make(map[string]time.Time),
 		uploadCache:    make(map[string]cachedUpload),
+		startedAt:      time.Now().UTC(),
+		clock:          time.Now,
 	}
 	s.loadSessionCacheFromDisk()
 	return s
+}
+
+func (s *Server) now() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
 }
 
 // extractRequestToken extracts the caller's API key from Authorization Bearer,
@@ -229,6 +274,58 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 
+	case r.Method == http.MethodGet && p == "/readyz":
+		accts := s.Accounts()
+		acctReports := make([]map[string]any, 0, len(accts))
+		healthyCount := 0
+		quarantinedCount := 0
+		refInterval := s.Cfg.ModelRefreshEvery
+		if refInterval <= 0 {
+			refInterval = 30 * time.Minute
+		}
+		now := s.now()
+		for _, a := range accts {
+			a.mu.RLock()
+			mFresh := !a.ModelsAt.IsZero() && now.Sub(a.ModelsAt) < 2*refInterval
+			qFresh := !a.QuotaAt.IsZero() && now.Sub(a.QuotaAt) < 30*time.Minute
+			authOK := a.ModelsError == nil && !a.Quarantined
+			hasModels := len(a.Models) > 0
+			qState := a.Quarantined
+			id := a.ID
+			a.mu.RUnlock()
+			if qState {
+				quarantinedCount++
+			}
+			if authOK && hasModels {
+				healthyCount++
+			}
+			acctReports = append(acctReports, map[string]any{
+				"id":           id,
+				"models_fresh": mFresh,
+				"quota_fresh":  qFresh,
+				"auth_ok":      authOK,
+				"quarantined":  qState,
+			})
+		}
+		statusStr := "ok"
+		httpCode := 200
+		if len(accts) == 0 || healthyCount == 0 || quarantinedCount > 0 || healthyCount < len(accts) {
+			statusStr = "degraded"
+			if len(accts) == 0 || healthyCount == 0 {
+				if r.URL.Query().Get("strict") == "1" {
+					httpCode = 503
+				}
+			}
+		}
+		sendJSON(w, httpCode, map[string]any{
+			"status":      statusStr,
+			"healthy":     healthyCount,
+			"quarantined": quarantinedCount,
+			"total":       len(accts),
+			"accounts":    acctReports,
+		}, nil)
+		return
+
 	case r.Method == http.MethodGet && (p == "/v1/sessions" || p == "/sessions"):
 		scope := s.ResolveAuthScope(r)
 		if !scope.OK {
@@ -236,9 +333,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sendJSON(w, 200, map[string]any{
-			"transport": "stealth-utls-h2",
-			"profile":   s.Cfg.ImpersonateProfile,
-			"sessions":  s.Pool.Status(),
+			"transport":     "stealth-utls-h2",
+			"profile":       s.Cfg.ImpersonateProfile,
+			"sessions":      s.Pool.Status(),
+			"cache_entries": s.sessionCacheLen(),
+			"cache_hits":    s.cacheHits.Load(),
+			"cache_misses":  s.cacheMisses.Load(),
 		}, nil)
 		return
 
@@ -257,13 +357,38 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			for _, m := range a.Models {
 				mNames = append(mNames, m.ModelName)
 			}
+			var capAtStr, rotAtStr, modAtStr, qAtStr string
+			if !a.CapturedAt.IsZero() {
+				capAtStr = a.CapturedAt.UTC().Format(time.RFC3339)
+			}
+			if !a.RotatedAt.IsZero() {
+				rotAtStr = a.RotatedAt.UTC().Format(time.RFC3339)
+			}
+			if !a.ModelsAt.IsZero() {
+				modAtStr = a.ModelsAt.UTC().Format(time.RFC3339)
+			}
+			if !a.QuotaAt.IsZero() {
+				qAtStr = a.QuotaAt.UTC().Format(time.RFC3339)
+			}
+			surfCopy := make(map[string]string, len(a.Surfaces))
+			for k, v := range a.Surfaces {
+				surfCopy[k] = v
+			}
 			list = append(list, map[string]any{
-				"id":       a.ID,
-				"email":    a.Email,
-				"capacity": a.Capacity,
-				"fails":    a.Fails,
-				"models":   mNames,
-				"quota":    a.Quota,
+				"id":               a.ID,
+				"email":            a.Email,
+				"capacity":         a.Capacity,
+				"fails":            a.Fails,
+				"models":           mNames,
+				"quota":            a.Quota,
+				"capturedAt":       capAtStr,
+				"rotatedAt":        rotAtStr,
+				"modelsAt":         modAtStr,
+				"quotaAt":          qAtStr,
+				"quarantined":      a.Quarantined,
+				"quarantineReason": a.QuarantineReason,
+				"accountGroup":     a.AccountGroup,
+				"surfaces":         surfCopy,
 			})
 			a.mu.RUnlock()
 		}
@@ -276,27 +401,52 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
 			return
 		}
-		s.EnsureModels(ctx, false)
+		freshReq := r.URL.Query().Get("fresh") == "1"
 		pool := s.scopedAccounts(scope)
-		var wg sync.WaitGroup
+		allCold := true
 		for _, a := range pool {
-			wg.Add(1)
-			go func(acct *AccountState) {
-				defer wg.Done()
-				q := s.clientFor(acct).GetQuota(ctx)
-				if len(q) > 0 {
-					s.mergeAccountQuota(acct, q)
-				}
-			}(a)
+			a.mu.RLock()
+			if !a.QuotaAt.IsZero() {
+				allCold = false
+			}
+			a.mu.RUnlock()
 		}
-		wg.Wait()
+		if freshReq || allCold {
+			s.EnsureModels(ctx, false)
+			var wg sync.WaitGroup
+			for _, a := range pool {
+				wg.Add(1)
+				go func(acct *AccountState) {
+					defer wg.Done()
+					q := s.clientFor(acct).GetQuota(ctx)
+					if len(q) > 0 {
+						s.mergeAccountQuota(acct, q)
+					}
+				}(a)
+			}
+			wg.Wait()
+		} else {
+			for _, a := range pool {
+				a.mu.RLock()
+				stale := time.Since(a.QuotaAt) > quotaRefreshCooldown
+				a.mu.RUnlock()
+				if stale {
+					s.refreshQuotaAsync(a, s.clientFor(a))
+				}
+			}
+		}
 		list := make([]map[string]any, 0, len(pool))
 		for _, a := range pool {
 			a.mu.RLock()
+			var qAtStr string
+			if !a.QuotaAt.IsZero() {
+				qAtStr = a.QuotaAt.UTC().Format(time.RFC3339)
+			}
 			list = append(list, map[string]any{
-				"id":    a.ID,
-				"email": a.Email,
-				"quota": a.Quota,
+				"id":      a.ID,
+				"email":   a.Email,
+				"quota":   a.Quota,
+				"quotaAt": qAtStr,
 			})
 			a.mu.RUnlock()
 		}
@@ -309,12 +459,41 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
 			return
 		}
-		accts := s.EnsureModels(ctx, false)
+		accts := s.Accounts()
 		if len(accts) == 0 {
 			sendJSON(w, 503, map[string]any{"error": map[string]any{"message": "no accounts configured", "type": "auth_unavailable"}}, nil)
 			return
 		}
 		pool := s.scopedAccounts(scope)
+		freshReq := r.URL.Query().Get("fresh") == "1"
+		hasWarmModels := false
+		needsBgRefresh := false
+		refEvery := s.Cfg.ModelRefreshEvery
+		if refEvery <= 0 {
+			refEvery = 30 * time.Minute
+		}
+		for _, a := range pool {
+			a.mu.RLock()
+			if len(a.Models) > 0 {
+				hasWarmModels = true
+				if !a.ModelsAt.IsZero() && time.Since(a.ModelsAt) >= refEvery {
+					needsBgRefresh = true
+				}
+			}
+			a.mu.RUnlock()
+		}
+		if freshReq {
+			s.EnsureModels(ctx, true)
+		} else if !hasWarmModels {
+			s.EnsureModels(ctx, false)
+		} else if needsBgRefresh {
+			go func() {
+				bgCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				defer cancel()
+				s.EnsureModels(bgCtx, true)
+			}()
+		}
+
 		allEmpty := len(pool) > 0
 		var firstErr error
 		for _, a := range pool {
@@ -344,57 +523,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			a.mu.RUnlock()
 		}
-		nowSec := time.Now().Unix()
-		data := make([]map[string]any, 0, len(models))
-		for _, x := range models {
-			isReasoning := gemini.IsReasoningModel(x.ModelName)
-			defThinkStr := "low"
-			if isReasoning {
-				defThinkStr = "high"
-			}
-			entry := map[string]any{
-				"id":                    x.ModelName,
-				"object":                "model",
-				"created":               nowSec,
-				"owned_by":              "google",
-				"context_length":        1048576,
-				"context_window":        1048576,
-				"max_completion_tokens": 65536,
-				"reasoning":             isReasoning,
-				"thinking": map[string]any{
-					"mode":           "effort",
-					"default":        defThinkStr,
-					"defaultLevel":   defThinkStr,
-					"efforts":        gemini.SupportedThinkingEfforts,
-					"requiresEffort": true,
-				},
-				"compat": map[string]any{
-					"supportsReasoningEffort": isReasoning,
-				},
-				"capabilities": map[string]any{
-					"vision":                  true,
-					"pdf":                     false,
-					"audioInput":              false,
-					"videoInput":              false,
-					"imageOutput":             false,
-					"audioOutput":             false,
-					"search":                  true,
-					"tools":                   true,
-					"reasoning":               isReasoning,
-					"thinkingFormat":          "gemini-level",
-					"thinkingCanDisable":      false,
-					"thinkingEffortSupported": isReasoning,
-					"thinkingLevels":          gemini.SupportedThinkingEfforts,
-					"defaultThinkingLevel":    defThinkStr,
-					"contextWindow":           1048576,
-					"maxOutput":               65536,
-				},
-			}
-			data = append(data, entry)
+		payload := s.BuildModelsPayload(models)
+		rawBytes, _ := json.Marshal(payload)
+		sum := sha256.Sum256(rawBytes)
+		etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		w.Header().Set("ETag", etag)
+		if inm := strings.TrimSpace(r.Header.Get("If-None-Match")); inm != "" && inm == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
 		}
-		sendJSON(w, 200, map[string]any{"object": "list", "data": data}, nil)
+		sendJSON(w, 200, payload, nil)
 		return
-
 	case r.Method == http.MethodPost && (p == "/v1/chat/completions" || p == "/chat/completions"):
 		scope := s.ResolveAuthScope(r)
 		if !scope.OK {
@@ -470,28 +610,228 @@ func readJSONBody(w http.ResponseWriter, r *http.Request) (map[string]any, bool)
 	return body, true
 }
 
-// StartBackgroundWorkers starts periodic model warming, dual-path cookie rotation,
+// BuildModelsPayload constructs the canonical /v1/models response object with
+// OpenAI, OpenRouter, and gsb capability metadata.
+func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
+	createdSec := s.startedAt.Unix()
+	if createdSec <= 0 {
+		createdSec = time.Now().Unix()
+	}
+	ctxWin := s.Cfg.ContextWindow
+	if ctxWin <= 0 {
+		ctxWin = 1048576
+	}
+	maxOut := s.Cfg.MaxOutputTokens
+	if maxOut <= 0 {
+		maxOut = 65536
+	}
+
+	data := make([]map[string]any, 0, len(models))
+	for _, x := range models {
+		caps := gemini.ResolveModelCapabilities(x)
+		isReasoning := caps.Reasoning
+		defThinkStr := caps.DefaultEffort
+		if defThinkStr == "" {
+			if isReasoning {
+				defThinkStr = "high"
+			} else {
+				defThinkStr = "low"
+			}
+		}
+		aliases := x.Aliases
+		if aliases == nil {
+			aliases = []string{}
+		}
+		var suppParams []string
+		var efforts []string
+		if isReasoning {
+			suppParams = []string{"tools", "tool_choice", "reasoning", "reasoning_effort", "max_tokens", "max_completion_tokens"}
+			efforts = gemini.SupportedThinkingEfforts
+		} else {
+			suppParams = []string{"tools", "tool_choice", "max_tokens", "max_completion_tokens"}
+			efforts = []string{}
+		}
+
+		entry := map[string]any{
+			"id":                    x.ModelName,
+			"object":                "model",
+			"created":               createdSec,
+			"owned_by":              "google",
+			"display_name":          x.DisplayName,
+			"description":           x.Description,
+			"aliases":               aliases,
+			"context_length":        ctxWin,
+			"context_window":        ctxWin,
+			"max_completion_tokens": maxOut,
+			"max_output_tokens":     maxOut,
+			"reasoning":             isReasoning,
+			"supported_parameters":  suppParams,
+			"architecture": map[string]any{
+				"modality":          "text+image->text",
+				"input_modalities":  []string{"text", "image"},
+				"output_modalities": []string{"text"},
+			},
+			"top_provider": map[string]any{
+				"context_length":        ctxWin,
+				"max_completion_tokens": maxOut,
+				"is_moderated":          false,
+			},
+			"pricing": map[string]any{
+				"prompt":     "0",
+				"completion": "0",
+				"image":      "0",
+				"request":    "0",
+			},
+			"thinking": map[string]any{
+				"mode":           "effort",
+				"default":        defThinkStr,
+				"defaultLevel":   defThinkStr,
+				"efforts":        efforts,
+				"requiresEffort": isReasoning,
+			},
+			"compat": map[string]any{
+				"supportsReasoningEffort": isReasoning,
+			},
+			"capabilities": map[string]any{
+				"vision":                  caps.Vision,
+				"pdf":                     false,
+				"audioInput":              false,
+				"videoInput":              false,
+				"imageOutput":             false,
+				"audioOutput":             false,
+				"search":                  caps.Search,
+				"tools":                   caps.Tools,
+				"reasoning":               isReasoning,
+				"thinkingFormat":          "gemini-level",
+				"thinkingCanDisable":      false,
+				"thinkingEffortSupported": isReasoning,
+				"thinkingLevels":          efforts,
+				"defaultThinkingLevel":    defThinkStr,
+				"contextWindow":           ctxWin,
+				"maxOutput":               maxOut,
+			},
+		}
+		data = append(data, entry)
+	}
+	return map[string]any{"object": "list", "data": data}
+}
+
+// ScheduleAccountTimers initializes staggered per-account rotation and model refresh deadlines.
+func (s *Server) ScheduleAccountTimers(now time.Time) {
+	accts := s.Accounts()
+	baseRotate := cookies.ClampRotateInterval(0, s.Cfg.RotateCookiesEvery)
+	for i, a := range accts {
+		a.mu.Lock()
+		if a.NextRotateAt.IsZero() {
+			a.NextRotateAt = now.Add(jitterDuration(baseRotate/10, baseRotate/2) + time.Duration(i)*2500*time.Millisecond)
+		}
+		if a.NextModelRefAt.IsZero() {
+			a.NextModelRefAt = now.Add(jitterDuration(5*time.Second, 30*time.Second) + time.Duration(i)*2500*time.Millisecond)
+		}
+		a.mu.Unlock()
+	}
+	s.decollideRotationTimers()
+}
+
+func (s *Server) decollideRotationTimers() {
+	accts := s.Accounts()
+	for i := range accts {
+		for j := i + 1; j < len(accts); j++ {
+			accts[i].mu.RLock()
+			ti := accts[i].NextRotateAt
+			accts[i].mu.RUnlock()
+			accts[j].mu.Lock()
+			tj := accts[j].NextRotateAt
+			diff := tj.Sub(ti)
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff < 2*time.Second {
+				accts[j].NextRotateAt = ti.Add(2500 * time.Millisecond)
+			}
+			accts[j].mu.Unlock()
+		}
+	}
+}
+
+// RunSchedulerStep evaluates one tick of the per-account background scheduler at now.
+func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
+	if inQuietHours(now, s.Cfg.QuietHours) {
+		return
+	}
+	accts := s.Accounts()
+	refEvery := s.Cfg.ModelRefreshEvery
+	if refEvery <= 0 {
+		refEvery = 30 * time.Minute
+	}
+	for _, a := range accts {
+		a.mu.RLock()
+		quarantined := a.Quarantined
+		nextRot := a.NextRotateAt
+		nextRef := a.NextModelRefAt
+		a.mu.RUnlock()
+		if quarantined {
+			continue
+		}
+		if s.Cfg.RotateCookiesEvery > 0 && !nextRot.IsZero() && !now.Before(nextRot) {
+			busy := false
+			if s.Pool != nil {
+				if sess := s.Pool.Existing(a.ID); sess != nil && sess.Busy() {
+					busy = true
+				}
+			}
+			if !busy {
+				c := s.clientFor(a)
+				rCtx, rCancel := context.WithTimeout(ctx, 15*time.Second)
+				res, err := c.RotateCookies(rCtx)
+				rCancel()
+				base := cookies.ClampRotateInterval(0, s.Cfg.RotateCookiesEvery)
+				if res != nil && res.NextInterval > 0 {
+					base = cookies.ClampRotateInterval(res.NextInterval, s.Cfg.RotateCookiesEvery)
+				}
+				nextTime := now.Add(base + randDuration(base/3))
+				a.mu.Lock()
+				if res != nil && res.Rotated {
+					a.RotatedAt = now
+				}
+				a.NextRotateAt = nextTime
+				a.mu.Unlock()
+				s.decollideRotationTimers()
+				if err != nil {
+					log.Printf("[cookies] %s rotate error: %v", a.ID, err)
+				} else if res != nil && res.Rotated {
+					log.Printf("[cookies] %s rotated session cookies (HTTP %d)", a.ID, res.Status)
+				}
+			}
+		}
+		if !nextRef.IsZero() && !now.Before(nextRef) {
+			rCtx, rCancel := context.WithTimeout(ctx, 45*time.Second)
+			s.RefreshAccount(rCtx, a, true)
+			rCancel()
+			a.mu.Lock()
+			a.NextModelRefAt = now.Add(refEvery + randDuration(refEvery/5))
+			a.mu.Unlock()
+		}
+	}
+}
+
+// StartBackgroundWorkers starts per-account jittered model warming, dual-path cookie rotation,
 // and idle session reaping until ctx is cancelled.
 func (s *Server) StartBackgroundWorkers(ctx context.Context) {
-	// Warm model registry periodically
-	refreshEvery := s.Cfg.ModelRefreshEvery
-	if refreshEvery <= 0 {
-		refreshEvery = 10 * time.Minute
-	}
+	s.ScheduleAccountTimers(s.now())
+
 	go func() {
 		wCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		s.EnsureModels(wCtx, false)
 		cancel()
-		ticker := time.NewTicker(refreshEvery)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				rCtx, rCancel := context.WithTimeout(ctx, 45*time.Second)
-				s.EnsureModels(rCtx, true)
-				rCancel()
+				s.RunSchedulerStep(ctx, s.now())
 			}
 		}
 	}()
@@ -511,36 +851,86 @@ func (s *Server) StartBackgroundWorkers(ctx context.Context) {
 			}
 		}()
 	}
+}
 
-	// Proactive dual-path cookie rotation (__Secure-1PSIDTS + SIDCC)
-	if s.Cfg.RotateCookiesEvery > 0 {
-		go func() {
-			ticker := time.NewTicker(s.Cfg.RotateCookiesEvery)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					for _, a := range s.Accounts() {
-						if s.Pool != nil {
-							if sess := s.Pool.Existing(a.ID); sess != nil && sess.Busy() {
-								continue
-							}
-						}
-						c := s.clientFor(a)
-						rCtx, rCancel := context.WithTimeout(ctx, 15*time.Second)
-						res, err := c.RotateCookies(rCtx)
-						rCancel()
-						if err != nil {
-							log.Printf("[cookies] %s rotate error: %v", a.ID, err)
-						} else if res != nil && res.Rotated {
-							log.Printf("[cookies] %s rotated session cookies (HTTP %d)", a.ID, res.Status)
-						}
-					}
-				}
-			}
-		}()
+func jitterDuration(minDur, maxDur time.Duration) time.Duration {
+	if maxDur <= minDur {
+		return minDur
+	}
+	return minDur + randDuration(maxDur-minDur)
+}
+
+func randDuration(maxDur time.Duration) time.Duration {
+	if maxDur <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(maxDur)))
+}
+
+func inQuietHours(now time.Time, spec string) bool {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return false
+	}
+	parts := strings.Split(spec, "-")
+	if len(parts) != 2 {
+		return false
+	}
+	startMin, ok1 := parseHHMM(parts[0])
+	endMin, ok2 := parseHHMM(parts[1])
+	if !ok1 || !ok2 {
+		return false
+	}
+	curMin := now.Hour()*60 + now.Minute()
+	if startMin <= endMin {
+		return curMin >= startMin && curMin < endMin
+	}
+	return curMin >= startMin || curMin < endMin
+}
+
+func parseHHMM(s string) (int, bool) {
+	hm := strings.Split(strings.TrimSpace(s), ":")
+	if len(hm) != 2 {
+		return 0, false
+	}
+	h, err1 := strconv.Atoi(hm[0])
+	m, err2 := strconv.Atoi(hm[1])
+	if err1 != nil || err2 != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, false
+	}
+	return h*60 + m, true
+}
+
+func (s *Server) logRequestJSON(entry map[string]any) {
+	if !s.Cfg.LogRequests || entry == nil {
+		return
+	}
+	if _, ok := entry["ts"]; !ok {
+		entry["ts"] = s.now().UTC().Format(time.RFC3339Nano)
+	}
+	if b, err := json.Marshal(entry); err == nil {
+		log.Printf("%s", string(b))
+	}
+}
+
+func setGSBHeaders(w http.ResponseWriter, headersSent bool, acctID, modelName string, attempt, upstreamStatus int, retryReason string) {
+	if headersSent || w == nil {
+		return
+	}
+	if acctID != "" {
+		w.Header().Set("X-GSB-Account", acctID)
+	}
+	if modelName != "" {
+		w.Header().Set("X-GSB-Model", modelName)
+	}
+	if attempt >= 0 {
+		w.Header().Set("X-GSB-Attempt", strconv.Itoa(attempt+1))
+	}
+	if upstreamStatus > 0 {
+		w.Header().Set("X-GSB-Upstream-Status", strconv.Itoa(upstreamStatus))
+	}
+	if retryReason != "" {
+		w.Header().Set("X-GSB-Retry-Reason", retryReason)
 	}
 }
 
@@ -549,17 +939,24 @@ func retryHeaders(hdrs map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string)
-	for _, k := range []string{"retry-after", "x-resets-at"} {
+	for _, k := range []string{"retry-after", "x-resets-at", "x-gsb-retry-reason"} {
 		val := hdrs[k]
 		if val == "" {
-			if k == "retry-after" {
+			switch k {
+			case "retry-after":
 				val = hdrs["Retry-After"]
-			} else {
+			case "x-resets-at":
 				val = hdrs["X-Resets-At"]
+			case "x-gsb-retry-reason":
+				val = hdrs["X-GSB-Retry-Reason"]
 			}
 		}
 		if val != "" && !strings.ContainsAny(val, "\r\n") {
-			out[k] = val
+			if k == "x-gsb-retry-reason" {
+				out["X-GSB-Retry-Reason"] = val
+			} else {
+				out[k] = val
+			}
 		}
 	}
 	return out

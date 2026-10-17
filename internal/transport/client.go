@@ -4,11 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -116,23 +121,33 @@ type Doer interface {
 
 // ClientConfig configures a per-account StealthClient.
 type ClientConfig struct {
-	ProfileName      string
-	ProxyURL         string
-	UserAgent        string
-	SecCHUA          string
-	SecCHUAPlatform  string
-	Timeout          time.Duration
-	FirstByteTimeout time.Duration
-	StallTimeout     time.Duration
-	CustomDoer       Doer
+	ProfileName            string
+	ProxyURL               string
+	UserAgent              string
+	SecCHUA                string
+	SecCHUAPlatform        string
+	SecCHUAFullVersionList string
+	SecCHUAArch            string
+	SecCHUABitness         string
+	SecCHUAPlatformVersion string
+	AcceptLanguage         string
+	TLSExtOrder            string // "fixed" | "random"
+	FollowRedirects        bool
+	IPv6Mode               string // "auto" | "off" | "on"
+	DumpRequestDir         string
+	Timeout                time.Duration
+	FirstByteTimeout       time.Duration
+	StallTimeout           time.Duration
+	CustomDoer             Doer
 }
 
 // StealthClient is an isolated, per-account HTTP/2 + uTLS client that reproduces
 // a single Chrome BrowserContext's network stack without launching a browser.
 type StealthClient struct {
-	mu     sync.Mutex
-	cfg    ClientConfig
-	client Doer
+	mu      sync.Mutex
+	cfg     ClientConfig
+	client  Doer
+	dumpSeq atomic.Uint64
 }
 
 // NewStealthClient creates an isolated StealthClient for one Google account.
@@ -171,10 +186,13 @@ func buildTLSClient(cfg ClientConfig) (tls_client.HttpClient, error) {
 			KeepAlive: 15 * time.Second,
 		}),
 		tls_client.WithClientProfile(ResolveProfile(cfg.ProfileName)),
-		tls_client.WithRandomTLSExtensionOrder(),
 		tls_client.WithNotFollowRedirects(),
 	}
-	if os.Getenv("BRIDGE_DISABLE_IPV6") != "0" {
+	if strings.EqualFold(strings.TrimSpace(cfg.TLSExtOrder), "random") {
+		opts = append(opts, tls_client.WithRandomTLSExtensionOrder())
+	}
+	ipv6Mode := strings.ToLower(strings.TrimSpace(cfg.IPv6Mode))
+	if ipv6Mode == "off" || (ipv6Mode == "" && strings.TrimSpace(os.Getenv("BRIDGE_DISABLE_IPV6")) == "1") {
 		opts = append(opts, tls_client.WithDisableIPV6())
 	}
 	if cfg.ProxyURL != "" {
@@ -276,8 +294,21 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 		return nil, NewUpstreamError(err.Error(), 502, "upstream_transport_error", nil, err)
 	}
 
-	sc.applyOrderedChromeHeaders(req, opts.Kind, opts.Headers)
+	hdrMap := make(map[string]string, len(opts.Headers)+1)
+	for k, v := range opts.Headers {
+		hdrMap[k] = v
+	}
+	if len(opts.Body) > 0 {
+		req.ContentLength = int64(len(opts.Body))
+		if _, hasCL := hdrMap["content-length"]; !hasCL {
+			if _, hasCLUpper := hdrMap["Content-Length"]; !hasCLUpper {
+				hdrMap["content-length"] = strconv.Itoa(len(opts.Body))
+			}
+		}
+	}
 
+	sc.applyOrderedChromeHeaders(req, opts.Kind, hdrMap)
+	sc.dumpRequestIfEnabled(req, opts.Kind, opts.Body)
 	var fbTimer *time.Timer
 	if firstByteTimeout > 0 {
 		fbTimer = time.AfterFunc(firstByteTimeout, func() {
@@ -521,6 +552,35 @@ func (sc *StealthClient) applyOrderedChromeHeaders(req *fhttp.Request, kind Requ
 	if platform == "" {
 		platform = `"Linux"`
 	}
+	acceptLang := sc.cfg.AcceptLanguage
+	if acceptLang == "" {
+		acceptLang = "en-US,en;q=0.9"
+	}
+
+	ver := extractChromeMajor(chUA, ua)
+	fullVerList := sc.cfg.SecCHUAFullVersionList
+	if fullVerList == "" {
+		fullVerList = fmt.Sprintf(`"Google Chrome";v="%s.0.0.0", "Chromium";v="%s.0.0.0", "Not?A_Brand";v="24.0.0.0"`, ver, ver)
+	}
+	arch := sc.cfg.SecCHUAArch
+	if arch == "" {
+		arch = `"x86"`
+	}
+	bitness := sc.cfg.SecCHUABitness
+	if bitness == "" {
+		bitness = `"64"`
+	}
+	platVer := sc.cfg.SecCHUAPlatformVersion
+	if platVer == "" {
+		switch strings.ToLower(strings.Trim(platform, `"`)) {
+		case "windows":
+			platVer = `"15.0.0"`
+		case "macos", "darwin":
+			platVer = `"14.6.1"`
+		default:
+			platVer = `"6.12.0"`
+		}
+	}
 
 	hdr := fhttp.Header{}
 	set := func(k, v string) {
@@ -541,7 +601,8 @@ func (sc *StealthClient) applyOrderedChromeHeaders(req *fhttp.Request, kind Requ
 		set("sec-fetch-mode", "navigate")
 		set("sec-fetch-user", "?1")
 		set("sec-fetch-dest", "document")
-		set("accept-language", "en-US,en;q=0.9")
+		set("accept-encoding", "gzip, deflate, br, zstd")
+		set("accept-language", acceptLang)
 		set("priority", "u=0, i")
 	case ReqKindIframe:
 		set("sec-ch-ua", chUA)
@@ -555,12 +616,19 @@ func (sc *StealthClient) applyOrderedChromeHeaders(req *fhttp.Request, kind Requ
 		set("sec-fetch-user", "?1")
 		set("sec-fetch-dest", "iframe")
 		set("referer", "https://gemini.google.com/")
-		set("accept-language", "en-US,en;q=0.9")
+		set("accept-encoding", "gzip, deflate, br, zstd")
+		set("accept-language", acceptLang)
 		set("priority", "u=0, i")
 	default: // ReqKindCORS
 		set("sec-ch-ua", chUA)
 		set("x-same-domain", "1")
 		set("sec-ch-ua-mobile", "?0")
+		set("sec-ch-ua-full-version-list", fullVerList)
+		set("sec-ch-ua-arch", arch)
+		set("sec-ch-ua-platform-version", platVer)
+		set("sec-ch-ua-model", `""`)
+		set("sec-ch-ua-bitness", bitness)
+		set("sec-ch-ua-wow64", "?0")
 		set("user-agent", ua)
 		set("sec-ch-ua-platform", platform)
 		set("accept", "*/*")
@@ -569,7 +637,8 @@ func (sc *StealthClient) applyOrderedChromeHeaders(req *fhttp.Request, kind Requ
 		set("sec-fetch-mode", "cors")
 		set("sec-fetch-dest", "empty")
 		set("referer", "https://gemini.google.com/app")
-		set("accept-language", "en-US,en;q=0.9")
+		set("accept-encoding", "gzip, deflate, br, zstd")
+		set("accept-language", acceptLang)
 		set("priority", "u=1, i")
 	}
 
@@ -609,9 +678,15 @@ func (sc *StealthClient) applyOrderedChromeHeaders(req *fhttp.Request, kind Requ
 			"sec-ch-ua",
 			"x-same-domain",
 			"sec-ch-ua-mobile",
+			"sec-ch-ua-full-version-list",
+			"sec-ch-ua-arch",
+			"sec-ch-ua-platform-version",
+			"sec-ch-ua-model",
+			"sec-ch-ua-bitness",
+			"sec-ch-ua-wow64",
 			"user-agent",
 			"content-type",
-			"x-goog-authuser",
+			"content-length",
 			"x-goog-ext-525001261-jspb",
 			"x-goog-ext-525005358-jspb",
 			"x-goog-ext-73010989-jspb",
@@ -656,4 +731,135 @@ func (sc *StealthClient) applyOrderedChromeHeaders(req *fhttp.Request, kind Requ
 	hdr[fhttp.HeaderOrderKey] = order
 	hdr[fhttp.PHeaderOrderKey] = []string{":method", ":authority", ":scheme", ":path"}
 	req.Header = hdr
+}
+
+func extractChromeMajor(chUA, ua string) string {
+	if idx := strings.Index(chUA, `;v="`); idx >= 0 {
+		rest := chUA[idx+4:]
+		if end := strings.IndexByte(rest, '"'); end > 0 {
+			return rest[:end]
+		}
+	}
+	if idx := strings.Index(ua, "Chrome/"); idx >= 0 {
+		rest := ua[idx+7:]
+		if dot := strings.IndexByte(rest, '.'); dot > 0 {
+			return rest[:dot]
+		}
+	}
+	return "150"
+}
+
+// RequestDump is the redacted JSON representation of an outbound HTTP request
+// produced when BRIDGE_DUMP_REQUEST is set.
+type RequestDump struct {
+	Timestamp     string              `json:"timestamp"`
+	Method        string              `json:"method"`
+	URL           string              `json:"url"`
+	Kind          string              `json:"kind"`
+	HeaderOrder   []string            `json:"headerOrder"`
+	PseudoOrder   []string            `json:"pseudoOrder"`
+	Headers       map[string][]string `json:"headers"`
+	CookieNames   []string            `json:"cookieNames"`
+	CookieHashes  map[string]string   `json:"cookieHashes"`
+	ContentLength int                 `json:"contentLength"`
+	BodySHA256    string              `json:"bodySha256"`
+	TLSExtOrder   string              `json:"tlsExtOrder"`
+}
+
+func (r RequestKind) String() string {
+	switch r {
+	case ReqKindNavigate:
+		return "navigate"
+	case ReqKindIframe:
+		return "iframe"
+	default:
+		return "cors"
+	}
+}
+
+func (sc *StealthClient) dumpRequestIfEnabled(req *fhttp.Request, kind RequestKind, body []byte) {
+	dir := strings.TrimSpace(sc.cfg.DumpRequestDir)
+	if dir == "" {
+		dir = strings.TrimSpace(os.Getenv("BRIDGE_DUMP_REQUEST"))
+	}
+	if dir == "" || req == nil {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+
+	redactedHeaders := make(map[string][]string, len(req.Header))
+	var cookieNames []string
+	cookieHashes := make(map[string]string)
+
+	for k, vals := range req.Header {
+		if k == fhttp.HeaderOrderKey || k == fhttp.PHeaderOrderKey {
+			continue
+		}
+		lk := strings.ToLower(k)
+		switch lk {
+		case "cookie":
+			var redactedParts []string
+			for _, rawCookie := range vals {
+				for _, part := range strings.Split(rawCookie, ";") {
+					part = strings.TrimSpace(part)
+					if part == "" {
+						continue
+					}
+					name, val, ok := strings.Cut(part, "=")
+					name = strings.TrimSpace(name)
+					if !ok || name == "" {
+						continue
+					}
+					sum := sha256.Sum256([]byte(val))
+					shortHash := "sha256:" + hex.EncodeToString(sum[:])[:8]
+					cookieNames = append(cookieNames, name)
+					cookieHashes[name] = shortHash
+					redactedParts = append(redactedParts, name+"="+shortHash)
+				}
+			}
+			redactedHeaders[lk] = []string{strings.Join(redactedParts, "; ")}
+		case "authorization":
+			redactedHeaders[lk] = []string{"SAPISIDHASH <redacted>"}
+		default:
+			cp := make([]string, len(vals))
+			copy(cp, vals)
+			redactedHeaders[lk] = cp
+		}
+	}
+
+	var bodyHash string
+	if len(body) > 0 {
+		sum := sha256.Sum256(body)
+		bodyHash = hex.EncodeToString(sum[:])
+	}
+
+	tlsOrder := strings.ToLower(strings.TrimSpace(sc.cfg.TLSExtOrder))
+	if tlsOrder == "" {
+		tlsOrder = "fixed"
+	}
+
+	dump := RequestDump{
+		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
+		Method:        req.Method,
+		URL:           req.URL.String(),
+		Kind:          kind.String(),
+		HeaderOrder:   append([]string(nil), req.Header[fhttp.HeaderOrderKey]...),
+		PseudoOrder:   append([]string(nil), req.Header[fhttp.PHeaderOrderKey]...),
+		Headers:       redactedHeaders,
+		CookieNames:   cookieNames,
+		CookieHashes:  cookieHashes,
+		ContentLength: len(body),
+		BodySHA256:    bodyHash,
+		TLSExtOrder:   tlsOrder,
+	}
+
+	data, err := json.MarshalIndent(dump, "", "  ")
+	if err != nil {
+		return
+	}
+	seq := sc.dumpSeq.Add(1)
+	fname := fmt.Sprintf("req-%d-%d.json", time.Now().UnixNano(), seq)
+	_ = os.WriteFile(filepath.Join(dir, fname), data, 0o600)
 }

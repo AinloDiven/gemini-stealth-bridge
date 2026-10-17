@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 var (
@@ -428,6 +430,7 @@ func TestGsbAuthTokensPrefixModelResolutionAndBudgetThinking(t *testing.T) {
 	cfg.HomeDir = t.TempDir()
 	cfg.AccountTokens = nil // test automatic gsb-<id> and raw <id> registration
 	srv := New(cfg)
+	t.Cleanup(func() { srv.FlushSessionCacheNow() })
 
 	var capturedLevel int
 	mock := &mockUpstream{
@@ -964,5 +967,480 @@ func BenchmarkServerHandleChatSSE_50FramesWithTools(b *testing.B) {
 		_ = json.Unmarshal(rawJSON, &parsed)
 		rec := httptest.NewRecorder()
 		srv.HandleChat(context.Background(), rec, parsed, AuthScope{OK: true, AccountID: acct.ID})
+	}
+}
+
+func TestModelsContract(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	flashModel := gemini.ModelInfo{
+		ModelName:   "gemini-flash",
+		ModelID:     "cccccccccccccccc",
+		DisplayName: "2.5 Flash",
+		Description: "Fast reasoning model",
+		Aliases:     []string{"gemini-2.5-flash"},
+		Capacity:    2,
+		ModelNumber: 2,
+	}
+	liteModel := gemini.ModelInfo{
+		ModelName:   "gemini-flash-lite",
+		ModelID:     "dddddddddddddddd",
+		DisplayName: "2.5 Flash Lite",
+		Description: "Lightweight model",
+		Capacity:    1,
+		ModelNumber: 1,
+	}
+	acct.mu.Lock()
+	acct.Models = []gemini.ModelInfo{flashModel, liteModel}
+	acct.ModelsAt = time.Now()
+	acct.mu.Unlock()
+
+	req1 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req1.Header.Set("Authorization", "Bearer audit")
+	rec1 := httptest.NewRecorder()
+	srv.ServeHTTP(rec1, req1)
+	if rec1.Code != 200 {
+		t.Fatalf("expected 200 on first /v1/models, got %d", rec1.Code)
+	}
+	etag := rec1.Header().Get("ETag")
+	if etag == "" || !strings.Contains(rec1.Header().Get("Cache-Control"), "max-age=60") {
+		t.Fatalf("expected ETag and Cache-Control headers, got ETag=%q CC=%q", etag, rec1.Header().Get("Cache-Control"))
+	}
+
+	var p1 map[string]any
+	if err := json.Unmarshal(rec1.Body.Bytes(), &p1); err != nil {
+		t.Fatalf("unmarshal /v1/models: %v", err)
+	}
+	data1, _ := p1["data"].([]any)
+	if len(data1) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(data1))
+	}
+	mFlash, _ := data1[0].(map[string]any)
+	mLite, _ := data1[1].(map[string]any)
+
+	if mFlash["reasoning"] != true || mFlash["context_length"] != float64(1048576) || mFlash["max_completion_tokens"] != float64(65536) || mFlash["max_output_tokens"] != float64(65536) {
+		t.Fatalf("unexpected flash metadata: %+v", mFlash)
+	}
+	if mFlash["display_name"] != "2.5 Flash" || mFlash["top_provider"] == nil || mFlash["architecture"] == nil {
+		t.Fatalf("missing display_name, top_provider, or architecture on flash: %+v", mFlash)
+	}
+	if mLite["reasoning"] != false {
+		t.Fatalf("expected gemini-flash-lite reasoning=false, got %v", mLite["reasoning"])
+	}
+	liteParams, _ := mLite["supported_parameters"].([]any)
+	for _, p := range liteParams {
+		if p == "reasoning_effort" || p == "reasoning" {
+			t.Fatalf("expected gemini-flash-lite supported_parameters not to include %v: %v", p, liteParams)
+		}
+	}
+
+	// Second request without If-None-Match -> identical created timestamp
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req2.Header.Set("Authorization", "Bearer audit")
+	rec2 := httptest.NewRecorder()
+	srv.ServeHTTP(rec2, req2)
+	var p2 map[string]any
+	_ = json.Unmarshal(rec2.Body.Bytes(), &p2)
+	d2, _ := p2["data"].([]any)
+	if d2[0].(map[string]any)["created"] != mFlash["created"] {
+		t.Fatalf("expected stable created timestamp across /v1/models calls")
+	}
+
+	// Conditional request with If-None-Match -> 304 Not Modified
+	req3 := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req3.Header.Set("Authorization", "Bearer audit")
+	req3.Header.Set("If-None-Match", etag)
+	rec3 := httptest.NewRecorder()
+	srv.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusNotModified {
+		t.Fatalf("expected 304 Not Modified with matching ETag, got %d", rec3.Code)
+	}
+}
+
+func TestContinuationCachedTokens(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	longTurn1 := "First turn context: " + strings.Repeat("alpha beta gamma delta ", 60)
+	acct.Client = clientFromFrames([]gemini.Frame{
+		makeFrame("First reply.", "", true, testModel.ModelID),
+	})
+
+	// Turn 1 populates session continuation cache
+	msgsTurn1 := []any{
+		map[string]any{"role": "user", "content": longTurn1},
+	}
+	rec1 := runChat(t, srv, acct, acct.Client, map[string]any{"messages": msgsTurn1})
+	if rec1.Code != 200 {
+		t.Fatalf("turn 1 failed: %d %s", rec1.Code, rec1.Body.String())
+	}
+
+	// Turn 2 hits continuation cache
+	msgsTurn2 := []any{
+		map[string]any{"role": "user", "content": longTurn1},
+		map[string]any{"role": "assistant", "content": "First reply."},
+		map[string]any{"role": "user", "content": "Short follow-up?"},
+	}
+	acct.Client = clientFromFrames([]gemini.Frame{
+		makeFrame("Second reply.", "", true, testModel.ModelID),
+	})
+	rec2 := runChat(t, srv, acct, acct.Client, map[string]any{"messages": msgsTurn2})
+	if rec2.Code != 200 {
+		t.Fatalf("turn 2 failed: %d %s", rec2.Code, rec2.Body.String())
+	}
+	var chatResp map[string]any
+	_ = json.Unmarshal(rec2.Body.Bytes(), &chatResp)
+	usage, _ := chatResp["usage"].(map[string]any)
+	pDetails, _ := usage["prompt_tokens_details"].(map[string]any)
+	cachedTok, _ := pDetails["cached_tokens"].(float64)
+	if cachedTok <= 0 {
+		t.Fatalf("expected Chat usage.prompt_tokens_details.cached_tokens > 0 on continuation hit, got %+v", usage)
+	}
+
+	// Also verify /v1/responses input_tokens_details.cached_tokens
+	respUsage := buildResponsesUsage( map[string]any{
+		"prompt_tokens":     400,
+		"completion_tokens": 50,
+		"total_tokens":      450,
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens": 300,
+		},
+	})
+	inDetails, _ := respUsage["input_tokens_details"].(map[string]any)
+	if inDetails["cached_tokens"] != 300 {
+		t.Fatalf("expected Responses input_tokens_details.cached_tokens=300, got %+v", respUsage)
+	}
+}
+
+func TestEarlySSEFirstByte(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.EarlySSE = true
+
+	firstPingAt := make(chan time.Duration, 1)
+	startAt := time.Now()
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			time.Sleep(250 * time.Millisecond)
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c1",
+				RID:             "r1",
+				AnsweredModelID: testModel.ModelID,
+				Frames:          []gemini.Frame{makeFrame("done", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	acct.Client = client
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gemini-pro","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer audit")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 64)
+	n, _ := resp.Body.Read(buf)
+	if n > 0 {
+		firstPingAt <- time.Since(startAt)
+	}
+	elapsed := <-firstPingAt
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("expected EarlySSE first byte in < 200ms (upstream slept 250ms), took %v", elapsed)
+	}
+	if !strings.Contains(string(buf[:n]), ": ping") {
+		t.Fatalf("expected immediate ': ping' in first SSE chunk, got %q", string(buf[:n]))
+	}
+}
+
+func TestSessionBusyRetryAndFallback(t *testing.T) {
+	// 1. Account-scoped token gets 429 session_busy on attempt 1 -> sleeps ~1s and succeeds on attempt 2 on SAME account
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.MaxAttempts = 3
+	calls := 0
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			calls++
+			if calls == 1 {
+				return nil, transport.NewUpstreamError("session busy", 429, "session_busy", map[string]string{"retry-after": "1"}, nil)
+			}
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c1",
+				RID:             "r1",
+				AnsweredModelID: testModel.ModelID,
+				Frames:          []gemini.Frame{makeFrame("recovered", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	rec := runChat(t, srv, acct, client, nil)
+	if rec.Code != 200 || calls != 2 {
+		t.Fatalf("expected account-scoped session_busy to retry and succeed on attempt 2, got code=%d calls=%d body=%s", rec.Code, calls, rec.Body.String())
+	}
+	if rec.Header().Get("X-GSB-Account") != "acct" || rec.Header().Get("X-GSB-Attempt") != "2" || rec.Header().Get("X-GSB-Retry-Reason") != "session_busy" {
+		t.Fatalf("unexpected X-GSB-* headers: %+v", rec.Header())
+	}
+
+	// 2. Admin token with 3 accounts gets 429 on acct1 and acct2 -> succeeds on acct3
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.MaxAttempts = 3
+	cfg.MaxUpstreamAttempts = 3
+	srv3 := New(cfg)
+
+	fail429 := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			return &gemini.StreamResponse{Status: 429}, nil
+		},
+	}
+	ok3 := clientFromFrames([]gemini.Frame{
+		makeFrame("from acct3", "", true, testModel.ModelID),
+	})
+	a1 := &AccountState{ID: "acct1", Email: "1@e.com", Client: fail429, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	a2 := &AccountState{ID: "acct2", Email: "2@e.com", Client: fail429, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	a3 := &AccountState{ID: "acct3", Email: "3@e.com", Client: ok3, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	srv3.SetAccounts([]*AccountState{a1, a2, a3})
+
+	rec3 := httptest.NewRecorder()
+	srv3.HandleChat(context.Background(), rec3, map[string]any{
+		"model":    "gemini-pro",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, AuthScope{OK: true, Admin: true})
+	if rec3.Code != 200 {
+		t.Fatalf("expected 3-account fallback to succeed on acct3, got %d: %s", rec3.Code, rec3.Body.String())
+	}
+	if rec3.Header().Get("X-GSB-Account") != "acct3" || rec3.Header().Get("X-GSB-Attempt") != "3" {
+		t.Fatalf("expected X-GSB-Account=acct3 and X-GSB-Attempt=3, got %+v", rec3.Header())
+	}
+}
+
+func TestSyntheticQuotaBackoffAndClear(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	baseNow := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	srv.clock = func() time.Time { return baseNow }
+
+	// Strike 1 -> 1m
+	srv.recordModelExhausted(acct, "gemini-pro")
+	acct.mu.RLock()
+	q1 := acct.Quota[0]
+	acct.mu.RUnlock()
+	t1, _ := time.Parse(time.RFC3339, q1.ResetAt)
+	if !q1.Synthetic || t1.Sub(baseNow) != 1*time.Minute {
+		t.Fatalf("expected strike 1 backoff=1m and Synthetic=true, got %+v (diff=%v)", q1, t1.Sub(baseNow))
+	}
+
+	// Strike 2 -> 5m
+	srv.recordModelExhausted(acct, "gemini-pro")
+	acct.mu.RLock()
+	q2 := acct.Quota[0]
+	acct.mu.RUnlock()
+	t2, _ := time.Parse(time.RFC3339, q2.ResetAt)
+	if t2.Sub(baseNow) != 5*time.Minute {
+		t.Fatalf("expected strike 2 backoff=5m, got %v", t2.Sub(baseNow))
+	}
+
+	// Strike 3 -> 15m
+	srv.recordModelExhausted(acct, "gemini-pro")
+	acct.mu.RLock()
+	q3 := acct.Quota[0]
+	acct.mu.RUnlock()
+	t3, _ := time.Parse(time.RFC3339, q3.ResetAt)
+	if t3.Sub(baseNow) != 15*time.Minute {
+		t.Fatalf("expected strike 3 backoff=15m, got %v", t3.Sub(baseNow))
+	}
+
+	// lookupQuotaResetHeaders must NOT return retry-after for synthetic-only bucket
+	hdrs := srv.lookupQuotaResetHeaders(context.Background(), acct, "gemini-pro")
+	if hdrs["retry-after"] != "" || hdrs["x-gsb-retry-reason"] != "model_substitution" {
+		t.Fatalf("expected only x-gsb-retry-reason=model_substitution for synthetic bucket, got %+v", hdrs)
+	}
+
+	// Successful request in advisory mode clears the synthetic bucket
+	srv.Cfg.QuotaPreflight = "advisory"
+	rec := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
+		makeFrame("ok", "", true, testModel.ModelID),
+	}), nil)
+	if rec.Code != 200 {
+		t.Fatalf("expected advisory mode to allow request, got %d: %s", rec.Code, rec.Body.String())
+	}
+	acct.mu.RLock()
+	remQuota := len(acct.Quota)
+	acct.mu.RUnlock()
+	if remQuota != 0 {
+		t.Fatalf("expected synthetic quota bucket cleared after successful generation, got %d buckets", remQuota)
+	}
+}
+
+func TestReadyzAndSessionStats(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+
+	// Healthy state
+	req1 := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	rec1 := httptest.NewRecorder()
+	srv.ServeHTTP(rec1, req1)
+	if rec1.Code != 200 || !strings.Contains(rec1.Body.String(), `"status":"ok"`) {
+		t.Fatalf("expected /readyz status:ok, got %d %s", rec1.Code, rec1.Body.String())
+	}
+
+	// Session cache stats in /v1/sessions
+	_ = srv.getSessionCache("nonexistent")
+	srv.putSessionCache("hit_key", []any{"c", "r", "rc", nil, nil, nil, nil, nil, nil, "ctx"})
+	_ = srv.getSessionCache("hit_key")
+
+	reqSess := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+	reqSess.Header.Set("Authorization", "Bearer audit")
+	recSess := httptest.NewRecorder()
+	srv.ServeHTTP(recSess, reqSess)
+	var sessPayload map[string]any
+	_ = json.Unmarshal(recSess.Body.Bytes(), &sessPayload)
+	if sessPayload["cache_entries"] != float64(1) || sessPayload["cache_hits"] != float64(1) || sessPayload["cache_misses"] != float64(1) {
+		t.Fatalf("unexpected /v1/sessions cache stats: %+v", sessPayload)
+	}
+
+	// Quarantined account -> degraded (/readyz?strict=1 returns 503)
+	srv.markAccountQuarantined(acct, "TOS_VIOLATION")
+	req2 := httptest.NewRequest(http.MethodGet, "/readyz?strict=1", nil)
+	rec2 := httptest.NewRecorder()
+	srv.ServeHTTP(rec2, req2)
+	if rec2.Code != 503 || !strings.Contains(rec2.Body.String(), `"status":"degraded"`) {
+		t.Fatalf("expected 503 degraded on /readyz?strict=1 when quarantined, got %d %s", rec2.Code, rec2.Body.String())
+	}
+}
+
+func TestPerAccountRotationJitterAndNextInterval(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.RotateCookiesEvery = 9 * time.Minute
+	srv := New(cfg)
+
+	baseNow := time.Date(2026, 10, 17, 14, 0, 0, 0, time.UTC)
+	srv.clock = func() time.Time { return baseNow }
+
+	var accts []*AccountState
+	for i := range 5 {
+		accts = append(accts, &AccountState{
+			ID:       fmt.Sprintf("acct_%d", i),
+			Email:    fmt.Sprintf("u%d@example.com", i),
+			Models:   []gemini.ModelInfo{testModel},
+			ModelsAt: baseNow,
+			Client: &mockUpstream{
+				streamFn: nil,
+			},
+		})
+	}
+	srv.SetAccounts(accts)
+	srv.ScheduleAccountTimers(baseNow)
+
+	// Verify no two accounts are scheduled within 1 second of each other
+	for i := range accts {
+		for j := i + 1; j < len(accts); j++ {
+			diff := accts[i].NextRotateAt.Sub(accts[j].NextRotateAt)
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff < time.Second {
+				t.Fatalf("accounts %d and %d rotation scheduled within 1s: %v vs %v", i, j, accts[i].NextRotateAt, accts[j].NextRotateAt)
+			}
+		}
+	}
+}
+
+func TestSoftBlockNoAmplification(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.MaxAttempts = 3
+	srv := New(cfg)
+
+	var quotaCalls atomic.Int32
+	var acct2Calls atomic.Int32
+	var acct1Calls atomic.Int32
+
+	c1 := &mockUpstream{
+		quotaFn: func(ctx context.Context) []gemini.QuotaBucket {
+			quotaCalls.Add(1)
+			return nil
+		},
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			acct1Calls.Add(1)
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c1",
+				RID:             "r1",
+				AnsweredModelID: testModel.ModelID,
+				Frames:          []gemini.Frame{makeFrame("Sorry, something went wrong. Please try your request again.", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	c2 := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			acct2Calls.Add(1)
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+
+	a1 := &AccountState{ID: "acct1", Email: "1@e.com", Client: c1, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	a2 := &AccountState{ID: "acct2", Email: "2@e.com", Client: c2, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	srv.SetAccounts([]*AccountState{a1, a2})
+
+	rec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec, map[string]any{
+		"model":    "gemini-pro",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, AuthScope{OK: true, Admin: true})
+
+	if quotaCalls.Load() != 0 {
+		t.Fatalf("expected 0 GetQuota calls on upstream_error_reply soft block, got %d", quotaCalls.Load())
+	}
+	if acct2Calls.Load() != 0 {
+		t.Fatalf("expected 0 failover calls to acct2 on upstream_error_reply, got %d", acct2Calls.Load())
+	}
+	if acct1Calls.Load() != 2 {
+		t.Fatalf("expected at most 1 retry (2 total calls) on acct1 for upstream_error_reply, got %d", acct1Calls.Load())
+	}
+}
+
+func TestQuarantineOn403TOSViolation(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.MaxAttempts = 3
+	srv := New(cfg)
+
+	var banCalls atomic.Int32
+	c1 := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			banCalls.Add(1)
+			return nil, transport.NewUpstreamError("account banned (TOS_VIOLATION)", 403, "account_banned", nil, nil)
+		},
+	}
+	c2 := clientFromFrames([]gemini.Frame{
+		makeFrame("ok", "", true, testModel.ModelID),
+	})
+	a1 := &AccountState{ID: "acct1", Email: "1@e.com", Client: c1, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	a2 := &AccountState{ID: "acct2", Email: "2@e.com", Client: c2, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	srv.SetAccounts([]*AccountState{a1, a2})
+
+	rec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec, map[string]any{
+		"model":    "gemini-pro",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, AuthScope{OK: true, Admin: true})
+
+	if rec.Code != 403 {
+		t.Fatalf("expected 403 on TOS_VIOLATION without retry, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if banCalls.Load() != 1 {
+		t.Fatalf("expected no retry on account_banned, got %d calls", banCalls.Load())
+	}
+	a1.mu.RLock()
+	q := a1.Quarantined
+	a1.mu.RUnlock()
+	if !q {
+		t.Fatal("expected acct1 to be marked Quarantined=true")
+	}
+
+	// pickFallbackAccount must skip quarantined acct1
+	cand, _ := srv.pickFallbackAccount(srv.Accounts(), map[string]bool{}, "", "gemini-pro", nil)
+	if cand == nil || cand.ID != "acct2" {
+		t.Fatalf("expected pickFallbackAccount to skip quarantined acct1 and pick acct2, got %+v", cand)
 	}
 }

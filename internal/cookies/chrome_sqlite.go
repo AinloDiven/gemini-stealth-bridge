@@ -40,9 +40,10 @@ var (
 
 // CookieRow represents a decrypted cookie from a browser SQLite database.
 type CookieRow struct {
-	Host  string
-	Name  string
-	Value string
+	Host      string
+	Name      string
+	Value     string
+	ExpiresAt int64
 }
 
 // ReadResult summarizes a browser cookie DB extraction.
@@ -376,44 +377,78 @@ func ReadBrowserCookies(dbPath string) (*ReadResult, error) {
 }
 
 func readFirefoxCookies(db *sql.DB) (*ReadResult, error) {
-	rows, err := db.Query(`SELECT host, name, value FROM moz_cookies WHERE host LIKE '%google.com' OR host LIKE '%gemini.google%'`)
+	rows, err := db.Query(`SELECT host, name, value, COALESCE(expiry, 0) FROM moz_cookies WHERE host LIKE '%google.com' OR host LIKE '%gemini.google%'`)
 	if err != nil {
-		return nil, err
+		// Fallback if table has minimal columns
+		rows, err = db.Query(`SELECT host, name, value, 0 FROM moz_cookies WHERE host LIKE '%google.com' OR host LIKE '%gemini.google%'`)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 
+	nowUnix := time.Now().Unix()
 	res := &ReadResult{KeyFound: true}
 	for rows.Next() {
 		var host, name, value string
-		if err := rows.Scan(&host, &name, &value); err != nil {
+		var expiry int64
+		if err := rows.Scan(&host, &name, &value, &expiry); err != nil {
+			continue
+		}
+		if expiry > 0 && expiry <= nowUnix {
 			continue
 		}
 		res.Plain++
-		res.Cookies = append(res.Cookies, CookieRow{Host: host, Name: name, Value: value})
+		res.Cookies = append(res.Cookies, CookieRow{Host: host, Name: name, Value: value, ExpiresAt: expiry})
 	}
 	res.Header = bestHeaderFromRows(res.Cookies)
 	return res, nil
 }
 
 type rawChromiumRow struct {
-	host      string
-	name      string
-	encrypted []byte
-	plain     string
+	host         string
+	name         string
+	encrypted    []byte
+	plain        string
+	hasExpires   int64
+	expiresUTC   int64
+	isPersistent int64
+	expiresUnix  int64
 }
 
+const chromiumEpochOffsetSec int64 = 11644473600
+
 func readChromiumCookies(db *sql.DB, dbPath string) (*ReadResult, error) {
-	rows, err := db.Query(`SELECT host_key, name, encrypted_value, value FROM cookies WHERE host_key LIKE '%google%'`)
+	hasExpiryCols := true
+	rows, err := db.Query(`SELECT host_key, name, encrypted_value, value, COALESCE(has_expires, 0), COALESCE(expires_utc, 0), COALESCE(is_persistent, 1) FROM cookies WHERE host_key LIKE '%google%'`)
 	if err != nil {
-		return nil, err
+		hasExpiryCols = false
+		rows, err = db.Query(`SELECT host_key, name, encrypted_value, value FROM cookies WHERE host_key LIKE '%google%'`)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 
+	nowUnix := time.Now().Unix()
 	var rawRows []rawChromiumRow
 	for rows.Next() {
 		var r rawChromiumRow
-		if err := rows.Scan(&r.host, &r.name, &r.encrypted, &r.plain); err != nil {
-			continue
+		if hasExpiryCols {
+			if err := rows.Scan(&r.host, &r.name, &r.encrypted, &r.plain, &r.hasExpires, &r.expiresUTC, &r.isPersistent); err != nil {
+				continue
+			}
+			if r.hasExpires != 0 && r.expiresUTC > 0 {
+				unixSec := (r.expiresUTC / 1_000_000) - chromiumEpochOffsetSec
+				if unixSec <= nowUnix {
+					continue
+				}
+				r.expiresUnix = unixSec
+			}
+		} else {
+			if err := rows.Scan(&r.host, &r.name, &r.encrypted, &r.plain); err != nil {
+				continue
+			}
 		}
 		rawRows = append(rawRows, r)
 	}
@@ -441,7 +476,7 @@ func readChromiumCookies(db *sql.DB, dbPath string) (*ReadResult, error) {
 		} else {
 			res.Plain++
 		}
-		res.Cookies = append(res.Cookies, CookieRow{Host: r.host, Name: r.name, Value: val})
+		res.Cookies = append(res.Cookies, CookieRow{Host: r.host, Name: r.name, Value: val, ExpiresAt: r.expiresUnix})
 	}
 	res.Header = bestHeaderFromRows(res.Cookies)
 	return res, nil
@@ -668,14 +703,16 @@ func bestHeaderFromRows(rows []CookieRow) string {
 	}
 	best := make(map[string]string)
 	bestScore := make(map[string]int)
+	bestExpiry := make(map[string]int64)
 	for _, r := range rows {
 		if !essentialSet[r.Name] || r.Value == "" {
 			continue
 		}
 		s := score(r.Host)
-		if s > bestScore[r.Name] {
+		if s > bestScore[r.Name] || (s == bestScore[r.Name] && r.ExpiresAt > bestExpiry[r.Name]) {
 			best[r.Name] = r.Value
 			bestScore[r.Name] = s
+			bestExpiry[r.Name] = r.ExpiresAt
 		}
 	}
 	return CanonicalHeader(best)

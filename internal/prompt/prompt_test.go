@@ -105,3 +105,40 @@ func TestFlattenMessagesOmitsThoughtTagsAndStripsLeakedThinkingProcessFromHistor
 		t.Fatalf("expected assistant tool_calls envelope preserved in history, got:\n%s", flattened)
 	}
 }
+
+func TestEstimateTokensCJK(t *testing.T) {
+	defer SetTokenEstimatorMode("script")
+
+	// 300 CJK characters = 900 UTF-8 bytes
+	cjkText := strings.Repeat("思考过程分析问题最终答案", 25) // 12 * 25 = 300 runes
+	SetTokenEstimatorMode("script")
+	gotScript := EstimateTokens(cjkText)
+	if gotScript != 450 {
+		t.Fatalf("expected 450 tokens for 300 CJK runes in script mode, got %d", gotScript)
+	}
+
+	SetTokenEstimatorMode("bytes4")
+	gotBytes4 := EstimateTokens(cjkText)
+	if gotBytes4 != 225 {
+		t.Fatalf("expected 225 tokens for 900 UTF-8 bytes in bytes4 mode, got %d", gotBytes4)
+	}
+}
+
+func TestBuildUsageWithCache(t *testing.T) {
+	SetTokenEstimatorMode("script")
+	logical := strings.Repeat(" word", 400)  // 2000 bytes -> 500 tokens
+	uploaded := strings.Repeat(" word", 100) // 500 bytes -> 125 tokens
+	usage := BuildUsageWithCache(logical, uploaded, "answer text", "thinking text")
+
+	details, ok := usage["prompt_tokens_details"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected prompt_tokens_details map in usage: %+v", usage)
+	}
+	cached, _ := details["cached_tokens"].(int)
+	if cached != 375 {
+		t.Fatalf("expected cached_tokens=375 (500-125), got %d", cached)
+	}
+	if usage["prompt_tokens"] != 500 {
+		t.Fatalf("expected prompt_tokens=500, got %v", usage["prompt_tokens"])
+	}
+}

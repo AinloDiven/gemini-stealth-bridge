@@ -198,9 +198,38 @@ var (
 	instrCacheMu    sync.RWMutex
 	instrCacheMap   = make(map[string]string, 32)
 	instrCacheOrder = make([]string, 0, 32)
+
+	compactMu          sync.RWMutex
+	compactEnabled     = true
+	compactDescMaxChar = 400
 )
 
 const toolCacheMax = 32
+
+// SetCompactOptions configures whether BuildToolInstructions and BuildToolReminder
+// compact tool schemas and descriptions before rendering into the prompt.
+func SetCompactOptions(enabled bool, maxDescChars int) {
+	if maxDescChars < 64 {
+		maxDescChars = 400
+	}
+	compactMu.Lock()
+	changed := compactEnabled != enabled || compactDescMaxChar != maxDescChars
+	compactEnabled = enabled
+	compactDescMaxChar = maxDescChars
+	compactMu.Unlock()
+	if changed {
+		instrCacheMu.Lock()
+		instrCacheMap = make(map[string]string, 32)
+		instrCacheOrder = instrCacheOrder[:0]
+		instrCacheMu.Unlock()
+	}
+}
+
+func getCompactOptions() (bool, int) {
+	compactMu.RLock()
+	defer compactMu.RUnlock()
+	return compactEnabled, compactDescMaxChar
+}
 
 // BuildToolInstructions renders the system-prompt tool calling instructions (cached by tool schema + choice).
 func BuildToolInstructions(tools any, toolChoice any) (string, error) {
@@ -212,8 +241,9 @@ func BuildToolInstructions(tools any, toolChoice any) (string, error) {
 		return "", nil
 	}
 
+	compactOn, maxDesc := getCompactOptions()
 	defsBytes, _ := json.Marshal(contract.Tools)
-	cacheKey := contract.ChoiceMode + ":" + contract.ForcedFunction + "\x00" + string(defsBytes)
+	cacheKey := fmt.Sprintf("%s:%s:%v:%d\x00%s", contract.ChoiceMode, contract.ForcedFunction, compactOn, maxDesc, string(defsBytes))
 
 	instrCacheMu.RLock()
 	if cached, ok := instrCacheMap[cacheKey]; ok {
@@ -224,11 +254,18 @@ func BuildToolInstructions(tools any, toolChoice any) (string, error) {
 
 	listParts := make([]string, 0, len(contract.Tools))
 	for _, d := range contract.Tools {
-		b, _ := json.Marshal(d)
+		toRender := d
+		if compactOn {
+			toRender = ToolDef{
+				Name:        d.Name,
+				Description: TruncateUTF8(d.Description, maxDesc),
+				Parameters:  CompactSchemaMap(d.Parameters, maxDesc),
+			}
+		}
+		b, _ := json.Marshal(toRender)
 		listParts = append(listParts, string(b))
 	}
 	list := strings.Join(listParts, "\n")
-
 	lines := []string{
 		"# Tool calling",
 		"",
@@ -285,8 +322,13 @@ func BuildToolReminder(tools any, toolChoice any) (string, error) {
 		return "", nil
 	}
 
+	compactOn, _ := getCompactOptions()
 	summaries := make([]string, 0, len(contract.Tools))
 	for _, d := range contract.Tools {
+		if compactOn {
+			summaries = append(summaries, d.Name)
+			continue
+		}
 		reqList := extractStringSlice(d.Parameters["required"])
 		if len(reqList) > 0 {
 			summaries = append(summaries, fmt.Sprintf("%s(%s)", d.Name, strings.Join(reqList, ", ")))

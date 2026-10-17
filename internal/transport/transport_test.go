@@ -2,14 +2,16 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
 	fhttp "github.com/bogdanfinn/fhttp"
 )
 
@@ -336,4 +338,81 @@ func TestConcurrentPoolAcquireAndLeaseRaceFree(t *testing.T) {
 		}(worker)
 	}
 	wg.Wait()
+}
+
+func TestRequestDumpRedactsCookies(t *testing.T) {
+	tmpDir := t.TempDir()
+	doer := &stubDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			return &fhttp.Response{
+				StatusCode: 200,
+				Header:     fhttp.Header{},
+				Body:       io.NopCloser(strings.NewReader("ok")),
+			}, nil
+		},
+	}
+	sc, err := NewStealthClient(ClientConfig{
+		ProfileName:    "chrome_150_psk",
+		DumpRequestDir: tmpDir,
+		CustomDoer:     doer,
+	})
+	if err != nil {
+		t.Fatalf("NewStealthClient: %v", err)
+	}
+
+	rawCookieSecret := "SUPER_SECRET_COOKIE_VALUE_12345"
+	_, err = sc.Do(context.Background(), RequestOptions{
+		Method: "POST",
+		URL:    "https://gemini.google.com/_/BardChatUi/data/batchexecute",
+		Kind:   ReqKindCORS,
+		Headers: map[string]string{
+			"content-type":  "application/x-www-form-urlencoded;charset=utf-8",
+			"cookie":        "SID=" + rawCookieSecret + "; __Secure-1PSIDTS=ts_secret_val",
+			"authorization": "SAPISIDHASH 1700000000_deadbeef",
+		},
+		Body: []byte("f.req=%5B%5D&at=xsrf"),
+	})
+	if err != nil {
+		t.Fatalf("Do failed: %v", err)
+	}
+
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected 1 dump file in %s, got %d (err=%v)", tmpDir, len(entries), err)
+	}
+	rawBytes, err := os.ReadFile(filepath.Join(tmpDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	rawStr := string(rawBytes)
+	if strings.Contains(rawStr, rawCookieSecret) || strings.Contains(rawStr, "ts_secret_val") || strings.Contains(rawStr, "deadbeef") {
+		t.Fatalf("dump leaked raw cookie or auth token: %s", rawStr)
+	}
+
+	var dump RequestDump
+	if err := json.Unmarshal(rawBytes, &dump); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	idxCT, idxCL, idxAE, idxAL := -1, -1, -1, -1
+	for i, h := range dump.HeaderOrder {
+		switch h {
+		case "content-type":
+			idxCT = i
+		case "content-length":
+			idxCL = i
+		case "accept-encoding":
+			idxAE = i
+		case "accept-language":
+			idxAL = i
+		}
+	}
+	if idxCT < 0 || idxCL != idxCT+1 {
+		t.Fatalf("expected content-length immediately after content-type in HeaderOrder, got %v", dump.HeaderOrder)
+	}
+	if idxAE < 0 || idxAL < 0 || idxAE >= idxAL {
+		t.Fatalf("expected accept-encoding before accept-language in HeaderOrder, got %v", dump.HeaderOrder)
+	}
+	if dump.Headers["authorization"][0] != "SAPISIDHASH <redacted>" {
+		t.Fatalf("unexpected authorization header in dump: %v", dump.Headers["authorization"])
+	}
 }

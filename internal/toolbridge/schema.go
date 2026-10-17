@@ -354,3 +354,73 @@ func jsonEqual(a, b any) bool {
 	}
 	return string(ba) == string(bb)
 }
+
+var nonFunctionalSchemaKeys = map[string]bool{
+	"$schema":              true,
+	"title":                true,
+	"additionalProperties": true,
+	"examples":             true,
+	"$id":                  true,
+	"$comment":             true,
+}
+
+// TruncateUTF8 truncates s on a UTF-8 rune boundary to at most maxRunes runes,
+// appending "..." if truncated.
+func TruncateUTF8(s string, maxRunes int) string {
+	if maxRunes <= 0 || utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	limit := maxRunes - 3
+	if limit < 1 {
+		limit = 1
+	}
+	count := 0
+	for idx := range s {
+		if count >= limit {
+			return s[:idx] + "..."
+		}
+		count++
+	}
+	return s
+}
+
+// CompactSchemaMap recursively copies a JSON Schema map while stripping
+// non-functional metadata keys ($schema, title, additionalProperties, examples, $id, $comment)
+// and truncating "description" strings to maxDescChars runes.
+func CompactSchemaMap(raw map[string]any, maxDescChars int) map[string]any {
+	if raw == nil {
+		return nil
+	}
+	if maxDescChars <= 0 {
+		maxDescChars = 400
+	}
+	out := make(map[string]any, len(raw))
+	for k, v := range raw {
+		if nonFunctionalSchemaKeys[k] {
+			continue
+		}
+		if k == "description" {
+			if str, ok := v.(string); ok {
+				out[k] = TruncateUTF8(str, maxDescChars)
+				continue
+			}
+		}
+		out[k] = compactSchemaValue(v, maxDescChars)
+	}
+	return out
+}
+
+func compactSchemaValue(v any, maxDescChars int) any {
+	switch val := v.(type) {
+	case map[string]any:
+		return CompactSchemaMap(val, maxDescChars)
+	case []any:
+		cp := make([]any, len(val))
+		for i, item := range val {
+			cp[i] = compactSchemaValue(item, maxDescChars)
+		}
+		return cp
+	default:
+		return v
+	}
+}

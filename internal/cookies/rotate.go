@@ -22,9 +22,29 @@ const (
 )
 
 var (
-	psidtsCookies = EssentialNames
-	rotateInitRe  = regexp.MustCompile(`init\('([^']{4,64})'\s*,\s*([0-9.]+)\s*,[^)]*?([0-9.]+)\s*\)`)
+	// rotationCookieSet sends the full canonical cookie jar so both SIDCC and
+	// __Secure-1PSIDTS rotate in a single /RotateCookies call.
+	rotationCookieSet = EssentialNames
+	rotateInitRe      = regexp.MustCompile(`init\('([^']{4,64})'\s*,\s*([0-9.]+)\s*,[^)]*?([0-9.]+)\s*\)`)
 )
+
+// ClampRotateInterval clamps a rotation interval into [60s, 3600s].
+// If d <= 0, defaultDur (or 9m if defaultDur <= 0) is used and clamped.
+func ClampRotateInterval(d, defaultDur time.Duration) time.Duration {
+	if d <= 0 {
+		d = defaultDur
+	}
+	if d <= 0 {
+		d = defaultRotateInterval
+	}
+	if d < 60*time.Second {
+		return 60 * time.Second
+	}
+	if d > 3600*time.Second {
+		return 3600 * time.Second
+	}
+	return d
+}
 
 // Rotator performs dual-path Google session keepalive over the account's own
 // isolated StealthClient:
@@ -65,38 +85,37 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 	// Calling /RotateCookies twice in the same minute triggers HTTP 429 on the second call,
 	// so the 658 iframe flow is used only as a fallback if the primary call does not succeed.
 	if r.allow1PSIDTS(accountID) {
-		subset := Subset(cookie, psidtsCookies)
-		if subset == "" {
-			subset = cookie
-		}
-		res, err := sc.Do(ctx, transport.RequestOptions{
-			Method: "POST",
-			URL:    rotatePostURL,
-			Kind:   transport.ReqKindCORS,
-			Headers: map[string]string{
-				"content-type":   "application/json",
-				"origin":         "https://accounts.google.com",
-				"referer":        "https://accounts.google.com/",
-				"sec-fetch-site": "same-origin",
-				"cookie":         subset,
-			},
-			Body:    []byte(rotate1PSIDTSSentinel),
-			Timeout: 20 * time.Second,
-		})
-		if err == nil {
-			lastStatus = res.Status
-			r.note1PSIDTS(accountID, res.Status)
-			if merged, changed := AbsorbSetCookie(cookie, res.SetCookies); changed {
-				cookie = merged
-				rotatedAny = true
-			}
-			if res.Status == 200 && rotatedAny {
-				return &RotateResult{
-					Status:       res.Status,
-					Rotated:      rotatedAny,
-					CookieHeader: cookie,
-					NextInterval: nextInterval,
-				}, nil
+		subset := Subset(cookie, rotationCookieSet)
+		if subset != "" {
+			res, err := sc.Do(ctx, transport.RequestOptions{
+				Method: "POST",
+				URL:    rotatePostURL,
+				Kind:   transport.ReqKindCORS,
+				Headers: map[string]string{
+					"content-type":   "application/json",
+					"origin":         "https://accounts.google.com",
+					"referer":        "https://accounts.google.com/",
+					"sec-fetch-site": "same-origin",
+					"cookie":         subset,
+				},
+				Body:    []byte(rotate1PSIDTSSentinel),
+				Timeout: 20 * time.Second,
+			})
+			if err == nil {
+				lastStatus = res.Status
+				r.note1PSIDTS(accountID, res.Status)
+				if merged, changed := AbsorbSetCookie(cookie, res.SetCookies); changed {
+					cookie = merged
+					rotatedAny = true
+				}
+				if res.Status == 200 && rotatedAny {
+					return &RotateResult{
+						Status:       res.Status,
+						Rotated:      rotatedAny,
+						CookieHeader: cookie,
+						NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
+					}, nil
+				}
 			}
 		}
 	}
@@ -159,7 +178,7 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 		Status:       lastStatus,
 		Rotated:      rotatedAny,
 		CookieHeader: cookie,
-		NextInterval: nextInterval,
+		NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
 	}, nil
 }
 

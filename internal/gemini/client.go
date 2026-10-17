@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -11,7 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
@@ -71,21 +71,38 @@ type AccountClient struct {
 	Pool     *transport.Pool
 	Rotator  *cookies.Rotator
 
-	mu             sync.RWMutex
-	bootMu         sync.Mutex
-	cookieHeader   string
-	email          string
-	userTier       string
-	at             string
-	bl             string
-	fSid           string
-	pushID         string
-	pctx           string
-	bootstrappedAt time.Time
-	fileMtimeMs    int64
-	modelsCache    *AvailableModelsResult
-	modelsCachedAt time.Time
-	reqCounter     atomic.Int64
+	mu               sync.RWMutex
+	bootMu           sync.Mutex
+	cookieHeader     string
+	cookieGen        atomic.Uint64
+	email            string
+	userTier         string
+	at               string
+	bl               string
+	fSid             string
+	pushID           string
+	pctx             string
+	bootstrappedAt   time.Time
+	fileMtimeMs      int64
+	modelsCache      *AvailableModelsResult
+	modelsCachedAt   time.Time
+	reqCounter       atomic.Int64
+	capturedAt       string
+	rotatedAt        string
+	cookieDB         string
+	importedFrom     string
+	profileID        string
+	tokenFetchedAt   string
+	tokenSource      string
+	fromDiskAT       bool
+	quarantined      bool
+	quarantineReason string
+	accountGroup     string
+	proxyURL         string
+	surfaces         map[string]string
+	locale           string
+	blOverride       string
+	protocolMode     string
 }
 
 // NewAccountClient creates an AccountClient for a specific Google account.
@@ -97,6 +114,9 @@ func NewAccountClient(id, cookieHeader, filePath string, pool *transport.Pool, r
 		Rotator:      rotator,
 		cookieHeader: cookieHeader,
 		pushID:       defaultPushID,
+		locale:       "en",
+		protocolMode: "bridge",
+		surfaces:     make(map[string]string),
 	}
 	ac.reqCounter.Store(100000 + time.Now().UnixNano()%800000)
 	return ac
@@ -118,7 +138,95 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 	ac.bl = rec.BL
 	ac.fSid = rec.FSid
 	ac.fileMtimeMs = mtime
+	ac.capturedAt = rec.CapturedAt
+	ac.rotatedAt = rec.RotatedAt
+	ac.cookieDB = rec.CookieDB
+	ac.importedFrom = rec.ImportedFrom
+	ac.profileID = rec.ProfileID
+	ac.tokenFetchedAt = rec.TokenFetchedAt
+	ac.tokenSource = rec.TokenSource
+	ac.quarantined = rec.Quarantined
+	ac.quarantineReason = rec.QuarantineReason
+	ac.accountGroup = rec.AccountGroup
+	ac.proxyURL = rec.ProxyURL
+	if len(rec.Surfaces) > 0 {
+		for k, v := range rec.Surfaces {
+			ac.surfaces[k] = v
+		}
+	}
+	if rec.AT != "" {
+		ac.fromDiskAT = true
+	}
+	if rec.FSid != "" && rec.LastReqID >= 100000 {
+		ac.reqCounter.Store(rec.LastReqID)
+	}
 	return ac, nil
+}
+
+// SetProvenance records the browser cookie DB and profile provenance on the AccountClient.
+func (ac *AccountClient) SetProvenance(cookieDB, profileHint string) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	if cookieDB != "" {
+		ac.cookieDB = cookieDB
+	}
+	bName, profID := cookies.ParseProfileHint(profileHint)
+	if bName == "" && cookieDB != "" {
+		bName, profID = cookies.ParseProfileHint(cookieDB)
+	}
+	if bName != "" {
+		ac.importedFrom = bName
+	}
+	if profID != "" {
+		ac.profileID = profID
+	}
+}
+
+// SetRuntimeOptions configures locale, BL override, protocol mode, group, and proxy URL.
+func (ac *AccountClient) SetRuntimeOptions(locale, blOverride, protocolMode, accountGroup, proxyURL string) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	if locale != "" {
+		ac.locale = locale
+	}
+	ac.blOverride = blOverride
+	if protocolMode != "" {
+		ac.protocolMode = protocolMode
+	}
+	if accountGroup != "" {
+		ac.accountGroup = accountGroup
+	}
+	if proxyURL != "" {
+		ac.proxyURL = proxyURL
+	}
+}
+
+// SetQuarantined updates the quarantine state and persists it to disk.
+func (ac *AccountClient) SetQuarantined(quarantined bool, reason string) {
+	ac.mu.Lock()
+	ac.quarantined = quarantined
+	ac.quarantineReason = reason
+	if ac.surfaces == nil {
+		ac.surfaces = make(map[string]string)
+	}
+	if quarantined {
+		ac.surfaces["geminiWeb"] = "blocked"
+	} else {
+		ac.surfaces["geminiWeb"] = "ok"
+	}
+	ac.mu.Unlock()
+	ac.persistState()
+}
+
+// SetSurfaceStatus updates a surface status (e.g. "geminiWeb": "ok") and persists to disk.
+func (ac *AccountClient) SetSurfaceStatus(surface, status string) {
+	ac.mu.Lock()
+	if ac.surfaces == nil {
+		ac.surfaces = make(map[string]string)
+	}
+	ac.surfaces[surface] = status
+	ac.mu.Unlock()
+	ac.persistState()
 }
 
 // ReloadFromDiskIfNewer checks if the account JSON file was updated externally
@@ -143,6 +251,7 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	}
 	if rec.AT != "" {
 		ac.at = rec.AT
+		ac.fromDiskAT = true
 	}
 	if rec.BL != "" {
 		ac.bl = rec.BL
@@ -150,8 +259,17 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	if rec.FSid != "" {
 		ac.fSid = rec.FSid
 	}
+	if rec.CapturedAt != "" {
+		ac.capturedAt = rec.CapturedAt
+	}
+	if rec.RotatedAt != "" {
+		ac.rotatedAt = rec.RotatedAt
+	}
+	ac.quarantined = rec.Quarantined
+	ac.quarantineReason = rec.QuarantineReason
 	ac.fileMtimeMs = mtime
 	if changed {
+		ac.cookieGen.Add(1)
 		ac.bootstrappedAt = time.Time{}
 		ac.modelsCache = nil
 	}
@@ -177,6 +295,7 @@ func (ac *AccountClient) SetTokens(at, bl, fSid string) {
 	ac.mu.Lock()
 	if at != "" {
 		ac.at = at
+		ac.fromDiskAT = false
 		ac.bootstrappedAt = time.Now()
 	}
 	if bl != "" {
@@ -215,16 +334,25 @@ func (ac *AccountClient) sessionKey() string {
 }
 
 func (ac *AccountClient) absorbAndPersistCookies(setCookies []string) bool {
+	return ac.absorbAndPersistCookiesWithGen(setCookies, 0, false)
+}
+
+func (ac *AccountClient) absorbAndPersistCookiesWithGen(setCookies []string, expectedGen uint64, enforceGen bool) bool {
 	if len(setCookies) == 0 {
 		return false
 	}
 	ac.mu.Lock()
+	if enforceGen && ac.cookieGen.Load() != expectedGen {
+		ac.mu.Unlock()
+		return false
+	}
 	merged, changed := cookies.AbsorbSetCookie(ac.cookieHeader, setCookies)
 	if !changed {
 		ac.mu.Unlock()
 		return false
 	}
 	ac.cookieHeader = merged
+	ac.cookieGen.Add(1)
 	ac.mu.Unlock()
 
 	if ac.Pool != nil {
@@ -237,28 +365,73 @@ func (ac *AccountClient) absorbAndPersistCookies(setCookies []string) bool {
 }
 
 func (ac *AccountClient) persistState() {
-	ac.mu.RLock()
+	ac.mu.Lock()
 	path := ac.FilePath
 	if path == "" {
-		ac.mu.RUnlock()
+		ac.mu.Unlock()
 		return
 	}
-	rec := cookies.CredentialFile{
-		Kind:       "gemini-web",
-		Name:       ac.ID,
-		Email:      ac.email,
-		Cookies:    ac.cookieHeader,
-		AT:         ac.at,
-		BL:         ac.bl,
-		FSid:       ac.fSid,
-		CapturedAt: time.Now().UTC().Format(time.RFC3339),
+	nowISO := time.Now().UTC().Format(time.RFC3339)
+	if ac.capturedAt == "" {
+		ac.capturedAt = nowISO
 	}
-	ac.mu.RUnlock()
+	ac.rotatedAt = nowISO
+	surfCopy := make(map[string]string, len(ac.surfaces))
+	for k, v := range ac.surfaces {
+		surfCopy[k] = v
+	}
+	rec := cookies.CredentialFile{
+		Kind:             "gemini-web",
+		Name:             ac.ID,
+		Email:            ac.email,
+		Cookies:          ac.cookieHeader,
+		AT:               ac.at,
+		BL:               ac.bl,
+		FSid:             ac.fSid,
+		CapturedAt:       ac.capturedAt,
+		RotatedAt:        ac.rotatedAt,
+		CookieDB:         ac.cookieDB,
+		ImportedFrom:     ac.importedFrom,
+		ProfileID:        ac.profileID,
+		TokenFetchedAt:   ac.tokenFetchedAt,
+		TokenSource:      ac.tokenSource,
+		LastReqID:        ac.reqCounter.Load(),
+		Quarantined:      ac.quarantined,
+		QuarantineReason: ac.quarantineReason,
+		AccountGroup:     ac.accountGroup,
+		ProxyURL:         ac.proxyURL,
+		Surfaces:         surfCopy,
+	}
+	ac.mu.Unlock()
 	if mtime, err := cookies.SaveCredentialFile(path, rec); err == nil {
 		ac.mu.Lock()
 		ac.fileMtimeMs = mtime
 		ac.mu.Unlock()
 	}
+}
+
+func classifyUpstreamAuthOrBan(status int, headers map[string]string, body string, defaultCode string) *transport.UpstreamError {
+	if status == 403 && (strings.Contains(body, "TOS_VIOLATION") || strings.Contains(body, "PERMISSION_DENIED")) {
+		return transport.NewUpstreamError("account banned or restricted upstream (TOS_VIOLATION / PERMISSION_DENIED)", 403, "account_banned", headers, nil)
+	}
+	if status == 302 || status == 301 || status == 303 || status == 307 || status == 308 {
+		loc := ""
+		if headers != nil {
+			loc = headers["location"]
+		}
+		if strings.Contains(loc, "accounts.google.com") || strings.Contains(loc, "ServiceLogin") || loc != "" {
+			return transport.NewUpstreamError("upstream redirected to Google sign-in", 401, "auth_redirect", headers, nil)
+		}
+	}
+	if status == 429 {
+		return transport.NewUpstreamError("upstream rate limited", 429, "rate_limit_error", headers, nil)
+	}
+	code := defaultCode
+	outStatus := status
+	if status == 401 || status == 403 {
+		code = "upstream_auth_error"
+	}
+	return transport.NewUpstreamError(fmt.Sprintf("upstream HTTP %d", status), outStatus, code, headers, nil)
 }
 
 func (ac *AccountClient) acquireSession(ctx context.Context) (*transport.Session, error) {
@@ -305,27 +478,27 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 	}
 	// Self-heal expired __Secure-1PSIDTS / SIDCC before declaring session dead:
 	// if /app failed or returned no SNlM0e token, run RotateCookies once and retry.
+	var lastRotRes *cookies.RotateResult
 	if res.Status != 200 || at == "" {
-		if rotRes, rotErr := ac.rotateOnClient(ctx, sc); rotErr == nil && rotRes != nil && rotRes.Rotated {
-			if retryRes, retryErr := doFetchApp(); retryErr == nil {
-				res = retryRes
-				if res.Status == 200 {
-					at = matchFirst(snlm0eRe, res.Body)
+		if rotRes, rotErr := ac.rotateOnClient(ctx, sc); rotErr == nil && rotRes != nil {
+			lastRotRes = rotRes
+			if rotRes.Rotated {
+				if retryRes, retryErr := doFetchApp(); retryErr == nil {
+					res = retryRes
+					if res.Status == 200 {
+						at = matchFirst(snlm0eRe, res.Body)
+					}
 				}
 			}
 		}
 	}
 
+	if lastRotRes != nil && lastRotRes.Status == 429 && at == "" {
+		return transport.NewUpstreamError("cookie rotation rate limited (HTTP 429)", 429, "rate_limit_error", res.Headers, nil)
+	}
+
 	if res.Status != 200 {
-		code := "upstream_http_error"
-		status := res.Status
-		if status == 401 || status == 403 || status == 302 {
-			code = "upstream_auth_error"
-			if status == 302 {
-				status = 401
-			}
-		}
-		return transport.NewUpstreamError(fmt.Sprintf("bootstrap HTTP %d", res.Status), status, code, res.Headers, nil)
+		return classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "upstream_http_error")
 	}
 
 	bl := matchFirst(cfb2hRe, res.Body)
@@ -339,6 +512,9 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 	tier := matchFirst(tierRe, res.Body)
 
 	if at == "" {
+		if strings.Contains(res.Body, "TOS_VIOLATION") || strings.Contains(res.Body, "PERMISSION_DENIED") {
+			return transport.NewUpstreamError("account banned or restricted upstream (TOS_VIOLATION / PERMISSION_DENIED)", 403, "account_banned", res.Headers, nil)
+		}
 		return transport.NewUpstreamError(
 			"could not extract SNlM0e (at token); session may be expired",
 			401,
@@ -347,11 +523,19 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 			nil,
 		)
 	}
+	nowISO := time.Now().UTC().Format(time.RFC3339)
 	ac.mu.Lock()
 	ac.at = at
-	if bl != "" {
+	ac.tokenFetchedAt = nowISO
+	ac.tokenSource = "bridge"
+	ac.fromDiskAT = false
+	if ac.blOverride != "" {
+		ac.bl = ac.blOverride
+		log.Printf("[gemini] account %s using BRIDGE_BL_OVERRIDE=%s", ac.ID, ac.blOverride)
+	} else if bl != "" {
 		ac.bl = bl
 	} else if ac.bl == "" {
+		log.Printf("[gemini] WARNING: account %s could not extract cfb2h build label; falling back to DefaultBL", ac.ID)
 		ac.bl = DefaultBL
 	}
 	if fSid != "" {
@@ -379,19 +563,38 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 func (ac *AccountClient) ensureBootstrapped(ctx context.Context, sc *transport.StealthClient) error {
 	ac.mu.RLock()
 	at := ac.at
-	age := time.Since(ac.bootstrappedAt)
+	fromDisk := ac.fromDiskAT
+	bootAt := ac.bootstrappedAt
+	age := time.Since(bootAt)
 	ac.mu.RUnlock()
-	if at != "" && (ac.bootstrappedAt.IsZero() || age < xsrfTTL) {
+	if at != "" && !fromDisk && !bootAt.IsZero() && age < xsrfTTL {
 		return nil
 	}
 	ac.bootMu.Lock()
 	defer ac.bootMu.Unlock()
 	ac.mu.RLock()
 	at = ac.at
-	age = time.Since(ac.bootstrappedAt)
+	bl := ac.bl
+	fSid := ac.fSid
+	fromDisk = ac.fromDiskAT
+	bootAt = ac.bootstrappedAt
+	age = time.Since(bootAt)
 	ac.mu.RUnlock()
-	if at != "" && (ac.bootstrappedAt.IsZero() || age < xsrfTTL) {
+	if at != "" && !fromDisk && !bootAt.IsZero() && age < xsrfTTL {
 		return nil
+	}
+	if fromDisk && at != "" && bl != "" && fSid != "" {
+		if res, err := ac.doBatchExec(ctx, sc, "otAQ7b", "[]"); err == nil && res != nil && res.Status == 200 {
+			entries := ParseBatch(res.Body)
+			p := findBatchPayload(entries, "otAQ7b")
+			if p != nil && !isStatus1016(p) {
+				ac.mu.Lock()
+				ac.fromDiskAT = false
+				ac.bootstrappedAt = time.Now()
+				ac.mu.Unlock()
+				return nil
+			}
+		}
 	}
 	return ac.bootstrapOnClient(ctx, sc)
 }
@@ -417,6 +620,7 @@ func (ac *AccountClient) rotateOnClient(ctx context.Context, sc *transport.Steal
 	if res.Rotated && res.CookieHeader != "" {
 		ac.mu.Lock()
 		ac.cookieHeader = res.CookieHeader
+		ac.cookieGen.Add(1)
 		ac.mu.Unlock()
 		if ac.Pool != nil {
 			if s := ac.Pool.Existing(ac.sessionKey()); s != nil {
@@ -450,7 +654,11 @@ func (ac *AccountClient) doBatchExec(ctx context.Context, sc *transport.StealthC
 	bl := ac.bl
 	fSid := ac.fSid
 	cookie := ac.cookieHeader
+	hl := ac.locale
 	ac.mu.RUnlock()
+	if hl == "" {
+		hl = "en"
+	}
 
 	reqID := ac.nextReqID()
 	q := url.Values{}
@@ -458,7 +666,7 @@ func (ac *AccountClient) doBatchExec(ctx context.Context, sc *transport.StealthC
 	q.Set("source-path", "/app")
 	q.Set("bl", bl)
 	q.Set("f.sid", fSid)
-	q.Set("hl", "en")
+	q.Set("hl", hl)
 	q.Set("_reqid", strconv.FormatInt(reqID, 10))
 	q.Set("rt", "c")
 
@@ -552,11 +760,7 @@ func (ac *AccountClient) AvailableModels(ctx context.Context, force bool) (*Avai
 		return nil, err
 	}
 	if res.Status != 200 {
-		code := "model_discovery_error"
-		if res.Status == 401 {
-			code = "upstream_auth_error"
-		}
-		return nil, transport.NewUpstreamError(fmt.Sprintf("model discovery HTTP %d", res.Status), res.Status, code, res.Headers, nil)
+		return nil, classifyUpstreamAuthOrBan(res.Status, res.Headers, res.Body, "model_discovery_error")
 	}
 
 	p := findBatchPayload(entries, "otAQ7b")
@@ -695,19 +899,17 @@ func (ac *AccountClient) GetQuota(ctx context.Context) []QuotaBucket {
 	}
 
 	payloads := []string{quotaPayloadFlash, quotaPayloadAdvanced}
-	batchResults := make([][]BatchEntry, len(payloads))
-	var wg sync.WaitGroup
-	for i, payload := range payloads {
-		wg.Add(1)
-		go func(idx int, pl string) {
-			defer wg.Done()
-			res, rErr := ac.doBatchExec(ctx, sess.Client, "qpEbW", pl)
-			if rErr == nil && res != nil {
-				batchResults[idx] = ParseBatch(res.Body)
-			}
-		}(i, payload)
+	batchResults := make([][]BatchEntry, 0, len(payloads))
+	for _, pl := range payloads {
+		res, rErr := ac.doBatchExec(ctx, sess.Client, "qpEbW", pl)
+		if rErr != nil || res == nil {
+			break
+		}
+		if res.Status == 401 || res.Status == 403 || res.Status == 429 || res.Status >= 500 {
+			break
+		}
+		batchResults = append(batchResults, ParseBatch(res.Body))
 	}
-	wg.Wait()
 
 	var out []QuotaBucket
 	for _, entries := range batchResults {

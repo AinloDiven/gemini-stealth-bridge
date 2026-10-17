@@ -5,12 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
-	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
 )
 
 const sessionCacheTTL = 30 * time.Minute
@@ -66,11 +68,15 @@ func (s *Server) loadSessionCacheFromDisk() {
 	}
 }
 
-func (s *Server) flushSessionCacheToDisk() {
+func (s *Server) FlushSessionCacheNow() {
 	p := s.sessionCacheDiskPath()
 	if p == "" {
 		return
 	}
+	s.cacheFlushMu.Lock()
+	defer s.cacheFlushMu.Unlock()
+	s.cacheFlushPending.Store(false)
+
 	now := time.Now()
 	s.mu.RLock()
 	entries := make([]persistedSessionEntry, 0, len(s.sessionOrder))
@@ -90,10 +96,30 @@ func (s *Server) flushSessionCacheToDisk() {
 	if err != nil {
 		return
 	}
-	tmp := p + ".tmp"
+	tmp := fmt.Sprintf("%s.tmp-%d", p, time.Now().UnixNano())
 	if err := os.WriteFile(tmp, b, 0o600); err == nil {
-		_ = os.Rename(tmp, p)
+		if err := os.Rename(tmp, p); err != nil {
+			_ = os.Remove(tmp)
+		}
 	}
+}
+
+func (s *Server) flushSessionCacheToDisk() {
+	if s.sessionCacheDiskPath() == "" {
+		return
+	}
+	if !s.cacheFlushPending.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		s.FlushSessionCacheNow()
+	}()
+}
+
+func (s *Server) sessionCacheLen() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.sessionCache)
 }
 
 func (s *Server) getSessionCache(key string) []any {
@@ -102,11 +128,14 @@ func (s *Server) getSessionCache(key string) []any {
 	at := s.sessionCacheAt[key]
 	s.mu.RUnlock()
 	if len(src) == 0 {
+		s.cacheMisses.Add(1)
 		return nil
 	}
 	if !at.IsZero() && time.Since(at) >= sessionCacheTTL {
+		s.cacheMisses.Add(1)
 		return nil
 	}
+	s.cacheHits.Add(1)
 	cp := make([]any, len(src))
 	copy(cp, src)
 	return cp

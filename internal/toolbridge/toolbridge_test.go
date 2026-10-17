@@ -1,6 +1,7 @@
 package toolbridge
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -310,5 +311,73 @@ func TestLiveToolCallStreamerIncrementalAndMultiCall(t *testing.T) {
 	}
 	if reconstructed[1] != oa[1].Function.Arguments {
 		t.Fatalf("call 1 streamed args mismatch:\ngot:  %s\nwant: %s", reconstructed[1], oa[1].Function.Arguments)
+	}
+}
+
+func TestToolSchemaCompactionParity(t *testing.T) {
+	defer SetCompactOptions(true, 400)
+
+	longDesc := strings.Repeat("Detailed tool parameter specification with UTF-8 文字 descriptions. ", 15)
+	tools := make([]any, 0, 30)
+	for i := range 30 {
+		tools = append(tools, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        fmt.Sprintf("tool_%02d", i),
+				"description": longDesc,
+				"parameters": map[string]any{
+					"$schema":              "https://json-schema.org/draft/2020-12/schema",
+					"$id":                  fmt.Sprintf("https://example.com/schemas/tool_%02d.json", i),
+					"title":                fmt.Sprintf("Tool %02d Parameters", i),
+					"$comment":             "Internal schema comment that models do not need",
+					"type":                 "object",
+					"additionalProperties": false,
+					"examples":             []any{map[string]any{"query": "example query"}},
+					"properties": map[string]any{
+						"query": map[string]any{
+							"type":        "string",
+							"title":       "Query String",
+							"description": longDesc,
+							"examples":    []any{"foo", "bar"},
+						},
+					},
+					"required": []any{"query"},
+				},
+			},
+		})
+	}
+
+	SetCompactOptions(false, 400)
+	uncompactedInstr, err := BuildToolInstructions(tools, "auto")
+	if err != nil {
+		t.Fatalf("BuildToolInstructions uncompacted: %v", err)
+	}
+	uncompactedRem, _ := BuildToolReminder(tools, "auto")
+
+	SetCompactOptions(true, 400)
+	compactedInstr, err := BuildToolInstructions(tools, "auto")
+	if err != nil {
+		t.Fatalf("BuildToolInstructions compacted: %v", err)
+	}
+	compactedRem, _ := BuildToolReminder(tools, "auto")
+
+	if len(compactedInstr) >= len(uncompactedInstr)*70/100 {
+		t.Fatalf("expected significant reduction in compacted instructions size: compacted=%d vs uncompacted=%d", len(compactedInstr), len(uncompactedInstr))
+	}
+	if strings.Contains(compactedInstr, "$schema") || strings.Contains(compactedInstr, "additionalProperties") || strings.Contains(compactedInstr, "$comment") {
+		t.Fatalf("expected non-functional schema keys stripped from compacted instructions")
+	}
+	if len(compactedRem) >= len(uncompactedRem) || strings.Contains(compactedRem, "(query)") {
+		t.Fatalf("expected compacted reminder to list tool names without required arg lists, got: %s", compactedRem)
+	}
+
+	// Validation must still enforce additionalProperties:false from original schema
+	_, err = InterpretReply(`{"tool_calls":[{"name":"tool_00","arguments":{"query":"ok","extra_field":1}}]}`, tools, "auto")
+	if err == nil || !strings.Contains(err.Error(), "violate the tool schema") {
+		t.Fatalf("expected original schema validation to reject extra_field despite prompt compaction, got err=%v", err)
+	}
+	res, err := InterpretReply(`{"tool_calls":[{"name":"tool_00","arguments":{"query":"ok"}}]}`, tools, "auto")
+	if err != nil || res == nil || len(res.Calls) != 1 {
+		t.Fatalf("expected valid call to pass validation, got res=%+v err=%v", res, err)
 	}
 }

@@ -9,6 +9,7 @@ The daemon runs without headless Chrome or CDP. Browserless transport is an impl
 ## Contents
 
 - [Capabilities and limits](#capabilities-and-limits)
+- [What's new in v0.2.0](#whats-new-in-v020)
 - [Quick start](#quick-start)
 - [Account setup](#account-setup)
 - [Client integration](#client-integration)
@@ -42,6 +43,17 @@ Compatibility covers the endpoints and fields described below, not the entire Op
 - Function calling is prompt-based, not native Gemini Developer API function calling. Malformed or schema-invalid calls can fail with `tool_call_error`. Native Gemini web tools are disabled for generation; OpenAI built-in tools such as web search are not exposed.
 - Token usage is estimated locally, not reported by Google's billing/tokenizer API. The model registry advertises a 1,048,576-token context window and 65,536-token output limit as metadata, not a guarantee for every account or request.
 - Audio, video, image generation, embeddings, and the OpenAI Files API are not exposed. Internal text-attachment offloading is not a general file-upload API.
+
+## What's new in v0.2.0
+
+Version `0.2.0` focuses on making daily coding-agent workflows smoother, keeping long sessions stable, and protecting connected Google accounts:
+
+- **Cleaner answers on multilingual & reasoning prompts**: Gemini Web sometimes writes its thought process directly inside the reply body—especially when thinking in Chinese, Japanese, Korean, or mixed languages. `gsb` now recognizes these patterns and routes them to the reasoning channel so your chat or coding agent only receives the final answer.
+- **Full context and output limits in routers**: API routers and coding harnesses often fall back to small default limits (like `4,096` output tokens) when model metadata is incomplete. `/v1/models` now publishes complete OpenAI and OpenRouter capability metadata so clients can use the full context window and output capacity without premature truncation.
+- **Faster streaming & lower prompt overhead**: Tool definitions are compacted before being injected into the prompt so agents with many tools waste less context, while keep-alive pings and optional early SSE headers prevent clients and reverse proxies from timing out during long thinking phases.
+- **Accurate cached-token & CJK usage reporting**: When `gsb` reuses a conversation continuation or processes CJK text, token usage now reflects both the script density and the tokens saved by session caching (`cached_tokens`), giving coding agents a much more realistic view of your context budget.
+- **Smarter recovery when an account is busy or downgraded**: Instead of failing immediately when you send overlapping requests to a single account, `gsb` briefly waits for the active stream to finish. When Gemini Web silently downgrades a model, backoff now starts small (1 minute) and clears automatically as soon as the model responds normally again.
+- **Safer session lifecycle & account protection**: A single-writer lock prevents two `gsb` instances from corrupting the same credential directory, expired browser cookies are filtered out during import, in-flight requests no longer overwrite freshly rotated cookies, and accounts that hit an upstream restriction are automatically quarantined instead of being retried in a loop.
 
 ## Quick start
 
@@ -194,7 +206,7 @@ Add `gsb` as an OpenAI-compatible provider in `9router`:
 
 Add a separate provider credential for each account if you want the router to manage account selection. Point the coding agent at the router's URL with the router's own API key; use the model name/prefix exposed by the router, for example `gsb/gemini-flash`. The bridge also accepts the `gsb/` model prefix directly.
 
-The base URL must be reachable **from the router process**. Inside a container, `127.0.0.1` refers to that container, not the host running `gsb`. Any non-loopback deployment needs the security measures below.
+The base URL must be reachable **from the router process**. Inside a container, `127.0.0.1` refers to that container, not the host running `gsb`. Any non-loopback deployment needs the security measures below. If your router caches or overrides model limits, you can run `./scripts/check-router-metadata.sh <router-url> <api-key>` to verify that context and output limits are passed through intact.
 
 ## API usage
 
@@ -242,12 +254,13 @@ All `/v1/*` endpoints below use the same authentication resolver. Account keys s
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Unauthenticated daemon status and account/model counts; does not prove upstream readiness |
-| `GET` | `/v1/models` | Model IDs and compatibility metadata for the caller's scope |
-| `POST` | `/v1/chat/completions` | Chat messages, tools, images, and JSON/SSE output |
-| `POST` | `/v1/responses` | Responses input, instructions, tools, and JSON/SSE output |
-| `GET` | `/v1/accounts` | Account IDs, email addresses, discovered models, and cached quotas |
-| `GET` | `/v1/quota` | Queries upstream quota buckets for scoped accounts |
-| `GET` | `/v1/sessions` | Transport session status across the daemon |
+| `GET` | `/readyz` | Readiness probe reporting per-account `models_fresh`, `quota_fresh`, `auth_ok`, and `quarantined` (`?strict=1` returns HTTP `503` when no healthy account is available) |
+| `GET` | `/v1/models` | Model IDs, OpenRouter/OpenAI limits, and capability metadata (`ETag` / `If-None-Match` caching; `?fresh=1` forces live discovery) |
+| `POST` | `/v1/chat/completions` | Chat messages, tools, images, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
+| `POST` | `/v1/responses` | Responses input, instructions, tools, and JSON/SSE output (includes `X-GSB-*` diagnostic headers) |
+| `GET` | `/v1/accounts` | Account IDs, email addresses, timestamps, quarantine state, surfaces, models, and cached quotas |
+| `GET` | `/v1/quota` | Cached or live (`?fresh=1`) upstream quota buckets for scoped accounts |
+| `GET` | `/v1/sessions` | Transport session status and continuation cache hit/miss counters |
 | `POST` | `/v1/refresh` | Reloads credential files and refreshes the model registry across the daemon |
 
 `/v1/refresh` rejects requests carrying an `Origin` header. Model names and quota information come from Gemini Web and can change independently of this repository.
@@ -356,7 +369,7 @@ Run `./gsb` directly for predictable environment handling. The optional Bash hel
 | Stream appears stalled or fails | Check daemon logs, upstream connectivity/proxy, client buffering, and client/reverse-proxy timeouts |
 | Reasoning appears in normal chat output | Check the client's reasoning-field support; model-authored inline reasoning may not be extracted |
 
-Quota-related errors may include `Retry-After` and `X-Resets-At` when usable reset information is available. SSE requests can emit an error after HTTP headers have been sent; clients must inspect stream events, not only the HTTP status.
+Quota-related errors may include `Retry-After` and `X-Resets-At` when usable reset information is available. When an error is caused by a silent model downgrade rather than an upstream quota timer, `gsb` uses a short retry cooldown and includes `X-GSB-Retry-Reason` so clients can tell the difference. SSE requests can emit an error after HTTP headers have been sent; clients must inspect stream events, not only the HTTP status.
 
 ## How it works
 

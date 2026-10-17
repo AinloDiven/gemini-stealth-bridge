@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -11,7 +12,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
@@ -138,17 +138,59 @@ func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error
 	}
 	ac.ID = id
 	rec, _, _ := cookies.LoadAccountFile(path)
-	var capAt time.Time
-	if rec != nil && rec.CapturedAt != "" {
-		capAt, _ = time.Parse(time.RFC3339, rec.CapturedAt)
+	var capAt, rotAt time.Time
+	var importedFrom, profileID, acctGroup, qReason string
+	var quarantined bool
+	surfaces := make(map[string]string)
+	if rec != nil {
+		if rec.CapturedAt != "" {
+			capAt, _ = time.Parse(time.RFC3339, rec.CapturedAt)
+		}
+		if rec.RotatedAt != "" {
+			rotAt, _ = time.Parse(time.RFC3339, rec.RotatedAt)
+		}
+		importedFrom = rec.ImportedFrom
+		profileID = rec.ProfileID
+		acctGroup = rec.AccountGroup
+		quarantined = rec.Quarantined
+		qReason = rec.QuarantineReason
+		for k, v := range rec.Surfaces {
+			surfaces[k] = v
+		}
 	}
+	if g, ok := s.Cfg.AccountGroups[id]; ok && g != "" {
+		acctGroup = g
+	}
+	proxyURL := ""
+	if p, ok := s.Cfg.EgressPerAccount[id]; ok && p != "" {
+		proxyURL = p
+	} else if rec != nil && rec.ProxyURL != "" {
+		proxyURL = rec.ProxyURL
+	}
+	ac.SetRuntimeOptions(s.Cfg.Locale, s.Cfg.BLOverride, s.Cfg.ProtocolMode, acctGroup, proxyURL)
+
 	return &AccountState{
-		ID:         id,
-		Email:      ac.Email(),
-		FilePath:   path,
-		CapturedAt: capAt,
-		Client:     ac,
+		ID:               id,
+		Email:            ac.Email(),
+		FilePath:         path,
+		CapturedAt:       capAt,
+		RotatedAt:        rotAt,
+		ImportedFrom:     importedFrom,
+		ProfileID:        profileID,
+		AccountGroup:     acctGroup,
+		Quarantined:      quarantined,
+		QuarantineReason: qReason,
+		Surfaces:         surfaces,
+		subStrikes:       make(map[string]int),
+		Client:           ac,
 	}, nil
+}
+
+func effectiveFreshnessTime(a *AccountState) time.Time {
+	if !a.RotatedAt.IsZero() {
+		return a.RotatedAt
+	}
+	return a.CapturedAt
 }
 
 func dedupeAccounts(list []*AccountState, credFile string) []*AccountState {
@@ -168,8 +210,10 @@ func dedupeAccounts(list []*AccountState, credFile string) []*AccountState {
 		}
 		aNamed := a.FilePath != credFile
 		prevNamed := prev.FilePath != credFile
-		newer := a.CapturedAt.After(prev.CapturedAt)
-		tieNamed := a.CapturedAt.Equal(prev.CapturedAt) && aNamed && !prevNamed
+		aTime := effectiveFreshnessTime(a)
+		prevTime := effectiveFreshnessTime(prev)
+		newer := aTime.After(prevTime)
+		tieNamed := aTime.Equal(prevTime) && aNamed && !prevNamed
 		if newer || tieNamed {
 			byEmail[key] = a
 			for i := range out {
@@ -298,21 +342,95 @@ func resolveModelOnAccount(a *AccountState, wanted string) *gemini.ModelInfo {
 	return nil
 }
 
+func (s *Server) markAccountQuarantined(a *AccountState, reason string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	a.Quarantined = true
+	a.QuarantineReason = reason
+	if a.Surfaces == nil {
+		a.Surfaces = make(map[string]string)
+	}
+	a.Surfaces["geminiWeb"] = "blocked"
+	c := a.Client
+	a.mu.Unlock()
+
+	if ac, ok := c.(*gemini.AccountClient); ok {
+		ac.SetQuarantined(true, reason)
+	}
+	log.Printf("[quarantine] account=%s quarantined reason=%q", a.ID, reason)
+}
+
+func (s *Server) checkAccountRateLimit(a *AccountState) error {
+	if a == nil {
+		return nil
+	}
+	now := s.now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if s.Cfg.MaxConcurrentPerAccount > 0 && a.activeStreams >= s.Cfg.MaxConcurrentPerAccount {
+		return transport.NewUpstreamError("account concurrent stream limit reached", 429, "rate_limit_error", map[string]string{"retry-after": "2"}, nil)
+	}
+	if s.Cfg.MaxRPMPerAccount > 0 {
+		cutoff := now.Add(-60 * time.Second)
+		kept := a.reqTimestamps[:0]
+		for _, ts := range a.reqTimestamps {
+			if ts.After(cutoff) {
+				kept = append(kept, ts)
+			}
+		}
+		a.reqTimestamps = kept
+		if len(a.reqTimestamps) >= s.Cfg.MaxRPMPerAccount {
+			waitSec := int(math.Ceil(a.reqTimestamps[0].Add(60 * time.Second).Sub(now).Seconds()))
+			if waitSec < 1 {
+				waitSec = 1
+			}
+			return transport.NewUpstreamError(
+				fmt.Sprintf("account %s RPM limit (%d/min) reached", a.ID, s.Cfg.MaxRPMPerAccount),
+				429,
+				"rate_limit_error",
+				map[string]string{"retry-after": strconv.Itoa(waitSec)},
+				nil,
+			)
+		}
+		a.reqTimestamps = append(a.reqTimestamps, now)
+	}
+	return nil
+}
+
 func (s *Server) checkPreFlightQuota(a *AccountState, model gemini.ModelInfo, mid string) error {
-	if !s.Cfg.RejectDowngrade {
+	return s.checkPreFlightQuotaInternal(a, model, mid, false)
+}
+
+func (s *Server) checkPreFlightQuotaInternal(a *AccountState, model gemini.ModelInfo, mid string, forSelection bool) error {
+	if a == nil {
+		return nil
+	}
+	a.mu.RLock()
+	quarantined := a.Quarantined
+	qReason := a.QuarantineReason
+	quota := a.Quota
+	a.mu.RUnlock()
+	if quarantined {
+		return transport.NewUpstreamError(fmt.Sprintf("account %s is quarantined: %s", a.ID, qReason), 403, "account_banned", nil, nil)
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(s.Cfg.QuotaPreflight))
+	if mode == "off" {
+		return nil
+	}
+	if !s.Cfg.RejectDowngrade && (mode == "" || mode == "strict") {
 		return nil
 	}
 	name := strings.ToLower(model.ModelName)
 	if strings.Contains(name, "lite") {
 		return nil
 	}
-	a.mu.RLock()
-	quota := a.Quota
-	a.mu.RUnlock()
 	if len(quota) == 0 {
 		return nil
 	}
-	now := time.Now()
+	now := s.now()
 	family := modelFamilyTokens(name)
 	var spent []gemini.QuotaBucket
 	for _, q := range quota {
@@ -343,25 +461,49 @@ func (s *Server) checkPreFlightQuota(a *AccountState, model gemini.ModelInfo, mi
 	if len(related) > 0 {
 		activeSpent = related
 	}
-	var earliest time.Time
+	if mode == "advisory" && !forSelection {
+		log.Printf("[quota] advisory preflight warning: model %s appears exhausted on account %s", mid, a.ID)
+		return nil
+	}
+	var earliestReal time.Time
+	var earliestAny time.Time
+	hasReal := false
 	for _, q := range activeSpent {
+		isSynth := q.Synthetic || strings.HasPrefix(q.ID, "sub:")
 		if t, err := time.Parse(time.RFC3339, q.ResetAt); err == nil {
-			if earliest.IsZero() || t.Before(earliest) {
-				earliest = t
+			if earliestAny.IsZero() || t.Before(earliestAny) {
+				earliestAny = t
+			}
+			if !isSynth {
+				hasReal = true
+				if earliestReal.IsZero() || t.Before(earliestReal) {
+					earliestReal = t
+				}
 			}
 		}
 	}
-	retrySec := int(math.Ceil(earliest.Sub(now).Seconds()))
+	if !hasReal {
+		return transport.NewUpstreamError(
+			fmt.Sprintf("quota exceeded: %s is in synthetic substitution cooldown on account %s until %s", mid, a.ID, earliestAny.UTC().Format(time.RFC3339)),
+			429,
+			"rate_limit_error",
+			map[string]string{
+				"x-gsb-retry-reason": "model_substitution",
+			},
+			nil,
+		)
+	}
+	retrySec := int(math.Ceil(earliestReal.Sub(now).Seconds()))
 	if retrySec < 1 {
 		retrySec = 1
 	}
 	return transport.NewUpstreamError(
-		fmt.Sprintf("quota exceeded: %s is exhausted on account %s until %s", mid, a.ID, earliest.UTC().Format(time.RFC3339)),
+		fmt.Sprintf("quota exceeded: %s is exhausted on account %s until %s", mid, a.ID, earliestReal.UTC().Format(time.RFC3339)),
 		429,
 		"rate_limit_error",
 		map[string]string{
 			"retry-after": strconv.Itoa(retrySec),
-			"x-resets-at": earliest.UTC().Format(time.RFC3339),
+			"x-resets-at": earliestReal.UTC().Format(time.RFC3339),
 		},
 		nil,
 	)
@@ -462,16 +604,33 @@ func (s *Server) recordModelExhausted(a *AccountState, modelName string) {
 		return
 	}
 	subID := "sub:" + strings.ToLower(strings.TrimSpace(modelName))
-	resetAt := time.Now().UTC().Add(30 * time.Minute).Format(time.RFC3339)
+	now := s.now()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.subStrikes == nil {
+		a.subStrikes = make(map[string]int)
+	}
+	strikes := a.subStrikes[subID] + 1
+	a.subStrikes[subID] = strikes
+	var dur time.Duration
+	switch {
+	case strikes == 1:
+		dur = 1 * time.Minute
+	case strikes == 2:
+		dur = 5 * time.Minute
+	default:
+		dur = 15 * time.Minute
+	}
+	resetAt := now.UTC().Add(dur).Format(time.RFC3339)
 	bucket := gemini.QuotaBucket{
 		ID:        subID,
 		Label:     modelName,
 		Total:     1,
 		Remaining: 0,
 		ResetAt:   resetAt,
+		Synthetic: true,
+		Strikes:   strikes,
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	for i, q := range a.Quota {
 		if q.ID == subID {
 			a.Quota[i] = bucket
@@ -481,21 +640,47 @@ func (s *Server) recordModelExhausted(a *AccountState, modelName string) {
 	a.Quota = append(a.Quota, bucket)
 }
 
+func (s *Server) clearModelExhausted(a *AccountState, modelName string) {
+	if a == nil || modelName == "" {
+		return
+	}
+	subID := "sub:" + strings.ToLower(strings.TrimSpace(modelName))
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.subStrikes != nil {
+		delete(a.subStrikes, subID)
+	}
+	if len(a.Quota) == 0 {
+		return
+	}
+	kept := a.Quota[:0]
+	for _, q := range a.Quota {
+		if q.ID == subID {
+			continue
+		}
+		kept = append(kept, q)
+	}
+	a.Quota = kept
+}
+
 func (s *Server) mergeAccountQuota(a *AccountState, fresh []gemini.QuotaBucket) []gemini.QuotaBucket {
-	now := time.Now()
+	now := s.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	merged := make([]gemini.QuotaBucket, 0, len(fresh)+2)
 	merged = append(merged, fresh...)
 	for _, old := range a.Quota {
-		if strings.HasPrefix(old.ID, "sub:") && old.ResetAt != "" {
+		if (old.Synthetic || strings.HasPrefix(old.ID, "sub:")) && old.ResetAt != "" {
 			if t, err := time.Parse(time.RFC3339, old.ResetAt); err == nil && t.After(now) {
+				old.Synthetic = true
 				merged = append(merged, old)
 			}
 		}
 	}
 	a.Quota = merged
 	a.QuotaAt = now
+	a.QuotaBackoffStep = 0
+	a.QuotaNextAllowAt = time.Time{}
 	return merged
 }
 
@@ -521,7 +706,7 @@ func (s *Server) hasSessionCacheHit(a *AccountState, modelName string, hasher *p
 	return false
 }
 
-func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]bool, requested string, hasher *prompt.HistoryHasher) (*AccountState, *gemini.ModelInfo) {
+func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]bool, originGroup string, requested string, hasher *prompt.HistoryHasher) (*AccountState, *gemini.ModelInfo) {
 	var idleCand *AccountState
 	var idleModel *gemini.ModelInfo
 	var busyCand *AccountState
@@ -530,11 +715,21 @@ func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]boo
 		if tried[cand.ID] {
 			continue
 		}
+		cand.mu.RLock()
+		qState := cand.Quarantined
+		cGroup := cand.AccountGroup
+		cand.mu.RUnlock()
+		if qState {
+			continue
+		}
+		if (originGroup != "" || cGroup != "") && cGroup != originGroup {
+			continue
+		}
 		m := resolveModelOnAccount(cand, requested)
 		if m == nil {
 			continue
 		}
-		if err := s.checkPreFlightQuota(cand, *m, m.ModelName); err != nil {
+		if err := s.checkPreFlightQuotaInternal(cand, *m, m.ModelName, true); err != nil {
 			continue
 		}
 		if !s.isAccountBusy(cand.ID) {
@@ -598,34 +793,49 @@ func (s *Server) lookupQuotaResetHeaders(_ context.Context, a *AccountState, mod
 	if len(related) > 0 {
 		chosen = related
 	}
-	now := time.Now()
-	var earliest time.Time
+	now := s.now()
+	var earliestReal time.Time
+	sawSynthetic := false
 	for _, q := range chosen {
+		isSynth := q.Synthetic || strings.HasPrefix(q.ID, "sub:")
+		if isSynth {
+			sawSynthetic = true
+			continue
+		}
 		if q.ResetAt != "" {
 			if t, err := time.Parse(time.RFC3339, q.ResetAt); err == nil && t.After(now) {
-				if earliest.IsZero() || t.Before(earliest) {
-					earliest = t
+				if earliestReal.IsZero() || t.Before(earliestReal) {
+					earliestReal = t
 				}
 			}
 		}
 	}
-	if earliest.IsZero() {
+	if earliestReal.IsZero() {
+		if sawSynthetic {
+			return map[string]string{
+				"x-gsb-retry-reason": "model_substitution",
+			}
+		}
 		return nil
 	}
-	retrySec := int(math.Ceil(earliest.Sub(now).Seconds()))
+	retrySec := int(math.Ceil(earliestReal.Sub(now).Seconds()))
 	if retrySec < 1 {
 		retrySec = 1
 	}
-	return map[string]string{
+	out := map[string]string{
 		"retry-after": strconv.Itoa(retrySec),
-		"x-resets-at": earliest.UTC().Format(time.RFC3339),
+		"x-resets-at": earliestReal.UTC().Format(time.RFC3339),
 	}
+	if sawSynthetic {
+		out["x-gsb-retry-reason"] = "model_substitution"
+	}
+	return out
 }
 
 func (s *Server) markAccountFailure(a *AccountState, msg string) {
 	a.mu.Lock()
 	a.Fails++
-	a.LastFail = time.Now()
+	a.LastFail = s.now()
 	a.LastError = msg
 	a.mu.Unlock()
 }
@@ -650,24 +860,46 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 	var best *AccountState
 	bestBusy := false
 	bestHasCache := false
+	bestQuotaOK := false
 	for _, a := range accts {
+		a.mu.RLock()
+		qState := a.Quarantined
+		a.mu.RUnlock()
+		if qState {
+			continue
+		}
 		aBusy := s.isAccountBusy(a.ID)
 		aHasCache := false
+		aQuotaOK := true
 		if m := resolveModelOnAccount(a, requested); m != nil {
-			if s.checkPreFlightQuota(a, *m, m.ModelName) == nil {
+			if s.checkPreFlightQuotaInternal(a, *m, m.ModelName, true) == nil {
 				aHasCache = s.hasSessionCacheHit(a, m.ModelName, hasher)
+			} else {
+				aQuotaOK = false
 			}
 		}
 		if best == nil {
 			best = a
 			bestBusy = aBusy
 			bestHasCache = aHasCache
+			bestQuotaOK = aQuotaOK
+			continue
+		}
+		if aQuotaOK && !bestQuotaOK {
+			best = a
+			bestBusy = aBusy
+			bestHasCache = aHasCache
+			bestQuotaOK = true
+			continue
+		}
+		if bestQuotaOK && !aQuotaOK {
 			continue
 		}
 		if bestBusy && !aBusy {
 			best = a
 			bestBusy = false
 			bestHasCache = aHasCache
+			bestQuotaOK = aQuotaOK
 			continue
 		}
 		if !bestBusy && aBusy {
@@ -677,6 +909,7 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 			best = a
 			bestBusy = aBusy
 			bestHasCache = true
+			bestQuotaOK = aQuotaOK
 			continue
 		}
 		if bestHasCache && !aHasCache {
@@ -692,6 +925,7 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 			best = a
 			bestBusy = aBusy
 			bestHasCache = aHasCache
+			bestQuotaOK = aQuotaOK
 		}
 	}
 	return best
@@ -703,21 +937,24 @@ func (s *Server) refreshQuotaAsync(a *AccountState, c UpstreamClient) {
 	if a == nil || c == nil {
 		return
 	}
+	now := s.now()
 	a.mu.Lock()
-	if a.quotaRefreshing {
+	if a.quotaRefreshing || a.Quarantined {
 		a.mu.Unlock()
 		return
 	}
-	lowQuota := a.Fails > 0
-	if !lowQuota {
-		for _, q := range a.Quota {
-			if !q.Unlimited && q.Total > 0 && q.Remaining <= 2 {
-				lowQuota = true
-				break
-			}
+	if !a.QuotaNextAllowAt.IsZero() && now.Before(a.QuotaNextAllowAt) {
+		a.mu.Unlock()
+		return
+	}
+	lowQuota := false
+	for _, q := range a.Quota {
+		if !q.Synthetic && !strings.HasPrefix(q.ID, "sub:") && !q.Unlimited && q.Total > 0 && q.Remaining <= 2 {
+			lowQuota = true
+			break
 		}
 	}
-	if !lowQuota && !a.QuotaAt.IsZero() && time.Since(a.QuotaAt) < quotaRefreshCooldown {
+	if !lowQuota && !a.QuotaAt.IsZero() && now.Sub(a.QuotaAt) < quotaRefreshCooldown {
 		a.mu.Unlock()
 		return
 	}
@@ -740,6 +977,19 @@ func (s *Server) refreshQuotaAsync(a *AccountState, c UpstreamClient) {
 		q := c.GetQuota(qCtx)
 		if len(q) > 0 {
 			s.mergeAccountQuota(a, q)
+		} else {
+			a.mu.Lock()
+			a.QuotaBackoffStep++
+			shift := a.QuotaBackoffStep
+			if shift > 5 {
+				shift = 5
+			}
+			backoff := quotaRefreshCooldown * time.Duration(1<<shift)
+			if backoff > 15*time.Minute {
+				backoff = 15 * time.Minute
+			}
+			a.QuotaNextAllowAt = s.now().Add(backoff)
+			a.mu.Unlock()
 		}
 	}()
 }
@@ -750,6 +1000,7 @@ type preparedGeneration struct {
 	model               *gemini.ModelInfo
 	mid                 string
 	requested           string
+	effortStr           string
 	contract            *toolbridge.Contract
 	hasTools            bool
 	stream              bool
@@ -757,6 +1008,7 @@ type preparedGeneration struct {
 	opts                gemini.StreamOptions
 	fullPrompt          string
 	curPrompt           string
+	flattenStats        prompt.FlattenStats
 	overflowParts       []prompt.AttachmentPart
 	imageParts          []prompt.AttachmentPart
 	fullAttachmentParts []prompt.AttachmentPart
@@ -787,11 +1039,24 @@ func (s *Server) prepareGeneration(
 
 	account := s.resolveChatAccount(accts, scope, requested, hasher)
 	if account == nil {
+		for _, a := range accts {
+			a.mu.RLock()
+			q := a.Quarantined
+			r := a.QuarantineReason
+			a.mu.RUnlock()
+			if q {
+				return nil, transport.NewUpstreamError(fmt.Sprintf("all accounts are quarantined (last: %s)", r), 403, "account_banned", nil, nil)
+			}
+		}
 		msg := "this endpoint requires a per-account token; the admin key cannot serve chat"
 		if scope.AccountID != "" {
 			msg = fmt.Sprintf("token is bound to account %q, which is not loaded", scope.AccountID)
 		}
 		return nil, transport.NewUpstreamError(msg, 401, "authentication_error", nil, nil)
+	}
+
+	if err := s.checkAccountRateLimit(account); err != nil {
+		return nil, err
 	}
 
 	contract, err := toolbridge.ValidateToolRequest(toolsRaw, toolChoiceRaw)
@@ -828,7 +1093,7 @@ func (s *Server) prepareGeneration(
 		return nil, err
 	}
 
-	fullPrompt, overflowParts, err := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
+	fullPrompt, overflowParts, flattenStats, err := prompt.FlattenMessagesWithStats(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
 		StartIndex:      0,
 		MaxPromptChars:  s.Cfg.MaxPromptChars,
 		MaxOldToolChars: s.Cfg.MaxOldToolChars,
@@ -847,17 +1112,31 @@ func (s *Server) prepareGeneration(
 	hasTools := len(contract.Tools) > 0 && contract.ChoiceMode != "none"
 	stream, _ := body["stream"].(bool)
 	buffered := s.Cfg.RejectDowngrade || hasTools
+	if strings.EqualFold(s.Cfg.StreamBufferMode, "eager") {
+		buffered = hasTools
+	}
 
 	tempReq, _ := body["temporary"].(bool)
 	effortVal := extractEffortFromBody(body)
 	if (effortVal == nil || effortVal == "") && inlineThink != "" {
 		effortVal = inlineThink
 	}
+	thinkLvl := gemini.ThinkingLevelFor(effortVal, mid, strconv.Itoa(s.Cfg.DefaultThinking))
+	effortStr := "low"
+	switch thinkLvl {
+	case 4:
+		effortStr = "medium"
+	case 2:
+		effortStr = "high"
+	}
 	opts := gemini.StreamOptions{
 		Model:         model,
-		ThinkingLevel: gemini.ThinkingLevelFor(effortVal, mid, strconv.Itoa(s.Cfg.DefaultThinking)),
+		ThinkingLevel: thinkLvl,
 		Temporary:     tempReq || s.Cfg.Temporary,
-		DisableTools:  true,
+		Language:      s.Cfg.Locale,
+		DisableTools:  !strings.EqualFold(s.Cfg.ProtocolMode, "web") || hasTools,
+		HasTools:      hasTools,
+		ProtocolMode:  s.Cfg.ProtocolMode,
 	}
 
 	curPrompt := fullPrompt
@@ -887,6 +1166,7 @@ func (s *Server) prepareGeneration(
 		model:               model,
 		mid:                 mid,
 		requested:           requested,
+		effortStr:           effortStr,
 		contract:            contract,
 		hasTools:            hasTools,
 		stream:              stream,
@@ -894,6 +1174,7 @@ func (s *Server) prepareGeneration(
 		opts:                opts,
 		fullPrompt:          fullPrompt,
 		curPrompt:           curPrompt,
+		flattenStats:        flattenStats,
 		overflowParts:       overflowParts,
 		imageParts:          imageParts,
 		fullAttachmentParts: fullAttachmentParts,

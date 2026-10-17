@@ -5,14 +5,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // EssentialNames lists the Google session cookies required by gemini.google.com
-// in canonical wire order.
+// in canonical wire order. Note: AEC is optional and may be absent in modern browser profiles.
 var EssentialNames = []string{
 	"SID", "HSID", "SSID", "APISID", "SAPISID",
 	"__Secure-1PSID", "__Secure-1PAPISID", "__Secure-3PSID", "__Secure-3PAPISID",
@@ -30,15 +32,26 @@ var essentialSet = func() map[string]bool {
 
 // CredentialFile represents the JSON structure stored in ~/.gemini-app-bridge/accounts/<id>.json.
 type CredentialFile struct {
-	Kind       string `json:"kind"`
-	Name       string `json:"name,omitempty"`
-	Email      string `json:"email"`
-	Cookies    string `json:"cookies"`
-	AT         string `json:"at,omitempty"`
-	BL         string `json:"bl,omitempty"`
-	FSid       string `json:"fSid,omitempty"`
-	CapturedAt string `json:"capturedAt"`
-	CookieDB   string `json:"cookieDb,omitempty"`
+	Kind             string            `json:"kind"`
+	Name             string            `json:"name,omitempty"`
+	Email            string            `json:"email"`
+	Cookies          string            `json:"cookies"`
+	AT               string            `json:"at,omitempty"`
+	BL               string            `json:"bl,omitempty"`
+	FSid             string            `json:"fSid,omitempty"`
+	CapturedAt       string            `json:"capturedAt"`
+	RotatedAt        string            `json:"rotatedAt,omitempty"`
+	CookieDB         string            `json:"cookieDb,omitempty"`
+	ImportedFrom     string            `json:"importedFrom,omitempty"`
+	ProfileID        string            `json:"profileId,omitempty"`
+	TokenFetchedAt   string            `json:"tokenFetchedAt,omitempty"`
+	TokenSource      string            `json:"tokenSource,omitempty"`
+	LastReqID        int64             `json:"lastReqId,omitempty"`
+	Quarantined      bool              `json:"quarantined,omitempty"`
+	QuarantineReason string            `json:"quarantineReason,omitempty"`
+	AccountGroup     string            `json:"accountGroup,omitempty"`
+	ProxyURL         string            `json:"proxyUrl,omitempty"`
+	Surfaces         map[string]string `json:"surfaces,omitempty"`
 }
 
 // ParseHeader splits a Cookie header string into ordered key-value pairs.
@@ -86,7 +99,8 @@ func Subset(header string, names []string) string {
 }
 
 // AbsorbSetCookie merges Set-Cookie response headers into an existing Cookie
-// header. Only cookies in EssentialNames with non-empty values are absorbed.
+// header. Cookies in EssentialNames with deletion markers (empty value, "deleted",
+// Max-Age<=0, or past Expires) are removed from the jar.
 // Returns the updated canonical Cookie header and true if any value changed.
 func AbsorbSetCookie(current string, setCookies []string) (string, bool) {
 	if len(setCookies) == 0 {
@@ -94,10 +108,13 @@ func AbsorbSetCookie(current string, setCookies []string) (string, bool) {
 	}
 	m := ParseHeader(current)
 	changed := false
+	now := time.Now()
 	for _, raw := range setCookies {
 		head := raw
+		attrs := ""
 		if semi := strings.IndexByte(raw, ';'); semi >= 0 {
 			head = raw[:semi]
+			attrs = raw[semi+1:]
 		}
 		i := strings.IndexByte(head, '=')
 		if i <= 0 {
@@ -105,7 +122,14 @@ func AbsorbSetCookie(current string, setCookies []string) (string, bool) {
 		}
 		name := strings.TrimSpace(head[:i])
 		val := strings.TrimSpace(head[i+1:])
-		if !essentialSet[name] || val == "" || strings.EqualFold(val, "deleted") {
+		if !essentialSet[name] {
+			continue
+		}
+		if isCookieDeletion(val, attrs, now) {
+			if _, exists := m[name]; exists {
+				delete(m, name)
+				changed = true
+			}
 			continue
 		}
 		if m[name] != val {
@@ -117,6 +141,41 @@ func AbsorbSetCookie(current string, setCookies []string) (string, bool) {
 		return current, false
 	}
 	return CanonicalHeader(m), true
+}
+
+func isCookieDeletion(val, attrs string, now time.Time) bool {
+	if val == "" || strings.EqualFold(val, "deleted") || strings.EqualFold(val, `""`) {
+		return true
+	}
+	for _, part := range strings.Split(attrs, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ak, av, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		ak = strings.ToLower(strings.TrimSpace(ak))
+		av = strings.TrimSpace(av)
+		switch ak {
+		case "max-age":
+			if ma, err := strconv.Atoi(av); err == nil && ma <= 0 {
+				return true
+			}
+		case "expires":
+			if exp, err := http.ParseTime(av); err == nil && exp.Before(now) {
+				return true
+			}
+			if exp, err := time.Parse("Mon, 02-Jan-2006 15:04:05 MST", av); err == nil && exp.Before(now) {
+				return true
+			}
+			if exp, err := time.Parse("Mon, 02-Jan-06 15:04:05 MST", av); err == nil && exp.Before(now) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // SAPISIDHash computes the Authorization: SAPISIDHASH header required by
@@ -228,12 +287,60 @@ func SaveCredentialFile(path string, cred CredentialFile) (int64, error) {
 		if cred.Email == "" {
 			cred.Email = prev.Email
 		}
+		if prev.CapturedAt != "" {
+			cred.CapturedAt = prev.CapturedAt
+		}
+		if cred.CookieDB == "" {
+			cred.CookieDB = prev.CookieDB
+		}
+		if cred.ImportedFrom == "" {
+			cred.ImportedFrom = prev.ImportedFrom
+		}
+		if cred.ProfileID == "" {
+			cred.ProfileID = prev.ProfileID
+		}
+		if cred.TokenFetchedAt == "" {
+			cred.TokenFetchedAt = prev.TokenFetchedAt
+		}
+		if cred.TokenSource == "" {
+			cred.TokenSource = prev.TokenSource
+		}
+		if cred.LastReqID == 0 {
+			cred.LastReqID = prev.LastReqID
+		}
+		if !cred.Quarantined && prev.Quarantined && cred.QuarantineReason == "" {
+			// Preserve quarantine unless caller explicitly cleared or updated Surfaces["geminiWeb"] == "ok"
+			if cred.Surfaces == nil || cred.Surfaces["geminiWeb"] != "ok" {
+				cred.Quarantined = prev.Quarantined
+				cred.QuarantineReason = prev.QuarantineReason
+			}
+		}
+		if cred.AccountGroup == "" {
+			cred.AccountGroup = prev.AccountGroup
+		}
+		if cred.ProxyURL == "" {
+			cred.ProxyURL = prev.ProxyURL
+		}
+		if len(prev.Surfaces) > 0 {
+			if cred.Surfaces == nil {
+				cred.Surfaces = make(map[string]string, len(prev.Surfaces))
+			}
+			for k, v := range prev.Surfaces {
+				if _, ok := cred.Surfaces[k]; !ok {
+					cred.Surfaces[k] = v
+				}
+			}
+		}
 	}
 	if cred.Kind == "" {
 		cred.Kind = "gemini-web"
 	}
+	nowISO := time.Now().UTC().Format(time.RFC3339)
 	if cred.CapturedAt == "" {
-		cred.CapturedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		cred.CapturedAt = nowISO
+	}
+	if cred.RotatedAt == "" {
+		cred.RotatedAt = nowISO
 	}
 	data, err := json.MarshalIndent(cred, "", "  ")
 	if err != nil {

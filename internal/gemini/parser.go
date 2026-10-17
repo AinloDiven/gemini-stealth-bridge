@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-
+	"unicode/utf8"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
@@ -67,11 +67,23 @@ var (
 	openThinkStartRe        = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
 	openThinkTagOnlyRe      = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b[^\\n]*|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)\\s*")
 	trailingOpenThinkRe     = regexp.MustCompile("(?is)(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b[^\\n]*|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)([\\s\\S]*)$")
-	thinkingProcessHeaderRe = regexp.MustCompile("(?is)^\\s*(?:#{1,6}\\s*)?(?:\\*\\*|__)?(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning)(?:\\*\\*|__)?\\s*:?(?:\\*\\*|__)?[ \\t]*\\r?\\n+")
-	fencedToolStartRe       = regexp.MustCompile("(?is)```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*(?:\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls|name|tool|tool_name|function)\\s*\"\\s*:|\\[\\s*\\{\\s*\"\\s*(?:name|tool|tool_name|function)\\s*\"\\s*:)")
-	xmlToolStartRe          = regexp.MustCompile("(?is)<(?:tool_call|tool_calls|function_call|function_calls)\\b")
-	bareToolEnvLineRe       = regexp.MustCompile("(?is)(?:^|\\r?\\n)[ \\t]*(\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls)\\s*\"\\s*:)")
-	finalAnswerMarkerRe     = regexp.MustCompile("(?im)^\\s*(?:#{1,6}\\s*)?(?:\\*\\*|__)?(?:final\\s+answer|answer|response)(?:\\*\\*|__)?\\s*:\\s*")
+	thinkingProcessHeaderRe = regexp.MustCompile(
+		"(?is)^\\s*(?:#{1,6}\\s*)?(?:(?:💭|🧠)\\s*)?(?:\\*\\*|__)?" +
+			"(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning|" +
+			"思考过程|思考過程|思维链|思維鏈|推理过程|推理過程|内部推理|內部推理|思考|" +
+			"思考プロセス|推論プロセス|" +
+			"생각\\s*과정|추론\\s*과정|" +
+			"quá\\s+trình\\s+suy\\s+nghĩ)" +
+			"(?:\\*\\*|__)?\\s*[:：]?(?:\\*\\*|__)?[ \\t]*\\r?\\n+",
+	)
+	fencedToolStartRe   = regexp.MustCompile("(?is)```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*(?:\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls|name|tool|tool_name|function)\\s*\"\\s*:|\\[\\s*\\{\\s*\"\\s*(?:name|tool|tool_name|function)\\s*\"\\s*:)")
+	xmlToolStartRe      = regexp.MustCompile("(?is)<(?:tool_call|tool_calls|function_call|function_calls)\\b")
+	bareToolEnvLineRe   = regexp.MustCompile("(?is)(?:^|\\r?\\n)[ \\t]*(\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls)\\s*\"\\s*:)")
+	finalAnswerMarkerRe = regexp.MustCompile(
+		"(?im)^\\s*(?:#{1,6}\\s*)?(?:\\*\\*|__)?" +
+			"(?:final\\s+answer|answer|response|最终答案|最終答案|最终回答|最終回答|回答|答案|최종\\s*답변|답변)" +
+			"(?:\\*\\*|__)?\\s*[:：]\\s*",
+	)
 	harnessReminderRe       = regexp.MustCompile(`(?is)^\s*\[Harness reminder:(?:[\s\S]*?block\.\]|[^\]\n]*\])\s*`)
 	assistantPrefixRe       = regexp.MustCompile(`(?i)^\s*Assistant:\s*`)
 )
@@ -171,9 +183,23 @@ func hasBareToolEnvelopeKey(s string) bool {
 	return false
 }
 
-func lowerHead(s string, maxBytes int) string {
-	if len(s) > maxBytes {
-		s = s[:maxBytes]
+func utf8SafeSlice(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	for maxBytes > 0 && !utf8.RuneStart(s[maxBytes]) {
+		maxBytes--
+	}
+	return s[:maxBytes]
+}
+
+func utf8SafeLowerHead(s string, maxRunes int) string {
+	count := 0
+	for idx := range s {
+		if count >= maxRunes {
+			return strings.ToLower(s[:idx])
+		}
+		count++
 	}
 	return strings.ToLower(s)
 }
@@ -227,16 +253,19 @@ func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string,
 	}
 
 	trimmed := strings.TrimLeft(text, " \t\r\n")
-	lowerTrimmed := lowerHead(trimmed, 48)
+	lowerTrimmed := utf8SafeLowerHead(trimmed, 48)
 
-	// 2. If streaming (!done), hold back partial opening prefixes of <think>, <thinking>, <thought>, ```python?code_, [Harness reminder:, or Assistant:
-	if !done && trimmed != "" && len(trimmed) < 40 {
+	// 2. If streaming (!done), hold back partial opening prefixes of <think>, <thinking>, <thought>, ```python?code_, [Harness reminder:, Assistant:, or multilingual thinking headers
+	if !done && trimmed != "" && utf8.RuneCountInString(trimmed) < 32 && utf8.ValidString(lowerTrimmed) {
 		for _, prefix := range []string{
 			"<think>", "<thinking>", "<thought>",
 			"```thinking", "```thought", "```python?code_", "```text?code_",
 			"thinking process:", "**thinking process", "### thinking process",
 			"thought process:", "**thought process", "### thought process",
 			"internal reasoning:", "**internal reasoning",
+			"思考过程：", "思考过程:", "**思考过程", "### 思考过程",
+			"思考過程：", "思维链：", "推理过程：", "思考：",
+			"思考プロセス：", "생각 과정:", "💭", "🧠",
 			"[harness reminder:", "assistant:",
 		} {
 			if len(lowerTrimmed) < len(prefix) && strings.HasPrefix(prefix, lowerTrimmed) {
@@ -250,7 +279,7 @@ func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string,
 		if harnessReminderRe.MatchString(text) {
 			text = harnessReminderRe.ReplaceAllString(text, "")
 			trimmed = strings.TrimLeft(text, " \t\r\n")
-			lowerTrimmed = lowerHead(trimmed, 48)
+			lowerTrimmed = utf8SafeLowerHead(trimmed, 48)
 		} else if !done {
 			return "", joinThoughts(thoughts, extraThoughts)
 		} else {
@@ -261,7 +290,7 @@ func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string,
 				text = ""
 			}
 			trimmed = strings.TrimLeft(text, " \t\r\n")
-			lowerTrimmed = lowerHead(trimmed, 48)
+			lowerTrimmed = utf8SafeLowerHead(trimmed, 48)
 		}
 	}
 
@@ -335,21 +364,27 @@ func holdBackTrailingToolOpener(s string) string {
 	return strings.TrimRight(s, " \t\r\n")
 }
 
+func mayStartWithThinkingHeader(trimmed string) bool {
+	r, _ := utf8.DecodeRuneInString(trimmed)
+	if r == utf8.RuneError {
+		return false
+	}
+	switch r {
+	case '#', '*', '_', 't', 'T', 'i', 'I', 'q', 'Q', '💭', '🧠', '思', '推', '内', '內', '생', '추':
+		return true
+	default:
+		return false
+	}
+}
+
 func extractThinkingProcessBlock(text string, done bool) (restText string, thought string, ok bool) {
 	trimmed := strings.TrimLeft(text, " \t\r\n")
-	if trimmed == "" {
-		return text, "", false
-	}
-	c0 := trimmed[0]
-	if c0 != '#' && c0 != '*' && c0 != '_' && c0 != 't' && c0 != 'T' && c0 != 'i' && c0 != 'I' {
+	if trimmed == "" || !mayStartWithThinkingHeader(trimmed) {
 		return text, "", false
 	}
 	wsPrefixLen := len(text) - len(trimmed)
-	headEnd := wsPrefixLen + 160
-	if headEnd > len(text) {
-		headEnd = len(text)
-	}
-	hdrLoc := thinkingProcessHeaderRe.FindStringIndex(text[:headEnd])
+	headSlice := utf8SafeSlice(text, wsPrefixLen+240)
+	hdrLoc := thinkingProcessHeaderRe.FindStringIndex(headSlice)
 	if len(hdrLoc) != 2 {
 		return text, "", false
 	}
