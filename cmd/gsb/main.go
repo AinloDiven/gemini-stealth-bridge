@@ -31,6 +31,21 @@ import (
 
 var reSafeAccountName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
+func init() {
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprint(out, "gsb — OpenAI-compatible bridge to Gemini Web\n\n")
+		fmt.Fprint(out, "First run (recommended):\n")
+		fmt.Fprint(out, "  gsb --login <name>   sign in to Gemini in a browser, then capture that session\n")
+		fmt.Fprint(out, "  gsb --probe          verify the captured account can reach Gemini\n")
+		fmt.Fprint(out, "  gsb                  start the daemon on 127.0.0.1:20133\n\n")
+		fmt.Fprint(out, "Reuse browser cookies only when that profile is already signed in to Gemini.\n")
+		fmt.Fprint(out, "Cookies copied from a profile that never signed in expire within minutes.\n\n")
+		fmt.Fprint(out, "Flags:\n")
+		flag.PrintDefaults()
+	}
+}
+
 func main() {
 	var (
 		loginAcct        = flag.String("login", "", "Interactive browser sign-in to capture a fresh session into ~/.gemini-stealth-bridge/accounts/<name>.json")
@@ -194,7 +209,7 @@ func main() {
 		log.Printf("  data:      %s (%d account(s) loaded)", cfg.HomeDir, loaded)
 		log.Printf("  models:    http://%s/v1/models", addr)
 		if loaded == 0 {
-			log.Printf("  WARNING:   no credentials found — run `gsb --import-chrome <name>` or place accounts in %s", cfg.AccountsDir)
+			log.Printf("  WARNING:   no credentials found — run `gsb --login <name>` to sign in and capture a session, or place account files in %s", cfg.AccountsDir)
 		}
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[fatal] listen %s: %v", addr, err)

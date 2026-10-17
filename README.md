@@ -78,9 +78,17 @@ Alternatively, install into your Go binary directory and use `gsb` instead of `.
 go install github.com/azrinaldi/gemini-stealth-bridge/cmd/gsb@latest
 ```
 
-### 2. Import a Gemini session
+### 2. Connect a Gemini account
 
-Sign in to [Gemini Web](https://gemini.google.com/app) in your browser, then import its cookies:
+Sign in through `gsb` so the session is created by a real sign-in. This is the recommended path:
+
+```sh
+./gsb --login acc1
+```
+
+A browser opens on Gemini Web. Complete Google sign-in (including 2FA), send one message in Gemini, then press Enter in the terminal to capture the session.
+
+If you already have a browser profile signed in to Gemini and prefer to reuse it, import its cookies instead:
 
 ```sh
 ./gsb --import-chrome acc1
@@ -129,9 +137,26 @@ Each imported account is stored in `~/.gemini-stealth-bridge/accounts/<name>.jso
 
 Cookie imports bootstrap the account against Gemini Web before reporting success. Treat both source cookie exports and saved account files as credentials.
 
-### Local browser profile
+### Sign in with `--login` (recommended)
 
-Despite its name, `--import-chrome` also recognizes other Chromium browsers and Firefox cookie databases. No browser is launched during import.
+```sh
+./gsb --login acc1
+```
+
+The helper opens Gemini Web and waits for terminal input. Sign in, then press Enter to import from the selected local profile, or paste a cookie header / single-line JSON export. It does not automatically detect completion of login. Without a profile hint, the opened default browser and the auto-detected cookie profile may differ.
+
+Prefer `--login` over copying cookies out of a browser that was never signed in to Gemini. A profile that has not completed Google sign-in holds cookies that expire within minutes, so an import can look successful and then fail almost immediately with `401 upstream_auth_error` or `code 1016`. Signing in first, then capturing, is the reliable path:
+
+1. Run `./gsb --login <name>` and complete Google sign-in in the opened browser, including any 2FA or "verify it's you" prompt.
+2. Open `https://gemini.google.com/app` and send one message, so the session is fully established.
+3. Press Enter in the terminal to capture the session.
+4. Run `./gsb --probe` and confirm the account reports models without an auth error.
+
+If an account later starts failing with an expired-session error, repeat the login instead of re-exporting the same stale cookies. `./gsb --rotate` only renews rotating cookies such as `__Secure-1PSIDTS`; it cannot restore a revoked or never-established sign-in.
+
+### Reuse a signed-in browser profile
+
+Despite its name, `--import-chrome` also recognizes other Chromium browsers and Firefox cookie databases. No browser is launched during import. Use this only when that browser profile is already signed in to Gemini.
 
 ```sh
 # Auto-detect a local cookie database.
@@ -164,26 +189,15 @@ The same payload can be supplied on stdin:
 
 `--cookie-value` accepts an inline payload, but puts credentials in shell history and potentially process listings. Prefer a protected file or stdin. Export the Google cookies used by the authenticated Gemini session; an incomplete or expired export will not bootstrap successfully.
 
-### Interactive login helper
-
-```sh
-./gsb --login acc1 --chrome-profile "Profile 4"
-```
-
-The helper opens Gemini Web and waits for terminal input. Sign in, then press Enter to import from the selected local profile, or paste a cookie header / single-line JSON export. It does not automatically detect completion of login. Without a profile hint, the opened default browser and the auto-detected cookie profile may differ.
-
-Prefer `--login` over copying cookies out of a browser that was never signed in to Gemini. A profile that has not completed Google sign-in holds cookies that expire within minutes, so an import can look successful and then fail almost immediately with `401 upstream_auth_error` or `code 1016`. Signing in first, then capturing, is the reliable path:
-
-1. Run `./gsb --login <name>` and complete Google sign-in in the opened browser, including any 2FA or "verify it's you" prompt.
-2. Open `https://gemini.google.com/app` and send one message, so the session is fully established.
-3. Press Enter in the terminal to capture the session.
-4. Run `./gsb --probe` and confirm the account reports models without an auth error.
-
-If an account later starts failing with an expired-session error, repeat the login instead of re-exporting the same stale cookies. `./gsb --rotate` only renews rotating cookies such as `__Secure-1PSIDTS`; it cannot restore a revoked or never-established sign-in.
-
 ### Additional accounts
 
-Repeat the import with another name:
+Repeat the login with another name:
+
+```sh
+./gsb --login acc2
+```
+
+Or, if that account is already signed in to a different browser profile:
 
 ```sh
 ./gsb --import-chrome acc2 --chrome-profile "Profile 2"
@@ -378,9 +392,9 @@ Run `./gsb` directly for predictable environment handling. The optional Bash hel
 
 | Symptom | What to check |
 |---|---|
-| `503 auth_unavailable` / no accounts configured | Import an account; ensure the import and daemon use the same `BRIDGE_HOME`; reload with `/v1/refresh` or restart |
+| `503 auth_unavailable` / no accounts configured | Connect an account with `gsb --login <name>`; ensure the daemon and the import use the same `BRIDGE_HOME`; reload with `/v1/refresh` or restart |
 | `401 authentication_error` | Confirm the key, account filename, shared-key setting, and whether the mapped account is loaded |
-| Cookie import/decryption failure | Select the correct profile and OS user; unlock the keyring where applicable, or use a cookie export |
+| Cookie import/decryption failure | Run `gsb --login <name>` instead; cookie import only works when that browser profile is already signed in. If decryption itself fails, unlock the keyring or use a cookie export |
 | Bootstrap/sign-in failure | Open Gemini Web with the same account, complete any Google sign-in checks, then re-import |
 | `401 upstream_auth_error` / `code 1016` on a previously working account | The saved session expired. Run `gsb --login <name>`, complete sign-in, then `gsb --probe`. Re-exporting the same browser cookies will not help |
 | `404 model_not_found` | Query `/v1/models` with the same key; do not assume another account's model is available |
@@ -423,6 +437,8 @@ Background workers refresh model/quota information, rotate cookies, and retire i
 | [`internal/cookies`](./internal/cookies) | Cookie import/decryption, persistence, authentication headers and rotation |
 | [`internal/transport`](./internal/transport) | uTLS/HTTP2 client, account sessions, queues and timeouts |
 | [`internal/config`](./internal/config) | Environment configuration and browser header profiles |
+
+[`AGENTS.md`](./AGENTS.md) records the setup rules for AI coding agents. Its main point: connect an account with `gsb --login`, and treat cookie import as a fallback for browser profiles that are already signed in.
 
 Build and run the existing checks from the repository root:
 
