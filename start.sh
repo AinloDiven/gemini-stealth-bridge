@@ -23,9 +23,29 @@ if [ -n "$pairs" ]; then
   export BRIDGE_ACCOUNT_TOKENS="$pairs"
 fi
 
-if [ ! -x "./gsb" ] || [ -n "$(find cmd internal -name '*.go' -newer ./gsb -print -quit 2>/dev/null)" ]; then
-  echo "building gsb..." >&2
-  go build -o gsb ./cmd/gsb
+needs_build=0
+if [ ! -x "./gsb" ]; then
+  needs_build=1
+elif [ -n "$(find cmd internal -name '*.go' -newer ./gsb -print -quit 2>/dev/null)" ]; then
+  needs_build=1
+fi
+
+if [ "$needs_build" = "1" ]; then
+  # A deployed tree often ships a prebuilt ./gsb without a Go toolchain. Refusing to
+  # start in that case would take the daemon down on the next restart, and with
+  # Restart=always systemd would retry forever. Prefer the existing binary and say
+  # plainly that it is older than the sources.
+  if ! command -v go >/dev/null 2>&1; then
+    if [ -x "./gsb" ]; then
+      echo "warning: sources are newer than ./gsb but no Go toolchain is installed; starting the existing binary" >&2
+    else
+      echo "error: ./gsb is missing and no Go toolchain is installed; build it elsewhere and copy it here" >&2
+      exit 1
+    fi
+  else
+    echo "building gsb..." >&2
+    go build -o gsb ./cmd/gsb
+  fi
 fi
 
 echo "starting gemini-stealth-bridge (gsb) on :$PORT (data: $DIR)"
