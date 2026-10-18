@@ -11,7 +11,7 @@ gsb --login <name>
 gsb --probe
 ```
 
-`--login` opens Gemini Web in a browser and waits for the terminal. The user must complete Google sign-in themselves — including any 2FA or "verify it's you" prompt — and send one message in Gemini before pressing Enter. An agent cannot complete this step on the user's behalf, so instruct the user to run it interactively and wait for them.
+`--login` opens Gemini Web in a browser and waits for the terminal. The user must complete Google sign-in themselves (including any 2FA or "verify it's you" prompt) and send one message in Gemini before pressing Enter. An agent cannot complete this step on the user's behalf, so instruct the user to run it interactively and wait for them.
 
 `--probe` then confirms the captured session can reach Gemini and lists the models and quota for that account. Treat a probe without an auth error as the setup success signal, not the mere existence of `accounts/<name>.json`.
 
@@ -62,13 +62,13 @@ Do not tell users to create one router connection per account. Account rotation 
 
 `BRIDGE_ACCOUNT_STRATEGY` controls the pool key's selection:
 
-- `rotate` (default) — keep using one account until it is exhausted, banned, rate-limited, or failing, then advance to the next and wrap around. Best session continuity and leaves other accounts at full quota.
-- `lru` — spread load to the least recently used healthy account.
-- `fill-first` — drain a fixed order set by `BRIDGE_ACCOUNT_PRIORITY`.
+- `rotate` (default): keep using one account until it is exhausted, banned, rate-limited, or failing, then advance to the next and wrap around. Best session continuity and leaves other accounts at full quota.
+- `lru`: spread load to the least recently used healthy account.
+- `fill-first`: drain a fixed order set by `BRIDGE_ACCOUNT_PRIORITY`.
 
-Every strategy skips quarantined accounts, accounts whose cached quota shows the requested model exhausted, accounts at their RPM/concurrency limit, and accounts that failed in the last 60 seconds. All strategies prefer the account holding the conversation's continuation cache. A failed account becomes eligible again after its cooldown; it is not demoted permanently.
+Every strategy skips quarantined accounts, accounts whose cached quota shows the requested model exhausted, accounts at their RPM/concurrency limit, and accounts that failed in the last 60 seconds. All strategies prefer the account holding the conversation's continuation cache. When failing over to another account, `gsb` reuses the target account's warm session without forcing a fresh `/app` bootstrap. A failed account becomes eligible again after its cooldown; it is not demoted permanently.
 
-`rotate` does not jump back to an earlier account as soon as that account recovers — it continues forward from the current position. If a user expects traffic to return to a preferred account immediately after a quota reset, that is `fill-first`, not `rotate`.
+`rotate` does not jump back to an earlier account as soon as that account recovers; it continues forward from the current position. If a user expects traffic to return to a preferred account immediately after a quota reset, that is `fill-first`, not `rotate`.
 
 ## Checking account status and quota
 
@@ -76,6 +76,8 @@ Every strategy skips quarantined accounts, accounts whose cached quota shows the
 gsb --accounts --accounts-live
 ```
 
-Or query `GET /v1/accounts` on the running daemon. Each account includes a computed `status` (`ok`, `exhausted`, `expired`, `quarantined`, `cooling`, `degraded`, `unknown`) and `statusReason`.
+Or query `GET /v1/accounts` on the running daemon (`GET /v1/accounts?live=1` forces a fresh upstream check). Each account includes a computed `status` (`ok`, `exhausted`, `expired`, `quarantined`, `cooling`, `degraded`, `unknown`) and `statusReason`.
 
-Gemini enforces two limits at once: a rolling ~5-hour window and a weekly cap. The upstream quota RPC only exposes the rolling ~5-hour window (`quotaWindow.weeklyExposed: false`), so a nonzero remaining count does not prove the weekly cap has room. When a model repeatedly fails despite remaining 5-hour quota, `gsb` escalates its cooldown (`1m → 5m → 15m → 1h → 6h → 24h`) and marks the account `exhausted` (`still exhausted after N retries`).
+Cached quota in `/v1/accounts` updates on traffic and every 30-minute refresh cycle, so an idle account can still display stale remaining credits from before the window exhausted. Always verify with `--accounts-live` or `?live=1` when requests return `429` (`model_substitution` or `rate_limit_error`) despite nonzero cached `remaining`. When an account's 5-hour credit pool hits `0/2400`, all non-lite models (`gemini-flash`, `gemini-pro`, `gemini-argon`) are blocked or silently downgraded upstream until `resetAt`, while `gemini-flash-lite` continues to work.
+
+Gemini also enforces two limits at once: a rolling ~5-hour window and a weekly cap. The upstream quota RPC only exposes the rolling ~5-hour window (`quotaWindow.weeklyExposed: false`), so a nonzero live remaining count does not prove the weekly cap has room. When a model repeatedly fails despite remaining 5-hour quota, `gsb` escalates its cooldown (`1m -> 5m -> 15m -> 1h -> 6h -> 24h`) and marks the account `exhausted` (`still exhausted after N retries`).

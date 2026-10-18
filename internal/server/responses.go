@@ -695,6 +695,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	}
 
 	triedAccounts := map[string]bool{account.ID: true}
+	freshSocketNext := false
+	rebootstrapNext := false
 	for attempt := range maxAttempts {
 		curAttempt = attempt
 		attemptStartedAt := time.Now()
@@ -723,10 +725,12 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			}
 		}
 		c := s.clientFor(account)
-		if attempt > 0 {
-			opts.FreshSocket = true
+		opts.FreshSocket = freshSocketNext
+		if rebootstrapNext {
 			_ = c.Bootstrap(ctx)
 		}
+		freshSocketNext = false
+		rebootstrapNext = false
 
 		files, uploadErr := s.uploadAttachments(ctx, account.ID, c, attachmentParts)
 		if len(files) > 0 {
@@ -946,6 +950,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						opts.Files = nil
 						curPrompt = fullPrompt
 						attachmentParts = fullAttachmentParts
+					} else {
+						freshSocketNext = true
+						rebootstrapNext = true
 					}
 					continue
 				}
@@ -969,6 +976,10 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					errCode == "incomplete_upstream_response" ||
 					errCode == "tool_call_error" {
 					lastRetryReason = errCode
+					if errCode != "tool_call_error" {
+						freshSocketNext = true
+						rebootstrapNext = true
+					}
 					opts.Metadata = nil
 					opts.Files = nil
 					curPrompt = fullPrompt
@@ -978,6 +989,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				if errCode == "upstream_error_reply" {
 					if attempt == 0 {
 						lastRetryReason = errCode
+						freshSocketNext = true
+						rebootstrapNext = true
 						opts.Metadata = nil
 						opts.Files = nil
 						select {
@@ -1008,13 +1021,19 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					wasCachedContinuation := len(opts.Metadata) > 0
 					opts.Metadata = nil
 					opts.Files = nil
+					switched := false
 					if !wasCachedContinuation && scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
 							account = nextAcct
 							model = nextModel
 							opts.Model = nextModel
+							switched = true
 						}
+					}
+					if !switched {
+						freshSocketNext = true
+						rebootstrapNext = true
 					}
 					curPrompt = fullPrompt
 					attachmentParts = fullAttachmentParts

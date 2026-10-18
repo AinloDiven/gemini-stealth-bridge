@@ -1916,3 +1916,101 @@ func TestDowngradeStillReturnsHTTPError(t *testing.T) {
 		t.Fatal("expected a non-200 status for a downgraded model, got 200")
 	}
 }
+
+func TestRetrySelectiveBootstrapAndFreshSocket(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.MaxAttempts = 3
+	cfg.MaxUpstreamAttempts = 3
+	cfg.RejectDowngrade = true
+	srv := New(cfg)
+
+	var boot1, boot2 atomic.Int32
+	var fresh2 atomic.Bool
+	c1 := &mockUpstream{
+		bootFn: func(ctx context.Context) error {
+			boot1.Add(1)
+			return nil
+		},
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			_ = onFrame(&gemini.LineParseResult{
+				CID:                "c1",
+				RID:                "r1",
+				AnsweredModelID:    lowerModelID,
+				AnsweredModelLabel: "3.5 Flash-Lite",
+				Frames:             []gemini.Frame{makeFrame("downgraded", "", true, lowerModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	c2 := &mockUpstream{
+		bootFn: func(ctx context.Context) error {
+			boot2.Add(1)
+			return nil
+		},
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			if opts.FreshSocket {
+				fresh2.Store(true)
+			}
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c2",
+				RID:             "r2",
+				AnsweredModelID: testModel.ModelID,
+				Frames:          []gemini.Frame{makeFrame("ok from acct2", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	a1 := &AccountState{ID: "acct1", Email: "1@e.com", Client: c1, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	a2 := &AccountState{ID: "acct2", Email: "2@e.com", Client: c2, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	srv.SetAccounts([]*AccountState{a1, a2})
+
+	rec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec, map[string]any{
+		"model":    "gemini-pro",
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, AuthScope{OK: true, Admin: true})
+	if rec.Code != 200 {
+		t.Fatalf("expected 200 on failover to acct2, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if boot1.Load() != 0 || boot2.Load() != 0 {
+		t.Fatalf("expected 0 forced Bootstrap calls on cross-account failover, got boot1=%d boot2=%d", boot1.Load(), boot2.Load())
+	}
+	if fresh2.Load() {
+		t.Fatal("expected FreshSocket=false when failing over to healthy acct2")
+	}
+
+	// Same-account transport error retry MUST set FreshSocket=true and call Bootstrap
+	srvSame, acctSame := newTestHarness(false, false)
+	srvSame.Cfg.MaxAttempts = 2
+	var sameBoot atomic.Int32
+	var sameFreshOnRetry atomic.Bool
+	sameCalls := 0
+	cSame := &mockUpstream{
+		bootFn: func(ctx context.Context) error {
+			sameBoot.Add(1)
+			return nil
+		},
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			sameCalls++
+			if sameCalls == 1 {
+				return nil, transport.NewUpstreamError("socket reset", 502, "upstream_transport_error", nil, nil)
+			}
+			if opts.FreshSocket {
+				sameFreshOnRetry.Store(true)
+			}
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c1",
+				RID:             "r1",
+				AnsweredModelID: testModel.ModelID,
+				Frames:          []gemini.Frame{makeFrame("recovered", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	recSame := runChat(t, srvSame, acctSame, cSame, nil)
+	if recSame.Code != 200 || sameBoot.Load() != 1 || !sameFreshOnRetry.Load() {
+		t.Fatalf("expected same-account transport retry to call Bootstrap once and set FreshSocket=true, got code=%d boot=%d fresh=%v",
+			recSame.Code, sameBoot.Load(), sameFreshOnRetry.Load())
+	}
+}
