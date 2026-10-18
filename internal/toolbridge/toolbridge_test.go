@@ -1,9 +1,13 @@
 package toolbridge
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 func sampleTools() []any {
@@ -312,6 +316,281 @@ func TestLiveToolCallStreamerIncrementalAndMultiCall(t *testing.T) {
 	if reconstructed[1] != oa[1].Function.Arguments {
 		t.Fatalf("call 1 streamed args mismatch:\ngot:  %s\nwant: %s", reconstructed[1], oa[1].Function.Arguments)
 	}
+}
+
+func TestLiveToolCallStreamerCompletedCallRevision(t *testing.T) {
+	tools := sampleTools()
+	complete := `{"tool_calls":[{"name":"read_file","arguments":{"path":"/tmp/a"}}]}`
+
+	assertRevision := func(t *testing.T, err error) {
+		t.Helper()
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.Code != "upstream_revision" {
+			t.Fatalf("expected upstream_revision error, got %v", err)
+		}
+	}
+
+	t.Run("name change after completion", func(t *testing.T) {
+		multiTools := append(sampleTools(), map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "write_file",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string"},
+					},
+					"required": []any{"path"},
+				},
+			},
+		})
+		var deltas []map[string]any
+		streamer := NewLiveToolCallStreamer(multiTools, "auto", func(d map[string]any) {
+			deltas = append(deltas, d)
+		})
+		if err := streamer.PushError(complete); err != nil {
+			t.Fatalf("initial push failed: %v", err)
+		}
+		changedName := `{"tool_calls":[{"name":"write_file","arguments":{"path":"/tmp/a"}}]}`
+		if err := streamer.PushError(changedName); err == nil {
+			t.Fatal("expected revision error for changed tool name")
+		} else {
+			assertRevision(t, err)
+		}
+		oa, err := streamer.FinalizeError([]Call{{Name: "write_file", Arguments: map[string]any{"path": "/tmp/a"}}}, "")
+		if err == nil || oa != nil {
+			t.Fatalf("expected finalize to reject renamed call, got oa=%+v err=%v", oa, err)
+		}
+		assertRevision(t, err)
+	})
+
+	t.Run("argument change after completion", func(t *testing.T) {
+		var deltas []map[string]any
+		streamer := NewLiveToolCallStreamer(tools, "auto", func(d map[string]any) {
+			deltas = append(deltas, d)
+		})
+		if err := streamer.PushError(complete); err != nil {
+			t.Fatalf("initial push failed: %v", err)
+		}
+		changed := `{"tool_calls":[{"name":"read_file","arguments":{"path":"/tmp/b"}}]}`
+		err := streamer.PushError(changed)
+		assertRevision(t, err)
+
+		// The authoritative completion must also refuse to return the stale streamed args.
+		oa, err := streamer.FinalizeError([]Call{{Name: "read_file", Arguments: map[string]any{"path": "/tmp/b"}}}, "")
+		if err == nil || oa != nil {
+			t.Fatalf("expected finalize to reject revised call, got oa=%+v err=%v", oa, err)
+		}
+		assertRevision(t, err)
+
+		// The legacy signature cannot report the revision, but it must still return the
+		// authoritative arguments rather than the obsolete streamed bytes.
+		compat := streamer.Finalize([]Call{{Name: "read_file", Arguments: map[string]any{"path": "/tmp/b"}}}, "")
+		if len(compat) != 1 || compat[0].Function.Arguments != `{"path":"/tmp/b"}` {
+			t.Fatalf("compatibility Finalize returned stale arguments: %+v", compat)
+		}
+	})
+
+	t.Run("revision before any emission is not an error", func(t *testing.T) {
+		var deltas []map[string]any
+		streamer := NewLiveToolCallStreamer(tools, "auto", func(d map[string]any) {
+			deltas = append(deltas, d)
+		})
+		// Only a prefix that cannot emit a header yet.
+		if err := streamer.PushError(`{"tool_calls":[{"name":"read_file","argum`); err != nil {
+			t.Fatalf("expected incomplete prefix to be ignored, got %v", err)
+		}
+		if len(deltas) != 0 {
+			t.Fatalf("expected no deltas before schema-safe validation, got %+v", deltas)
+		}
+		if err := streamer.PushError(complete); err != nil {
+			t.Fatalf("expected completed call to be accepted after unemitted prefix, got %v", err)
+		}
+	})
+}
+
+func TestLiveToolCallStreamerWhitespaceAndKeyOrderEquivalence(t *testing.T) {
+	tools := sampleTools()
+	var deltas []map[string]any
+	streamer := NewLiveToolCallStreamer(tools, "auto", func(d map[string]any) {
+		deltas = append(deltas, d)
+	})
+
+	first := `{"tool_calls":[{"name":"read_file","arguments":{"path":"/tmp/a","lines":2}}]}`
+	// Same parsed value, different whitespace and key order. This must not be a revision.
+	reordered := "{\n  \"tool_calls\" : [ {\n    \"arguments\" : { \"lines\" : 2, \"path\" : \"/tmp/a\" },\n    \"name\" : \"read_file\"\n  } ]\n}"
+	if err := streamer.PushError(first); err != nil {
+		t.Fatalf("initial push failed: %v", err)
+	}
+	if err := streamer.PushError(reordered); err != nil {
+		t.Fatalf("whitespace/key-order equivalent call was treated as a revision: %v", err)
+	}
+
+	oa, err := streamer.FinalizeError([]Call{{Name: "read_file", Arguments: map[string]any{"path": "/tmp/a", "lines": 2}}}, reordered)
+	if err != nil {
+		t.Fatalf("finalize rejected equivalent parsed arguments: %v", err)
+	}
+	if len(oa) != 1 || oa[0].Function.Arguments != `{"lines":2,"path":"/tmp/a"}` {
+		t.Fatalf("unexpected canonical finalization: %+v", oa)
+	}
+	if !json.Valid([]byte(oa[0].Function.Arguments)) {
+		t.Fatalf("final arguments are not valid JSON: %s", oa[0].Function.Arguments)
+	}
+
+	reconstructed := reconstructStreamedArguments(deltas, 0)
+	if reconstructed != oa[0].Function.Arguments {
+		t.Fatalf("streamed bytes diverged from canonical finalization:\nstreamed: %s\nfinal:    %s", reconstructed, oa[0].Function.Arguments)
+	}
+}
+
+func TestLiveToolCallStreamerPartialPrefixMismatch(t *testing.T) {
+	tools := sampleTools()
+
+	t.Run("emitted byte changes", func(t *testing.T) {
+		longPath := strings.Repeat("a", 160)
+		frame1 := `{"tool_calls":[{"name":"read_file","arguments":{"path":"` + longPath
+		frame2 := `{"tool_calls":[{"name":"read_file","arguments":{"path":"` + "b" + longPath[1:]
+
+		var deltas []map[string]any
+		streamer := NewLiveToolCallStreamer(tools, "auto", func(d map[string]any) {
+			deltas = append(deltas, d)
+		})
+		if err := streamer.PushError(frame1); err != nil {
+			t.Fatalf("initial partial push failed: %v", err)
+		}
+		reconstructed := reconstructStreamedArguments(deltas, 0)
+		if reconstructed == "" {
+			t.Fatal("expected schema-safe partial arguments to be emitted")
+		}
+
+		err := streamer.PushError(frame2)
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.Code != "upstream_revision" {
+			t.Fatalf("expected upstream_revision for non-monotonic partial prefix, got %v", err)
+		}
+
+		// No second JSON object may be appended to the already-emitted partial object.
+		reconstructed = reconstructStreamedArguments(deltas, 0)
+		if strings.Count(reconstructed, "{") != 1 {
+			t.Fatalf("expected exactly one partial JSON object, got %q", reconstructed)
+		}
+		if strings.Contains(reconstructed, "b"+longPath[1:]) {
+			t.Fatalf("revised partial bytes leaked into the stream: %q", reconstructed)
+		}
+
+		oa, err := streamer.FinalizeError([]Call{{Name: "read_file", Arguments: map[string]any{"path": "b" + longPath[1:]}}}, "")
+		if err == nil || oa != nil {
+			t.Fatalf("expected finalize to fail closed after prefix mismatch, got oa=%+v err=%v", oa, err)
+		}
+	})
+}
+
+func TestLiveToolCallStreamerCanonicalFinalization(t *testing.T) {
+	tools := sampleTools()
+
+	t.Run("header only then authoritative canonical arguments", func(t *testing.T) {
+		var deltas []map[string]any
+		streamer := NewLiveToolCallStreamer(tools, "auto", func(d map[string]any) {
+			deltas = append(deltas, d)
+		})
+
+		// Header is safe, but the arguments prefix is too short to emit raw JSON.
+		if err := streamer.PushError(`{"tool_calls":[{"name":"read_file","arguments":{"path":"/tmp/a`); err != nil {
+			t.Fatalf("partial push failed: %v", err)
+		}
+		if got := reconstructStreamedArguments(deltas, 0); got != "" {
+			t.Fatalf("expected no raw partial arguments before schema-safe validation, got %q", got)
+		}
+
+		authoritative := []Call{{Name: "read_file", Arguments: map[string]any{"path": "/tmp/a"}}}
+		oa, err := streamer.FinalizeError(authoritative, "")
+		if err != nil {
+			t.Fatalf("finalize failed: %v", err)
+		}
+		if len(oa) != 1 {
+			t.Fatalf("expected one finalized call, got %+v", oa)
+		}
+		want := `{"path":"/tmp/a"}`
+		if oa[0].Function.Arguments != want {
+			t.Fatalf("expected canonical authoritative arguments %s, got %s", want, oa[0].Function.Arguments)
+		}
+		reconstructed := reconstructStreamedArguments(deltas, 0)
+		if reconstructed != want {
+			t.Fatalf("expected finalize to emit canonical arguments, streamed %q want %q", reconstructed, want)
+		}
+		if !json.Valid([]byte(reconstructed)) {
+			t.Fatalf("finalized stream is malformed JSON: %q", reconstructed)
+		}
+	})
+
+	t.Run("emitted partial then authoritative canonical tail", func(t *testing.T) {
+		longPath := strings.Repeat("a", 160)
+		partial := `{"tool_calls":[{"name":"read_file","arguments":{"path":"` + longPath
+		var deltas []map[string]any
+		streamer := NewLiveToolCallStreamer(tools, "auto", func(d map[string]any) {
+			deltas = append(deltas, d)
+		})
+		if err := streamer.PushError(partial); err != nil {
+			t.Fatalf("partial push failed: %v", err)
+		}
+		if got := reconstructStreamedArguments(deltas, 0); got == "" {
+			t.Fatal("expected schema-safe partial arguments to be emitted")
+		}
+
+		authoritative := []Call{{Name: "read_file", Arguments: map[string]any{"path": longPath}}}
+		oa, err := streamer.FinalizeError(authoritative, "")
+		if err != nil {
+			t.Fatalf("finalize failed: %v", err)
+		}
+		want := `{"path":"` + longPath + `"}`
+		if len(oa) != 1 || oa[0].Function.Arguments != want {
+			t.Fatalf("expected canonical authoritative arguments, got %+v", oa)
+		}
+		reconstructed := reconstructStreamedArguments(deltas, 0)
+		if reconstructed != want {
+			t.Fatalf("finalize did not close the streamed prefix canonically:\nstreamed: %s\nwant:     %s", reconstructed, want)
+		}
+		if !json.Valid([]byte(reconstructed)) {
+			t.Fatalf("finalized stream is malformed JSON: %q", reconstructed)
+		}
+	})
+
+	t.Run("authoritative change after partial emission fails closed", func(t *testing.T) {
+		longPath := strings.Repeat("a", 160)
+		var deltas []map[string]any
+		streamer := NewLiveToolCallStreamer(tools, "auto", func(d map[string]any) {
+			deltas = append(deltas, d)
+		})
+		if err := streamer.PushError(`{"tool_calls":[{"name":"read_file","arguments":{"path":"` + longPath); err != nil {
+			t.Fatalf("partial push failed: %v", err)
+		}
+		oa, err := streamer.FinalizeError([]Call{{Name: "read_file", Arguments: map[string]any{"path": "b" + longPath[1:]}}}, "")
+		if err == nil || oa != nil {
+			t.Fatalf("expected finalize to fail closed on revised authoritative arguments, got oa=%+v err=%v", oa, err)
+		}
+		var ue *transport.UpstreamError
+		if !errors.As(err, &ue) || ue.Code != "upstream_revision" {
+			t.Fatalf("expected upstream_revision error, got %v", err)
+		}
+	})
+}
+
+func reconstructStreamedArguments(deltas []map[string]any, target int) string {
+	var out strings.Builder
+	for _, d := range deltas {
+		tcs, _ := d["tool_calls"].([]map[string]any)
+		for _, tc := range tcs {
+			idx, _ := tc["index"].(int)
+			if idx != target {
+				continue
+			}
+			fn, _ := tc["function"].(map[string]any)
+			if args, ok := fn["arguments"].(string); ok {
+				out.WriteString(args)
+			}
+		}
+	}
+	return out.String()
 }
 
 func TestToolSchemaCompactionParity(t *testing.T) {

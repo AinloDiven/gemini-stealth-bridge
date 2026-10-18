@@ -135,13 +135,16 @@ func TestAccountStatusIgnoresSyntheticAndResetBuckets(t *testing.T) {
 }
 
 func TestAccountStatusWeeklyCapAfterRepeatedStrikes(t *testing.T) {
-	// Three or more strikes means we already retried and the limit was still there,
-	// which is the observable signal for the weekly cap that the RPC does not expose.
+	now := time.Now()
 	a := &AccountState{
 		ID:         "a",
 		subStrikes: map[string]int{"sub:gemini-pro": 3},
+		Quota: []gemini.QuotaBucket{{
+			ID: "sub:gemini-pro", Label: "gemini-pro", Total: 1, Remaining: 0,
+			Synthetic: true, ResetAt: now.Add(time.Hour).UTC().Format(time.RFC3339),
+		}},
 	}
-	status, reason := AccountStatus(a, time.Now())
+	status, reason := AccountStatus(a, now)
 	if status != StatusExhausted {
 		t.Fatalf("status = %q, want %q", status, StatusExhausted)
 	}

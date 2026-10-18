@@ -48,7 +48,7 @@ Compatibility covers the endpoints and fields described below, not the entire Op
 
 Version `0.2.0` focuses on daily coding-agent workflows, long-session stability, and account protection:
 
-- **Selectable pool routing & fast failover**: `BRIDGE_ACCOUNT_STRATEGY` supports `rotate` (default sticky session), `lru`, and `fill-first` (`BRIDGE_ACCOUNT_PRIORITY`). Failover across accounts switches directly to the next ready session without forcing a redundant `/app` bootstrap or resetting healthy HTTP/2 sockets.
+- **Selectable pool routing & fast failover**: `BRIDGE_ACCOUNT_STRATEGY` supports `rotate` (default sticky session), `lru`, and `fill-first` (`BRIDGE_ACCOUNT_PRIORITY`). Failover across accounts switches directly to the next ready session without forcing a redundant `/app` bootstrap or resetting healthy HTTP/2 sockets. A detected model downgrade (`model_substitution`) fails over even when an account key pins the request, because the downgrade is caught before any response byte is streamed; mid-stream `429`/`rate_limit_error` still respect the pin.
 - **Honest account status & hour-scale quota backoff**: `/v1/accounts` and `gsb --accounts` (`--accounts-live`) report a computed `status` (`ok`, `exhausted`, `expired`, `quarantined`, `cooling`, `degraded`, `unknown`), load counters, and `quotaWindow` metadata noting that upstream RPC quota only covers the rolling ~5-hour window. Model exhaustion backoff starts short (`1m -> 5m -> 15m`) for 5-hour limits and escalates to hour scale (`1h -> 6h -> 24h`) when hitting the weekly cap.
 - **Streaming that survives long thinking turns**: Buffered streaming flushes SSE headers as soon as the served model ID is verified (with `BRIDGE_EARLY_SSE_GRACE_MS=20000` as fallback) and sends keep-alive pings so reverse proxies like 9router do not time out while waiting for the first token.
 - **Multilingual & inline reasoning extraction**: Routes inline thought blocks (including Chinese, Japanese, Korean, and mixed-language reasoning headers) to `reasoning_content` so only the final answer reaches the client.
@@ -473,6 +473,8 @@ Run `./gsb` directly for predictable environment handling. The optional Bash hel
 | Tool-call validation error | Check the tool schema and `tool_choice`; the generated call must match the requested contract |
 | Stream appears stalled or fails | Check daemon logs, upstream connectivity/proxy, client buffering, and client/reverse-proxy timeouts |
 | Reasoning appears in normal chat output | Check the client's reasoning-field support; model-authored inline reasoning may not be extracted |
+
+For a pool-key request, a `429` may say that no pool account can serve the requested model and summarize unavailable accounts by reason (`exhausted`, `cooling`, `rate_limited`, or `busy`). The message intentionally reports counts rather than emails or credentials; use `/v1/accounts?live=1` for per-account detail. An account-specific quota message is preserved for account-key requests.
 
 Quota-related errors may include `Retry-After` and `X-Resets-At` when usable reset information is available. When an error is caused by a silent model downgrade rather than an upstream quota timer, `gsb` uses a short retry cooldown and includes `X-GSB-Retry-Reason` so clients can tell the difference. SSE requests can emit an error after HTTP headers have been sent; clients must inspect stream events, not only the HTTP status.
 

@@ -81,6 +81,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 	reqStartedAt := time.Now()
 	prep, prepErr := s.prepareGeneration(ctx, body, scope, messages, toolsRaw, toolChoiceRaw)
+	prepareMs := time.Since(reqStartedAt).Milliseconds()
 	if prepErr != nil {
 		sendChatError(w, false, prepErr)
 		return
@@ -104,23 +105,69 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	fullAttachmentParts := prep.fullAttachmentParts
 	attachmentParts := prep.attachmentParts
 	hasher := prep.hasher
+	cacheKey := prep.cacheKey
 	cmplID := "chatcmpl-" + randomHex(8)
 	created := time.Now().Unix()
 	eagerStream := strings.EqualFold(s.Cfg.StreamBufferMode, "eager")
 
 	headersSent := false
 	var ttftMs atomic.Int64
+	var headerMs, identityMs atomic.Int64
+	var firstReasoningMs, firstContentMs, firstToolMs atomic.Int64
+	var uploadMs, accountSwitches atomic.Int64
 	ttftMs.Store(-1)
+	headerMs.Store(-1)
+	identityMs.Store(-1)
+	firstReasoningMs.Store(-1)
+	firstContentMs.Store(-1)
+	firstToolMs.Store(-1)
 	curAttempt := 0
 	lastUpstreamStatus := 0
 	lastRetryReason := ""
 	var streamMu sync.Mutex
 	flusher, _ := w.(http.Flusher)
 
+	// markPhase records a phase timestamp once, in milliseconds from request
+	// start. A value stays -1 until that phase is actually observed.
+	markPhase := func(target *atomic.Int64) {
+		target.CompareAndSwap(-1, time.Since(reqStartedAt).Milliseconds())
+	}
+	// markMeaningfulOutput records the first client-visible model output and
+	// derives ttft_ms from the same event.
+	markMeaningfulOutput := func(target *atomic.Int64) {
+		markPhase(target)
+		markPhase(&ttftMs)
+	}
+	// assignAccount counts an account switch only when failover moves the request
+	// to a different account. Same-account retries leave the counter untouched.
+	assignAccount := func(next *AccountState) {
+		if next != nil && next != account {
+			accountSwitches.Add(1)
+		}
+		account = next
+	}
+
 	var writeBuf []byte
 	emit := func(delta any, finish any, usage map[string]any) {
 		if ctx.Err() != nil {
 			return
+		}
+		// Only non-empty reasoning, non-empty content, and non-empty tool_calls
+		// count as output. Role-only deltas, model metadata, keepalive pings, and
+		// finish chunks must not move the first-output timestamps.
+		switch d := delta.(type) {
+		case sseDeltaReasoning:
+			if d.ReasoningContent != "" {
+				markMeaningfulOutput(&firstReasoningMs)
+			}
+		case sseDeltaContent:
+			if d.Content != "" {
+				markMeaningfulOutput(&firstContentMs)
+			}
+		case map[string]any:
+			if hasToolCallDelta(d) {
+				markMeaningfulOutput(&firstToolMs)
+			}
 		}
 		streamMu.Lock()
 		defer streamMu.Unlock()
@@ -178,9 +225,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		w.WriteHeader(200)
 		headersSent = true
 		markStreamStarted()
-		if ttftMs.Load() < 0 && !early {
-			ttftMs.Store(time.Since(reqStartedAt).Milliseconds())
-		}
+		// header_ms is the actual response header commit, independent of any
+		// early flush or first meaningful delta.
+		markPhase(&headerMs)
 		_, _ = io.WriteString(w, ": ping\n\n")
 		if flusher != nil {
 			flusher.Flush()
@@ -218,9 +265,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		startStreamWith(early, curAttempt, lastUpstreamStatus, lastRetryReason)
 	}
 
-	if stream && s.Cfg.EarlySSE {
+	if stream && s.Cfg.EarlySSE && (eagerStream || !s.Cfg.RejectDowngrade) {
 		startStream(false)
-	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 {
+	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 && (eagerStream || !s.Cfg.RejectDowngrade) {
 		// Buffered mode normally holds the response headers until the first frame so
 		// a detected model downgrade can still become an HTTP error. Thinking-heavy
 		// models can exceed a proxy's response-header timeout, so flush headers once
@@ -326,7 +373,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		freshSocketNext = false
 		rebootstrapNext = false
 
+		uploadStartedAt := time.Now()
 		files, uploadErr := s.uploadAttachments(ctx, account.ID, c, attachmentParts)
+		uploadMs.Add(time.Since(uploadStartedAt).Milliseconds())
 		if len(files) > 0 {
 			opts.Files = files
 		}
@@ -341,11 +390,11 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			account.activeStreams++
 			account.mu.Unlock()
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
-				if ttftMs.Load() < 0 {
-					ttftMs.Store(time.Since(reqStartedAt).Milliseconds())
-				}
 				attemptStateMu.Lock()
 				observeIdentity(update.AnsweredModelID, update.AnsweredModelLabel)
+				if servedID != "" {
+					markPhase(&identityMs)
+				}
 				earlyMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
@@ -371,6 +420,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 					attemptStateMu.Lock()
 					observeIdentity(frame.AnsweredModelID, frame.AnsweredModelLabel)
+					if servedID != "" {
+						markPhase(&identityMs)
+					}
 					if frame.Text != "" || text == "" {
 						if !shouldPreserveTextOnErrorFrame(text, frame.Text, sentText, hasTools, toolsRaw, toolChoiceRaw, toolStreamer) {
 							text = frame.Text
@@ -382,6 +434,12 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					attemptStateMu.Unlock()
 					if frameMismatch {
 						return transport.ErrStopStreaming
+					}
+					identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
+					if identityVerified && toolStreamer != nil {
+						if err := toolStreamer.PushError(text); err != nil {
+							return err
+						}
 					}
 					if stream && !buffered && ctx.Err() == nil {
 						if !strings.HasPrefix(text, sentText) || (s.Cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
@@ -402,13 +460,11 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						if sentText != "" && !strings.HasPrefix(text, sentText) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
-						// A matching served-model id proves no downgrade is in progress, so
-						// the headers no longer need to be held for an HTTP error. Flushing
-						// here keeps latency low without weakening downgrade detection.
-						if !headersSent && servedID != "" && !identityConflict && gemini.IsMatchingServedModel(*model, servedID, servedLabel) {
+						// Hold all model output until the requested identity is verified.
+						identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
+						if !headersSent && identityVerified {
 							startStream(false)
 						}
-						identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && (servedID != "" || gemini.IsMatchingServedModel(*model, servedID, servedLabel) || servedID == ""))
 						if identityVerified && s.Cfg.LiveThoughts {
 							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 								startStream(false)
@@ -423,7 +479,12 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								}
 							}
 						}
-						canStreamText := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
+						if identityVerified && toolStreamer != nil {
+							if err := toolStreamer.PushError(text); err != nil {
+								return err
+							}
+						}
+						canStreamText := identityVerified
 						if canStreamText {
 							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
 								startStream(false)
@@ -492,10 +553,22 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					s.refreshQuotaAsync(account, c)
 				}
 			}
+			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+				s.deleteSessionCache(cacheKey)
+				cacheKey = ""
+			}
 
+			// Headers, reasoning, text, or tool-call deltas already shown to the
+			// client commit the response; a retry would duplicate or contradict it.
+			responseCommitted := func() bool {
+				streamMu.Lock()
+				headers := headersSent
+				streamMu.Unlock()
+				return headers || sentText != "" || sentThought != "" || (toolStreamer != nil && toolStreamer.SentAny())
+			}
 			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
 				(retryDeadline.IsZero() || time.Now().Before(retryDeadline)) &&
-				sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) && ctx.Err() == nil &&
+				!responseCommitted() && ctx.Err() == nil &&
 				errCode != "account_banned"
 
 			if canRetryMore {
@@ -504,14 +577,13 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							account = nextAcct
+							assignAccount(nextAcct)
 							model = nextModel
 							opts.Model = nextModel
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
 							attachmentParts = fullAttachmentParts
-							sentThought = ""
 							continue
 						}
 					}
@@ -523,7 +595,6 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 					}
 					if ctx.Err() == nil {
-						sentThought = ""
 						continue
 					}
 				}
@@ -532,17 +603,18 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					if lastRetryReason == "" {
 						lastRetryReason = "rate_limit_error"
 					}
-					if headersSent || scope.AccountID == "" {
+					// Switching accounts is a pool-only operation and can only happen
+					// before any response bytes commit the current attempt.
+					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							account = nextAcct
+							assignAccount(nextAcct)
 							model = nextModel
 							opts.Model = nextModel
 							opts.Metadata = nil
 							opts.Files = nil
 							curPrompt = fullPrompt
 							attachmentParts = fullAttachmentParts
-							sentThought = ""
 							continue
 						}
 					}
@@ -550,37 +622,58 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				if errStatus == 401 || errCode == "upstream_auth_error" || errCode == "auth_redirect" {
 					lastRetryReason = errCode
 					c.InvalidateAuth()
-					if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil && (headersSent || scope.AccountID == "") {
-						triedAccounts[nextAcct.ID] = true
-						account = nextAcct
-						model = nextModel
-						opts.Model = nextModel
-						opts.Metadata = nil
-						opts.Files = nil
-						curPrompt = fullPrompt
-						attachmentParts = fullAttachmentParts
-					} else {
+					switched := false
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct)
+							model = nextModel
+							opts.Model = nextModel
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							switched = true
+						}
+					}
+					if !switched {
 						freshSocketNext = true
 						rebootstrapNext = true
 					}
-					sentThought = ""
 					continue
 				}
 				if errCode == "upstream_connect_timeout" ||
 					errCode == "upstream_stalled" ||
 					errCode == "upstream_timeout" {
 					lastRetryReason = errCode
-					if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-						triedAccounts[nextAcct.ID] = true
-						account = nextAcct
-						model = nextModel
-						opts.Model = nextModel
-						opts.Metadata = nil
-						opts.Files = nil
-						curPrompt = fullPrompt
-						attachmentParts = fullAttachmentParts
-						sentThought = ""
-						continue
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct)
+							model = nextModel
+							opts.Model = nextModel
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
+					}
+				}
+				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" {
+					lastRetryReason = errCode
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct)
+							model = nextModel
+							opts.Model = nextModel
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
 					}
 				}
 				if errCode == "upstream_transport_error" ||
@@ -595,7 +688,6 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					opts.Files = nil
 					curPrompt = fullPrompt
 					attachmentParts = fullAttachmentParts
-					sentThought = ""
 					continue
 				}
 				if errCode == "upstream_error_reply" {
@@ -606,7 +698,6 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						rebootstrapNext = true
 						opts.Metadata = nil
 						opts.Files = nil
-						sentThought = ""
 						select {
 						case <-time.After(100 * time.Millisecond):
 						case <-ctx.Done():
@@ -635,12 +726,11 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					wasCachedContinuation := len(opts.Metadata) > 0
 					opts.Metadata = nil
 					opts.Files = nil
-					sentThought = ""
 					switched := false
 					if !wasCachedContinuation && scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							account = nextAcct
+							assignAccount(nextAcct)
 							model = nextModel
 							opts.Model = nextModel
 							switched = true
@@ -658,23 +748,37 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 			stopKeepalive()
 			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+			totalMs := time.Since(reqStartedAt).Milliseconds()
 			s.logRequestJSON(map[string]any{
-				"req_id":        cmplID,
-				"endpoint":      "/v1/chat/completions",
-				"model":         mid,
-				"account":       account.ID,
-				"effort":        effortStr,
-				"prompt_bytes":  len(curPrompt),
-				"header_bytes":  flattenStats.HeaderBytes,
-				"body_bytes":    flattenStats.BodyBytes,
-				"footer_bytes":  flattenStats.FooterBytes,
-				"tool_bytes":    flattenStats.ToolSchemaBytes,
-				"ttft_ms":       ttftMs.Load(),
-				"total_ms":      time.Since(reqStartedAt).Milliseconds(),
-				"status":        errStatus,
-				"error_code":    errCode,
-				"cached_tokens": 0,
-				"attempts":      curAttempt + 1,
+				"req_id":             cmplID,
+				"endpoint":           "/v1/chat/completions",
+				"model":              mid,
+				"account":            account.ID,
+				"effort":             effortStr,
+				"prompt_bytes":       len(curPrompt),
+				"header_bytes":       flattenStats.HeaderBytes,
+				"body_bytes":         flattenStats.BodyBytes,
+				"footer_bytes":       flattenStats.FooterBytes,
+				"tool_bytes":         flattenStats.ToolSchemaBytes,
+				"ttft_ms":            ttftMs.Load(),
+				"total_ms":           totalMs,
+				"status":             errStatus,
+				"error_code":         errCode,
+				"cached_tokens":      0,
+				"attempts":           curAttempt + 1,
+				"prepare_ms":         prepareMs,
+				"cache_hit":          cacheKey != "",
+				"cache_prefix_split": prep.cacheSplit,
+				"upload_ms":          uploadMs.Load(),
+				"identity_ms":        identityMs.Load(),
+				"header_ms":          headerMs.Load(),
+				"first_reasoning_ms": firstReasoningMs.Load(),
+				"first_content_ms":   firstContentMs.Load(),
+				"first_tool_ms":      firstToolMs.Load(),
+				"done_ms":            totalMs,
+				"account_switches":   accountSwitches.Load(),
+				"requested_model":    mid,
+				"served_model":       servedID,
 			})
 			if ctx.Err() == nil {
 				sendChatError(w, headersSent, runCheck)
@@ -727,7 +831,14 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 				}
 				if toolStreamer != nil {
-					oaCalls = toolStreamer.Finalize(calls, text)
+					var finalizeErr error
+					oaCalls, finalizeErr = toolStreamer.FinalizeError(calls, text)
+					if finalizeErr != nil {
+						if ctx.Err() == nil {
+							sendChatError(w, headersSent, finalizeErr)
+						}
+						return
+					}
 				} else {
 					oaCalls = toolbridge.ToOpenAIToolCalls(calls)
 					toolbridge.StreamOpenAIToolCallChunks(func(d map[string]any) {
@@ -795,6 +906,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				payload["model_served"] = served
 			}
 			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+			markPhase(&headerMs)
 			sendJSON(w, 200, payload, nil)
 		}
 
@@ -802,23 +914,37 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		if d, ok := usage["prompt_tokens_details"].(map[string]any); ok {
 			cachedTok, _ = d["cached_tokens"].(int)
 		}
+		totalMs := time.Since(reqStartedAt).Milliseconds()
 		s.logRequestJSON(map[string]any{
-			"req_id":        cmplID,
-			"endpoint":      "/v1/chat/completions",
-			"model":         mid,
-			"account":       account.ID,
-			"effort":        effortStr,
-			"prompt_bytes":  len(curPrompt),
-			"header_bytes":  flattenStats.HeaderBytes,
-			"body_bytes":    flattenStats.BodyBytes,
-			"footer_bytes":  flattenStats.FooterBytes,
-			"tool_bytes":    flattenStats.ToolSchemaBytes,
-			"ttft_ms":       ttftMs.Load(),
-			"total_ms":      time.Since(reqStartedAt).Milliseconds(),
-			"status":        200,
-			"error_code":    "",
-			"cached_tokens": cachedTok,
-			"attempts":      curAttempt + 1,
+			"req_id":             cmplID,
+			"endpoint":           "/v1/chat/completions",
+			"model":              mid,
+			"account":            account.ID,
+			"effort":             effortStr,
+			"prompt_bytes":       len(curPrompt),
+			"header_bytes":       flattenStats.HeaderBytes,
+			"body_bytes":         flattenStats.BodyBytes,
+			"footer_bytes":       flattenStats.FooterBytes,
+			"tool_bytes":         flattenStats.ToolSchemaBytes,
+			"ttft_ms":            ttftMs.Load(),
+			"total_ms":           totalMs,
+			"status":             200,
+			"error_code":         "",
+			"cached_tokens":      cachedTok,
+			"attempts":           curAttempt + 1,
+			"prepare_ms":         prepareMs,
+			"cache_hit":          cacheKey != "",
+			"cache_prefix_split": prep.cacheSplit,
+			"upload_ms":          uploadMs.Load(),
+			"identity_ms":        identityMs.Load(),
+			"header_ms":          headerMs.Load(),
+			"first_reasoning_ms": firstReasoningMs.Load(),
+			"first_content_ms":   firstContentMs.Load(),
+			"first_tool_ms":      firstToolMs.Load(),
+			"done_ms":            totalMs,
+			"account_switches":   accountSwitches.Load(),
+			"requested_model":    mid,
+			"served_model":       servedID,
 		})
 
 		account.mu.Lock()
@@ -1157,4 +1283,22 @@ func shouldPreserveTextOnErrorFrame(
 		}
 	}
 	return false
+}
+
+// hasToolCallDelta reports whether an emitted chat delta carries a non-empty
+// tool_calls array. The live streamer emits a header chunk (empty arguments)
+// followed by argument chunks; either one is the first tool-call output.
+func hasToolCallDelta(delta map[string]any) bool {
+	raw, ok := delta["tool_calls"]
+	if !ok || raw == nil {
+		return false
+	}
+	switch calls := raw.(type) {
+	case []map[string]any:
+		return len(calls) > 0
+	case []any:
+		return len(calls) > 0
+	default:
+		return false
+	}
 }

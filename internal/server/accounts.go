@@ -149,6 +149,7 @@ func (s *Server) LoadCredentials() int {
 			prev.LastFail = time.Time{}
 			prev.LastError = ""
 			prev.ModelsError = nil
+			clearSyntheticQuotaLocked(prev)
 		}
 		prev.mu.Unlock()
 		if ac, ok := prev.Client.(*gemini.AccountClient); ok {
@@ -556,6 +557,90 @@ func (s *Server) checkPreFlightQuotaInternal(a *AccountState, model gemini.Model
 	)
 }
 
+// poolAvailabilityError replaces an account-specific quota error with an
+// aggregate message when a pool request has no eligible account. Account keys
+// keep the precise account error so pinning semantics remain observable.
+func (s *Server) poolAvailabilityError(accts []*AccountState, requested string, fallback error) error {
+	upstreamErr, ok := fallback.(*transport.UpstreamError)
+	if !ok || upstreamErr == nil {
+		return fallback
+	}
+
+	exhausted, substitution, cooling, rateLimited, busy, modelUnavailable, quarantined, ready := 0, 0, 0, 0, 0, 0, 0, 0
+	for _, a := range accts {
+		if a == nil {
+			continue
+		}
+		a.mu.RLock()
+		isQuarantined := a.Quarantined
+		a.mu.RUnlock()
+		if isQuarantined {
+			quarantined++
+			continue
+		}
+		model := resolveModelOnAccount(a, requested)
+		if model == nil {
+			modelUnavailable++
+			continue
+		}
+		if quotaErr := s.checkPreFlightQuotaInternal(a, *model, model.ModelName, true); quotaErr != nil {
+			if quotaUE, ok := quotaErr.(*transport.UpstreamError); ok && quotaUE.Headers["x-gsb-retry-reason"] == "model_substitution" {
+				substitution++
+			} else {
+				exhausted++
+			}
+			continue
+		}
+		if s.accountCooling(a) {
+			cooling++
+			continue
+		}
+		if s.accountRateLimited(a) {
+			rateLimited++
+			continue
+		}
+		if s.isAccountBusy(a.ID) {
+			busy++
+			continue
+		}
+		ready++
+	}
+	if ready > 0 {
+		return fallback
+	}
+
+	details := make([]string, 0, 7)
+	if exhausted > 0 {
+		details = append(details, fmt.Sprintf("exhausted=%d", exhausted))
+	}
+	if substitution > 0 {
+		details = append(details, fmt.Sprintf("substitution_cooldown=%d", substitution))
+	}
+	if cooling > 0 {
+		details = append(details, fmt.Sprintf("cooling=%d", cooling))
+	}
+	if rateLimited > 0 {
+		details = append(details, fmt.Sprintf("rate_limited=%d", rateLimited))
+	}
+	if busy > 0 {
+		details = append(details, fmt.Sprintf("busy=%d", busy))
+	}
+	if modelUnavailable > 0 {
+		details = append(details, fmt.Sprintf("model_unavailable=%d", modelUnavailable))
+	}
+	if quarantined > 0 {
+		details = append(details, fmt.Sprintf("quarantined=%d", quarantined))
+	}
+	if len(details) == 0 {
+		return fallback
+	}
+	if requested == "" {
+		requested = "requested model"
+	}
+	message := fmt.Sprintf("no pool account can serve %s: %d account(s) unavailable (%s); no account failover was available", requested, len(accts), strings.Join(details, ", "))
+	return transport.NewUpstreamError(message, upstreamErr.StatusCode, upstreamErr.Code, upstreamErr.Headers, upstreamErr.Cause)
+}
+
 func (s *Server) classifyEmpty(ctx context.Context, a *AccountState, modelName string) error {
 	c := s.clientFor(a)
 	qCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
@@ -683,6 +768,7 @@ func (s *Server) recordModelExhausted(a *AccountState, modelName string) {
 	now := s.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	pruneExpiredSyntheticLocked(a, now)
 	if a.subStrikes == nil {
 		a.subStrikes = make(map[string]int)
 	}
@@ -731,6 +817,64 @@ func (s *Server) clearModelExhausted(a *AccountState, modelName string) {
 	a.Quota = kept
 }
 
+// pruneExpiredSyntheticLocked removes synthetic substitution buckets whose
+// cooldown has elapsed, together with their strike counters. Real quota buckets
+// are left untouched. Callers must hold a.mu.
+func pruneExpiredSyntheticLocked(a *AccountState, now time.Time) {
+	if a == nil {
+		return
+	}
+	if len(a.Quota) > 0 {
+		kept := make([]gemini.QuotaBucket, 0, len(a.Quota))
+		for _, q := range a.Quota {
+			if (q.Synthetic || strings.HasPrefix(q.ID, "sub:")) && !syntheticCooldownActive(q, now) {
+				continue
+			}
+			kept = append(kept, q)
+		}
+		a.Quota = kept
+	}
+	if len(a.subStrikes) == 0 {
+		return
+	}
+	active := make(map[string]bool, len(a.Quota))
+	for _, q := range a.Quota {
+		if q.Synthetic || strings.HasPrefix(q.ID, "sub:") {
+			if syntheticCooldownActive(q, now) {
+				active[q.ID] = true
+			}
+		}
+	}
+	for subID := range a.subStrikes {
+		if !active[subID] {
+			delete(a.subStrikes, subID)
+		}
+	}
+}
+
+// clearSyntheticQuotaLocked drops all synthetic substitution state while keeping
+// real upstream quota intact. It is used when a credential is genuinely
+// recaptured or unquarantined. Callers must hold a.mu.
+func clearSyntheticQuotaLocked(a *AccountState) {
+	if a == nil {
+		return
+	}
+	if len(a.subStrikes) > 0 {
+		a.subStrikes = make(map[string]int)
+	}
+	if len(a.Quota) == 0 {
+		return
+	}
+	kept := make([]gemini.QuotaBucket, 0, len(a.Quota))
+	for _, q := range a.Quota {
+		if q.Synthetic || strings.HasPrefix(q.ID, "sub:") {
+			continue
+		}
+		kept = append(kept, q)
+	}
+	a.Quota = kept
+}
+
 func (s *Server) mergeAccountQuota(a *AccountState, fresh []gemini.QuotaBucket) []gemini.QuotaBucket {
 	now := s.now()
 	a.mu.Lock()
@@ -746,10 +890,11 @@ func (s *Server) mergeAccountQuota(a *AccountState, fresh []gemini.QuotaBucket) 
 		}
 	}
 	a.Quota = merged
+	pruneExpiredSyntheticLocked(a, now)
 	a.QuotaAt = now
 	a.QuotaBackoffStep = 0
 	a.QuotaNextAllowAt = time.Time{}
-	return merged
+	return a.Quota
 }
 
 func (s *Server) isAccountBusy(acctID string) bool {
@@ -767,7 +912,7 @@ func (s *Server) hasSessionCacheHit(a *AccountState, modelName string, hasher *p
 		return false
 	}
 	for split := hasher.Len() - 1; split >= 2; split-- {
-		if len(s.getSessionCache(hasher.HashPrefix(a.ID, modelName, split))) > 0 {
+		if len(s.peekSessionCache(hasher.HashPrefix(a.ID, modelName, split))) > 0 {
 			return true
 		}
 	}
@@ -1366,6 +1511,13 @@ type preparedGeneration struct {
 	fullAttachmentParts []prompt.AttachmentPart
 	attachmentParts     []prompt.AttachmentPart
 	hasher              *prompt.HistoryHasher
+	// cacheKey is the exact continuation entry consumed by this generation. It is
+	// empty when no cached metadata was selected; callers invalidate this key when
+	// the upstream rejects the continuation before falling back to a full prompt.
+	cacheKey string
+	// cacheSplit is the message index at which the cached continuation was
+	// selected. It is zero when no continuation was used.
+	cacheSplit int
 }
 
 func (s *Server) prepareGeneration(
@@ -1408,6 +1560,9 @@ func (s *Server) prepareGeneration(
 	}
 
 	if err := s.checkAccountRateLimit(account); err != nil {
+		if scope.AccountID == "" {
+			return nil, s.poolAvailabilityError(accts, requested, err)
+		}
 		return nil, err
 	}
 
@@ -1442,6 +1597,9 @@ func (s *Server) prepareGeneration(
 	mid := model.ModelName
 
 	if err := s.checkPreFlightQuota(account, *model, mid); err != nil {
+		if scope.AccountID == "" {
+			return nil, s.poolAvailabilityError(accts, mid, err)
+		}
 		return nil, err
 	}
 
@@ -1493,11 +1651,15 @@ func (s *Server) prepareGeneration(
 	}
 
 	curPrompt := fullPrompt
+	cacheKey := ""
+	cacheSplit := 0
 	if s.Cfg.SessionCache && !opts.Temporary && hasher != nil {
 		for split := len(messages) - 1; split >= 2; split-- {
 			prefixKey := hasher.HashPrefix(account.ID, mid, split)
 			if cachedMeta := s.getSessionCache(prefixKey); len(cachedMeta) > 0 {
 				opts.Metadata = cachedMeta
+				cacheKey = prefixKey
+				cacheSplit = split
 				deltaPrompt, _, dErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
 					StartIndex:      split,
 					MaxPromptChars:  s.Cfg.MaxPromptChars,
@@ -1538,5 +1700,7 @@ func (s *Server) prepareGeneration(
 		fullAttachmentParts: fullAttachmentParts,
 		attachmentParts:     attachmentParts,
 		hasher:              hasher,
+		cacheKey:            cacheKey,
+		cacheSplit:          cacheSplit,
 	}, nil
 }

@@ -39,6 +39,14 @@ const (
 // It is exported so the CLI can report the same status the HTTP API does, instead
 // of reimplementing the rules and drifting from them.
 func AccountStatus(a *AccountState, now time.Time) (status string, reason string) {
+	// Best-effort cleanup: status evaluation is a natural point to drop expired
+	// synthetic cooldowns and their strike counters. Callers such as the accounts
+	// endpoint already hold a read lock, so TryLock simply skips mutation there;
+	// the read-only view below still ignores the expired entries.
+	if a.mu.TryLock() {
+		pruneExpiredSyntheticLocked(a, now)
+		a.mu.Unlock()
+	}
 	a.mu.RLock()
 	quarantined := a.Quarantined
 	qReason := a.QuarantineReason
@@ -76,8 +84,20 @@ func AccountStatus(a *AccountState, now time.Time) (status string, reason string
 
 	// A long cooldown means we already retried and the limit is still there, which
 	// is the signal that this is the weekly window rather than the 5-hour one.
+	// Only an active synthetic bucket justifies reporting exhausted: once its
+	// ResetAt has passed, the strike counter is stale state, not a live limit.
 	for subID, strikes := range subStrikes {
 		if strikes < 3 {
+			continue
+		}
+		active := false
+		for _, q := range quota {
+			if q.ID == subID && syntheticCooldownActive(q, now) {
+				active = true
+				break
+			}
+		}
+		if !active {
 			continue
 		}
 		name := strings.TrimPrefix(subID, "sub:")
@@ -97,6 +117,20 @@ func AccountStatus(a *AccountState, now time.Time) (status string, reason string
 	}
 
 	return StatusOK, ""
+}
+
+// syntheticCooldownActive reports whether a synthetic substitution bucket is
+// still within its cooldown window. A missing or malformed ResetAt is treated as
+// expired so stale state cannot keep an account excluded.
+func syntheticCooldownActive(q gemini.QuotaBucket, now time.Time) bool {
+	if !q.Synthetic && !strings.HasPrefix(q.ID, "sub:") {
+		return false
+	}
+	if q.ResetAt == "" {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, q.ResetAt)
+	return err == nil && t.After(now)
 }
 
 // exhaustedBucket reports the first real (non-synthetic) quota bucket that is

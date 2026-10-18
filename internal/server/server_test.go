@@ -247,6 +247,50 @@ func Test429StatusAndCooldownHeadersSurvive(t *testing.T) {
 	}
 }
 
+func TestPoolQuotaErrorSummarizesUnavailableAccounts(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.AccountTokens = nil
+	cfg.QuotaPreflight = "strict"
+	cfg.MaxConcurrentPerAccount = 0
+	cfg.MaxRPMPerAccount = 0
+	srv := New(cfg)
+	resetAt := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	quota := []gemini.QuotaBucket{{
+		ID:        "gemini-pro",
+		Label:     "Gemini Pro",
+		Total:     100,
+		Remaining: 0,
+		ResetAt:   resetAt,
+	}}
+	a1 := &AccountState{ID: "acct1", Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now(), Quota: quota}
+	a2 := &AccountState{ID: "acct2", Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now(), Quota: quota}
+	srv.SetAccounts([]*AccountState{a1, a2})
+	body := map[string]any{
+		"model":    testModel.ModelName,
+		"messages": []any{map[string]any{"role": "user", "content": "synthetic"}},
+	}
+
+	poolRec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), poolRec, body, AuthScope{OK: true})
+	if poolRec.Code != 429 {
+		t.Fatalf("expected pool quota error, got %d: %s", poolRec.Code, poolRec.Body.String())
+	}
+	poolBody := poolRec.Body.String()
+	if !strings.Contains(poolBody, "no pool account can serve gemini-pro") || !strings.Contains(poolBody, "exhausted=2") {
+		t.Fatalf("expected aggregate pool availability details, got %s", poolBody)
+	}
+	if strings.Contains(poolBody, "on account acct1") {
+		t.Fatalf("pool error leaked a single fallback account: %s", poolBody)
+	}
+
+	pinnedRec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), pinnedRec, body, AuthScope{OK: true, AccountID: "acct1"})
+	if pinnedRec.Code != 429 || !strings.Contains(pinnedRec.Body.String(), "on account acct1") {
+		t.Fatalf("expected pinned account error to remain account-specific, got %d: %s", pinnedRec.Code, pinnedRec.Body.String())
+	}
+}
+
 func TestApologyDetectionAndGenuineQuotes(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 
@@ -921,6 +965,29 @@ func TestSessionCacheDiskPersistenceAndAccountAffinity(t *testing.T) {
 	}
 }
 
+func TestDeleteSessionCacheRemovesEntryAndOrder(t *testing.T) {
+	srv, _ := newTestHarness(false, true)
+	srv.putSessionCache("old", []any{"metadata"})
+	srv.putSessionCache("keep", []any{"metadata"})
+	if len(srv.peekSessionCache("old")) == 0 {
+		t.Fatal("expected cached entry before invalidation")
+	}
+	srv.deleteSessionCache("old")
+	if got := srv.peekSessionCache("old"); len(got) != 0 {
+		t.Fatalf("expected invalidated entry to be absent, got %#v", got)
+	}
+	srv.mu.RLock()
+	defer srv.mu.RUnlock()
+	for _, key := range srv.sessionOrder {
+		if key == "old" {
+			t.Fatal("invalidated key remained in session order")
+		}
+	}
+	if len(srv.sessionCache["keep"]) == 0 {
+		t.Fatal("unrelated cache entry was removed")
+	}
+}
+
 func BenchmarkServerHandleChatSSE_50FramesWithTools(b *testing.B) {
 	srv, acct := newTestHarness(false, false)
 	chunk := strings.Repeat("The quick brown fox jumps over the lazy dog in Three.js shader pipeline. ", 8)
@@ -1109,8 +1176,8 @@ func TestContinuationCachedTokens(t *testing.T) {
 	}
 }
 
-func TestEarlySSEFirstByte(t *testing.T) {
-	srv, acct := newTestHarness(false, false)
+func TestEarlySSEFirstByteInRelaxedMode(t *testing.T) {
+	srv, acct := newTestHarness(true, false)
 	srv.Cfg.EarlySSE = true
 
 	firstPingAt := make(chan time.Duration, 1)
@@ -1119,10 +1186,8 @@ func TestEarlySSEFirstByte(t *testing.T) {
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
 			time.Sleep(250 * time.Millisecond)
 			_ = onFrame(&gemini.LineParseResult{
-				CID:             "c1",
-				RID:             "r1",
-				AnsweredModelID: testModel.ModelID,
-				Frames:          []gemini.Frame{makeFrame("done", "", true, testModel.ModelID)},
+				CID: "c1", RID: "r1", AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{makeFrame("done", "", true, testModel.ModelID)},
 			})
 			return &gemini.StreamResponse{Status: 200}, nil
 		},
@@ -1131,9 +1196,9 @@ func TestEarlySSEFirstByte(t *testing.T) {
 
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
-
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gemini-pro","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer audit")
+	startAt = time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do failed: %v", err)
@@ -1146,7 +1211,7 @@ func TestEarlySSEFirstByte(t *testing.T) {
 	}
 	elapsed := <-firstPingAt
 	if elapsed >= 200*time.Millisecond {
-		t.Fatalf("expected EarlySSE first byte in < 200ms (upstream slept 250ms), took %v", elapsed)
+		t.Fatalf("expected relaxed EarlySSE first byte in < 200ms, took %v", elapsed)
 	}
 	if !strings.Contains(string(buf[:n]), ": ping") {
 		t.Fatalf("expected immediate ': ping' in first SSE chunk, got %q", string(buf[:n]))
@@ -1762,18 +1827,16 @@ func TestRotateFallbackAdvancesAndWraps(t *testing.T) {
 	}
 }
 
-func TestGraceFlushesHeadersBeforeFirstFrame(t *testing.T) {
+func TestGraceDoesNotCommitStrictHeadersBeforeIdentity(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.EarlySSEGrace = 150 * time.Millisecond
+	srv.Cfg.EarlySSEGrace = 20 * time.Millisecond
 
 	client := &mockUpstream{
 		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
-			time.Sleep(900 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			_ = onFrame(&gemini.LineParseResult{
-				CID:             "c1",
-				RID:             "r1",
-				AnsweredModelID: testModel.ModelID,
-				Frames:          []gemini.Frame{makeFrame("done", "", true, testModel.ModelID)},
+				CID: "c1", RID: "r1", AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{makeFrame("done", "", true, testModel.ModelID)},
 			})
 			return &gemini.StreamResponse{Status: 200}, nil
 		},
@@ -1782,7 +1845,6 @@ func TestGraceFlushesHeadersBeforeFirstFrame(t *testing.T) {
 
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
-
 	start := time.Now()
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions",
 		strings.NewReader(`{"model":"gemini-pro","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
@@ -1796,13 +1858,13 @@ func TestGraceFlushesHeadersBeforeFirstFrame(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
 	}
-	if headerAt > 600*time.Millisecond {
-		t.Fatalf("expected headers before the first upstream frame (~900ms), got %v", headerAt)
+	if headerAt < 90*time.Millisecond {
+		t.Fatalf("expected strict headers after identity-bearing frame, got %v", headerAt)
 	}
 	buf := make([]byte, 64)
 	n, _ := resp.Body.Read(buf)
 	if !strings.Contains(string(buf[:n]), ": ping") {
-		t.Fatalf("expected an immediate keep-alive ping, got %q", string(buf[:n]))
+		t.Fatalf("expected keep-alive ping after commit, got %q", string(buf[:n]))
 	}
 }
 
@@ -1917,6 +1979,46 @@ func TestDowngradeStillReturnsHTTPError(t *testing.T) {
 	}
 }
 
+func TestSubstitutionDoesNotFailoverPinnedScope(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.MaxAttempts = 3
+	cfg.MaxUpstreamAttempts = 3
+	cfg.RejectDowngrade = true
+	srv := New(cfg)
+
+	var attempts atomic.Int32
+	c1 := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			attempts.Add(1)
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c1", RID: "r1", AnsweredModelID: lowerModelID, AnsweredModelLabel: "3.5 Flash-Lite",
+				Frames: []gemini.Frame{makeFrame("downgraded", "", true, lowerModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	c2 := clientFromFrames([]gemini.Frame{makeFrame("must not run", "", true, testModel.ModelID)})
+	a1 := &AccountState{ID: "acct1", Email: "1@e.com", Client: c1, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	a2 := &AccountState{ID: "acct2", Email: "2@e.com", Client: c2, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	srv.SetAccounts([]*AccountState{a1, a2})
+
+	rec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec, map[string]any{
+		"model":    testModel.ModelName,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, AuthScope{OK: true, AccountID: "acct1"})
+	if rec.Code != 429 {
+		t.Fatalf("expected 429 on pinned-scope substitution, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-GSB-Account"); got != "acct1" {
+		t.Fatalf("expected pinned account acct1, got %q", got)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("expected acct1 upstream called once, got %d", attempts.Load())
+	}
+}
+
 func TestRetrySelectiveBootstrapAndFreshSocket(t *testing.T) {
 	cfg := config.Load()
 	cfg.HomeDir = "/synthetic"
@@ -2012,5 +2114,78 @@ func TestRetrySelectiveBootstrapAndFreshSocket(t *testing.T) {
 	if recSame.Code != 200 || sameBoot.Load() != 1 || !sameFreshOnRetry.Load() {
 		t.Fatalf("expected same-account transport retry to call Bootstrap once and set FreshSocket=true, got code=%d boot=%d fresh=%v",
 			recSame.Code, sameBoot.Load(), sameFreshOnRetry.Load())
+	}
+}
+
+func TestStrictIdentityUnknownDoesNotEmitReasoning(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	client := clientFromFrames([]gemini.Frame{
+		makeFrame("answer", "secret reasoning", true, ""),
+	})
+	acct.Client = client
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
+	if rec.Code != 502 {
+		t.Fatalf("expected identity error, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "model_identity_unknown") {
+		t.Fatalf("expected model_identity_unknown, got %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "secret reasoning") || strings.Contains(rec.Body.String(), "data:") {
+		t.Fatalf("strict identity gate leaked model output: %s", rec.Body.String())
+	}
+}
+
+func TestStreamedReasoningPreventsRetryConcatenation(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.MaxAttempts = 3
+	srv.Cfg.MaxUpstreamAttempts = 3
+	var calls atomic.Int32
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			calls.Add(1)
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c1", RID: "r1", AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{makeFrame("", "reasoning once", false, testModel.ModelID)},
+			})
+			return nil, transport.NewUpstreamError("socket reset", 502, "upstream_transport_error", nil, nil)
+		},
+	}
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
+	if calls.Load() != 1 {
+		t.Fatalf("expected no retry after reasoning output, got %d upstream calls", calls.Load())
+	}
+	if strings.Count(rec.Body.String(), "reasoning once") != 1 {
+		t.Fatalf("expected one reasoning emission, got %s", rec.Body.String())
+	}
+}
+
+func TestResponsesCanonicalizesAssistantFunctionCallTurn(t *testing.T) {
+	messages, _, _, err := NormalizeResponsesInput(map[string]any{
+		"input": []any{
+			map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "checking"}}},
+			map[string]any{"type": "function_call", "call_id": "call_1", "name": "read_file", "arguments": `{"path":"/tmp/a"}`},
+			map[string]any{"type": "function_call_output", "call_id": "call_1", "output": "ok"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NormalizeResponsesInput failed: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("expected one assistant and one tool message, got %#v", messages)
+	}
+	if messages[0]["role"] != "assistant" || messages[1]["role"] != "tool" {
+		t.Fatalf("unexpected canonical roles: %#v", messages)
+	}
+	content, _ := messages[0]["content"].(string)
+	if content != "checking" {
+		t.Fatalf("assistant content was not preserved: %#v", messages[0])
+	}
+	calls, ok := messages[0]["tool_calls"].([]any)
+	if !ok || len(calls) != 1 {
+		t.Fatalf("expected one combined tool call: %#v", messages[0])
+	}
+	call := calls[0].(map[string]any)
+	if call["id"] != "call_1" {
+		t.Fatalf("call id changed: %#v", call)
 	}
 }

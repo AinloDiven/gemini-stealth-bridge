@@ -54,27 +54,53 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 		}
 	case []any:
 		var (
+			pendingAssistant map[string]any
 			pendingToolCalls []any
 			pendingReasoning []string
 			callIDToName     = make(map[string]string)
 		)
+		recordToolCallNames := func(tcs []any) {
+			for _, tcAny := range tcs {
+				tcMap, ok := tcAny.(map[string]any)
+				if !ok {
+					continue
+				}
+				cid, _ := tcMap["id"].(string)
+				fnMap, _ := tcMap["function"].(map[string]any)
+				fnName, _ := fnMap["name"].(string)
+				if cid != "" && fnName != "" {
+					callIDToName[cid] = fnName
+				}
+			}
+		}
 		flushPendingAssistant := func() {
-			if len(pendingToolCalls) == 0 {
+			if pendingAssistant == nil && len(pendingToolCalls) == 0 {
 				return
 			}
-			tcCopy := make([]any, len(pendingToolCalls))
-			copy(tcCopy, pendingToolCalls)
-			pendingToolCalls = nil
-			msg := map[string]any{
-				"role":       "assistant",
-				"content":    nil,
-				"tool_calls": tcCopy,
+			var msg map[string]any
+			if pendingAssistant != nil {
+				msg = pendingAssistant
+			} else {
+				msg = map[string]any{"role": "assistant", "content": nil}
+			}
+			if len(pendingToolCalls) > 0 {
+				tcCopy := make([]any, len(pendingToolCalls))
+				copy(tcCopy, pendingToolCalls)
+				msg["tool_calls"] = tcCopy
+				recordToolCallNames(tcCopy)
 			}
 			if len(pendingReasoning) > 0 {
-				msg["reasoning_content"] = strings.Join(pendingReasoning, "\n")
-				pendingReasoning = nil
+				existing, _ := msg["reasoning_content"].(string)
+				if existing != "" {
+					msg["reasoning_content"] = existing + "\n" + strings.Join(pendingReasoning, "\n")
+				} else {
+					msg["reasoning_content"] = strings.Join(pendingReasoning, "\n")
+				}
 			}
 			messages = append(messages, msg)
+			pendingAssistant = nil
+			pendingToolCalls = nil
+			pendingReasoning = nil
 		}
 
 		for i, itemAny := range inp {
@@ -153,6 +179,9 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 					continue
 
 				case "reasoning":
+					if pendingAssistant != nil {
+						flushPendingAssistant()
+					}
 					if sumArr, ok := item["summary"].([]any); ok {
 						for _, sAny := range sumArr {
 							if sMap, ok := sAny.(map[string]any); ok {
@@ -175,11 +204,11 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 					continue
 				}
 
-				flushPendingAssistant()
 				if role == "" {
 					role = "user"
 				}
 				if role == "assistant" || role == "model" {
+					flushPendingAssistant()
 					msg := normalizeResponsesAssistantMessage(item, i)
 					if len(pendingReasoning) > 0 {
 						existing, _ := msg["reasoning_content"].(string)
@@ -191,19 +220,13 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 						pendingReasoning = nil
 					}
 					if tcs, ok := msg["tool_calls"].([]any); ok {
-						for _, tcAny := range tcs {
-							if tcMap, ok := tcAny.(map[string]any); ok {
-								cid, _ := tcMap["id"].(string)
-								if fnMap, ok := tcMap["function"].(map[string]any); ok {
-									if fnName, _ := fnMap["name"].(string); cid != "" && fnName != "" {
-										callIDToName[cid] = fnName
-									}
-								}
-							}
-						}
+						pendingToolCalls = append(pendingToolCalls[:0], tcs...)
+						delete(msg, "tool_calls")
+						recordToolCallNames(tcs)
 					}
-					messages = append(messages, msg)
+					pendingAssistant = msg
 				} else {
+					flushPendingAssistant()
 					messages = append(messages, map[string]any{
 						"role":    role,
 						"content": normalizeResponsesContentParts(item["content"]),
@@ -442,6 +465,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 
 	reqStartedAt := time.Now()
 	prep, prepErr := s.prepareGeneration(ctx, body, scope, messages, toolsRaw, toolChoiceRaw)
+	prepareMs := time.Since(reqStartedAt).Milliseconds()
 	if prepErr != nil {
 		sendChatError(w, false, prepErr)
 		return
@@ -465,6 +489,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	fullAttachmentParts := prep.fullAttachmentParts
 	attachmentParts := prep.attachmentParts
 	hasher := prep.hasher
+	cacheKey := prep.cacheKey
 	respID := "resp_" + randomHex(8)
 	rsID := "rs_" + randomHex(6)
 	msgID := "msg_" + randomHex(6)
@@ -473,7 +498,15 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 
 	headersSent := false
 	var ttftMs atomic.Int64
+	var headerMs, identityMs atomic.Int64
+	var firstReasoningMs, firstContentMs, firstToolMs atomic.Int64
+	var uploadMs, accountSwitches atomic.Int64
 	ttftMs.Store(-1)
+	headerMs.Store(-1)
+	identityMs.Store(-1)
+	firstReasoningMs.Store(-1)
+	firstContentMs.Store(-1)
+	firstToolMs.Store(-1)
 	curAttempt := 0
 	lastUpstreamStatus := 0
 	lastRetryReason := ""
@@ -484,6 +517,26 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		messageAdded   bool
 	)
 	flusher, _ := w.(http.Flusher)
+
+	// markPhase records a phase timestamp once, in milliseconds from request
+	// start. A value stays -1 until that phase is actually observed.
+	markPhase := func(target *atomic.Int64) {
+		target.CompareAndSwap(-1, time.Since(reqStartedAt).Milliseconds())
+	}
+	// markMeaningfulOutput records the first client-visible model output and
+	// derives ttft_ms from the same event.
+	markMeaningfulOutput := func(target *atomic.Int64) {
+		markPhase(target)
+		markPhase(&ttftMs)
+	}
+	// assignAccount counts an account switch only when failover moves the request
+	// to a different account. Same-account retries leave the counter untouched.
+	assignAccount := func(next *AccountState) {
+		if next != nil && next != account {
+			accountSwitches.Add(1)
+		}
+		account = next
+	}
 
 	emitSSE := func(eventType string, payload map[string]any) {
 		if ctx.Err() != nil {
@@ -535,9 +588,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		w.WriteHeader(200)
 		headersSent = true
 		markStreamStarted()
-		if ttftMs.Load() < 0 && !early {
-			ttftMs.Store(time.Since(reqStartedAt).Milliseconds())
-		}
+		// header_ms is the actual response header commit, independent of any
+		// early flush or first meaningful delta.
+		markPhase(&headerMs)
 		_, _ = io.WriteString(w, ": ping\n\n")
 		if flusher != nil {
 			flusher.Flush()
@@ -585,9 +638,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		startStreamWith(early, curAttempt, lastUpstreamStatus, lastRetryReason)
 	}
 
-	if stream && s.Cfg.EarlySSE {
+	if stream && s.Cfg.EarlySSE && (eagerStream || !s.Cfg.RejectDowngrade) {
 		startStream(false)
-	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 {
+	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 && (eagerStream || !s.Cfg.RejectDowngrade) {
 		go func() {
 			timer := time.NewTimer(s.Cfg.EarlySSEGrace)
 			defer timer.Stop()
@@ -607,6 +660,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		if delta == "" {
 			return
 		}
+		markMeaningfulOutput(&firstReasoningMs)
 		startStream(false)
 		if !reasoningAdded {
 			reasoningAdded = true
@@ -640,6 +694,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		if delta == "" {
 			return
 		}
+		markMeaningfulOutput(&firstContentMs)
 		startStream(false)
 		outIdx := 0
 		if reasoningAdded {
@@ -732,7 +787,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		freshSocketNext = false
 		rebootstrapNext = false
 
+		uploadStartedAt := time.Now()
 		files, uploadErr := s.uploadAttachments(ctx, account.ID, c, attachmentParts)
+		uploadMs.Add(time.Since(uploadStartedAt).Milliseconds())
 		if len(files) > 0 {
 			opts.Files = files
 		}
@@ -747,11 +804,11 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			account.activeStreams++
 			account.mu.Unlock()
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
-				if ttftMs.Load() < 0 {
-					ttftMs.Store(time.Since(reqStartedAt).Milliseconds())
-				}
 				attemptStateMu.Lock()
 				observeIdentity(update.AnsweredModelID, update.AnsweredModelLabel)
+				if servedID != "" {
+					markPhase(&identityMs)
+				}
 				earlyMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
@@ -777,6 +834,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					}
 					attemptStateMu.Lock()
 					observeIdentity(frame.AnsweredModelID, frame.AnsweredModelLabel)
+					if servedID != "" {
+						markPhase(&identityMs)
+					}
 					if frame.Text != "" || text == "" {
 						if !shouldPreserveTextOnErrorFrame(text, frame.Text, sentText, hasTools, toolsRaw, toolChoiceRaw, nil) {
 							text = frame.Text
@@ -812,7 +872,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						if !headersSent && servedID != "" && !identityConflict && gemini.IsMatchingServedModel(*model, servedID, servedLabel) {
 							startStream(false)
 						}
-						identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && (servedID == "" || gemini.IsMatchingServedModel(*model, servedID, servedLabel)))
+						identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
 						if identityVerified && s.Cfg.LiveThoughts {
 							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 								emitReasoningDelta(thoughts[len(sentThought):])
@@ -886,10 +946,22 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					s.refreshQuotaAsync(account, c)
 				}
 			}
+			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+				s.deleteSessionCache(cacheKey)
+				cacheKey = ""
+			}
 
+			// Headers, reasoning, or text already shown to the client commit the
+			// response; a retry would duplicate or contradict it.
+			responseCommitted := func() bool {
+				streamMu.Lock()
+				headers := headersSent
+				streamMu.Unlock()
+				return headers || sentText != "" || sentThought != ""
+			}
 			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
 				(retryDeadline.IsZero() || time.Now().Before(retryDeadline)) &&
-				sentText == "" && sentThought == "" && ctx.Err() == nil &&
+				!responseCommitted() && ctx.Err() == nil &&
 				errCode != "account_banned"
 
 			if canRetryMore {
@@ -898,7 +970,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							account = nextAcct
+							assignAccount(nextAcct)
 							model = nextModel
 							opts.Model = nextModel
 							opts.Metadata = nil
@@ -924,10 +996,12 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if lastRetryReason == "" {
 						lastRetryReason = "rate_limit_error"
 					}
-					if headersSent || scope.AccountID == "" {
+					// Switching accounts is a pool-only operation and can only happen
+					// before any response bytes commit the current attempt.
+					if scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							account = nextAcct
+							assignAccount(nextAcct)
 							model = nextModel
 							opts.Model = nextModel
 							opts.Metadata = nil
@@ -941,16 +1015,21 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				if errStatus == 401 || errCode == "upstream_auth_error" || errCode == "auth_redirect" {
 					lastRetryReason = errCode
 					c.InvalidateAuth()
-					if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil && (headersSent || scope.AccountID == "") {
-						triedAccounts[nextAcct.ID] = true
-						account = nextAcct
-						model = nextModel
-						opts.Model = nextModel
-						opts.Metadata = nil
-						opts.Files = nil
-						curPrompt = fullPrompt
-						attachmentParts = fullAttachmentParts
-					} else {
+					switched := false
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct)
+							model = nextModel
+							opts.Model = nextModel
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							switched = true
+						}
+					}
+					if !switched {
 						freshSocketNext = true
 						rebootstrapNext = true
 					}
@@ -960,16 +1039,34 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					errCode == "upstream_stalled" ||
 					errCode == "upstream_timeout" {
 					lastRetryReason = errCode
-					if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-						triedAccounts[nextAcct.ID] = true
-						account = nextAcct
-						model = nextModel
-						opts.Model = nextModel
-						opts.Metadata = nil
-						opts.Files = nil
-						curPrompt = fullPrompt
-						attachmentParts = fullAttachmentParts
-						continue
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct)
+							model = nextModel
+							opts.Model = nextModel
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
+					}
+				}
+				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" {
+					lastRetryReason = errCode
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct)
+							model = nextModel
+							opts.Model = nextModel
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
 					}
 				}
 				if errCode == "upstream_transport_error" ||
@@ -1025,7 +1122,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if !wasCachedContinuation && scope.AccountID == "" {
 						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
 							triedAccounts[nextAcct.ID] = true
-							account = nextAcct
+							assignAccount(nextAcct)
 							model = nextModel
 							opts.Model = nextModel
 							switched = true
@@ -1043,23 +1140,37 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 
 			stopKeepalive()
 			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+			totalMs := time.Since(reqStartedAt).Milliseconds()
 			s.logRequestJSON(map[string]any{
-				"req_id":        respID,
-				"endpoint":      "/v1/responses",
-				"model":         mid,
-				"account":       account.ID,
-				"effort":        effortStr,
-				"prompt_bytes":  len(curPrompt),
-				"header_bytes":  flattenStats.HeaderBytes,
-				"body_bytes":    flattenStats.BodyBytes,
-				"footer_bytes":  flattenStats.FooterBytes,
-				"tool_bytes":    flattenStats.ToolSchemaBytes,
-				"ttft_ms":       ttftMs.Load(),
-				"total_ms":      time.Since(reqStartedAt).Milliseconds(),
-				"status":        errStatus,
-				"error_code":    errCode,
-				"cached_tokens": 0,
-				"attempts":      curAttempt + 1,
+				"req_id":             respID,
+				"endpoint":           "/v1/responses",
+				"model":              mid,
+				"account":            account.ID,
+				"effort":             effortStr,
+				"prompt_bytes":       len(curPrompt),
+				"header_bytes":       flattenStats.HeaderBytes,
+				"body_bytes":         flattenStats.BodyBytes,
+				"footer_bytes":       flattenStats.FooterBytes,
+				"tool_bytes":         flattenStats.ToolSchemaBytes,
+				"ttft_ms":            ttftMs.Load(),
+				"total_ms":           totalMs,
+				"status":             errStatus,
+				"error_code":         errCode,
+				"cached_tokens":      0,
+				"attempts":           curAttempt + 1,
+				"prepare_ms":         prepareMs,
+				"cache_hit":          cacheKey != "",
+				"cache_prefix_split": prep.cacheSplit,
+				"upload_ms":          uploadMs.Load(),
+				"identity_ms":        identityMs.Load(),
+				"header_ms":          headerMs.Load(),
+				"first_reasoning_ms": firstReasoningMs.Load(),
+				"first_content_ms":   firstContentMs.Load(),
+				"first_tool_ms":      firstToolMs.Load(),
+				"done_ms":            totalMs,
+				"account_switches":   accountSwitches.Load(),
+				"requested_model":    mid,
+				"served_model":       servedID,
 			})
 			if ctx.Err() == nil {
 				sendChatError(w, headersSent, runCheck)
@@ -1229,6 +1340,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						"status":    "in_progress",
 					},
 				})
+				// The argument delta is the first client-visible function-call
+				// output, including calls whose argument object is empty.
+				markMeaningfulOutput(&firstToolMs)
 				emitSSE("response.function_call_arguments.delta", map[string]any{
 					"item_id":      fcID,
 					"output_index": fcOutIdx,
@@ -1267,6 +1381,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"usage":      respUsage,
 			}
 			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
+			markPhase(&headerMs)
 			sendJSON(w, 200, payload, nil)
 		}
 
@@ -1274,23 +1389,37 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		if d, ok := chatUsage["prompt_tokens_details"].(map[string]any); ok {
 			cachedTok, _ = d["cached_tokens"].(int)
 		}
+		totalMs := time.Since(reqStartedAt).Milliseconds()
 		s.logRequestJSON(map[string]any{
-			"req_id":        respID,
-			"endpoint":      "/v1/responses",
-			"model":         mid,
-			"account":       account.ID,
-			"effort":        effortStr,
-			"prompt_bytes":  len(curPrompt),
-			"header_bytes":  flattenStats.HeaderBytes,
-			"body_bytes":    flattenStats.BodyBytes,
-			"footer_bytes":  flattenStats.FooterBytes,
-			"tool_bytes":    flattenStats.ToolSchemaBytes,
-			"ttft_ms":       ttftMs.Load(),
-			"total_ms":      time.Since(reqStartedAt).Milliseconds(),
-			"status":        200,
-			"error_code":    "",
-			"cached_tokens": cachedTok,
-			"attempts":      curAttempt + 1,
+			"req_id":             respID,
+			"endpoint":           "/v1/responses",
+			"model":              mid,
+			"account":            account.ID,
+			"effort":             effortStr,
+			"prompt_bytes":       len(curPrompt),
+			"header_bytes":       flattenStats.HeaderBytes,
+			"body_bytes":         flattenStats.BodyBytes,
+			"footer_bytes":       flattenStats.FooterBytes,
+			"tool_bytes":         flattenStats.ToolSchemaBytes,
+			"ttft_ms":            ttftMs.Load(),
+			"total_ms":           totalMs,
+			"status":             200,
+			"error_code":         "",
+			"cached_tokens":      cachedTok,
+			"attempts":           curAttempt + 1,
+			"prepare_ms":         prepareMs,
+			"cache_hit":          cacheKey != "",
+			"cache_prefix_split": prep.cacheSplit,
+			"upload_ms":          uploadMs.Load(),
+			"identity_ms":        identityMs.Load(),
+			"header_ms":          headerMs.Load(),
+			"first_reasoning_ms": firstReasoningMs.Load(),
+			"first_content_ms":   firstContentMs.Load(),
+			"first_tool_ms":      firstToolMs.Load(),
+			"done_ms":            totalMs,
+			"account_switches":   accountSwitches.Load(),
+			"requested_model":    mid,
+			"served_model":       servedID,
 		})
 
 		account.mu.Lock()

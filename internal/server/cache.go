@@ -15,7 +15,10 @@ import (
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
 )
 
-const sessionCacheTTL = 30 * time.Minute
+const (
+	sessionCacheTTL        = 30 * time.Minute
+	sessionCacheMaxEntries = 256
+)
 
 type persistedSessionEntry struct {
 	Key  string    `json:"key"`
@@ -55,7 +58,7 @@ func (s *Server) loadSessionCacheFromDisk() {
 			continue
 		}
 		if _, exists := s.sessionCache[e.Key]; !exists {
-			if len(s.sessionOrder) >= 256 {
+			if len(s.sessionOrder) >= sessionCacheMaxEntries {
 				oldest := s.sessionOrder[0]
 				s.sessionOrder = s.sessionOrder[1:]
 				delete(s.sessionCache, oldest)
@@ -135,23 +138,87 @@ func (s *Server) sessionCacheLen() int {
 	return len(s.sessionCache)
 }
 
+// promoteSessionCacheLocked moves key to the newest position in sessionOrder.
+// Callers must hold s.mu. A key missing from sessionOrder is appended so a live
+// cache entry is never invisible to eviction.
+func (s *Server) promoteSessionCacheLocked(key string) {
+	for i, k := range s.sessionOrder {
+		if k != key {
+			continue
+		}
+		if i == len(s.sessionOrder)-1 {
+			return
+		}
+		copy(s.sessionOrder[i:], s.sessionOrder[i+1:])
+		s.sessionOrder[len(s.sessionOrder)-1] = key
+		return
+	}
+	s.sessionOrder = append(s.sessionOrder, key)
+}
+
+// getSessionCache returns a copy of a live entry and records the lookup. A hit
+// also promotes the entry to the newest LRU position; the TTL is based on when
+// the entry was written, so reads do not extend its lifetime.
 func (s *Server) getSessionCache(key string) []any {
-	s.mu.RLock()
+	s.mu.Lock()
+	now := time.Now()
 	src := s.sessionCache[key]
 	at := s.sessionCacheAt[key]
-	s.mu.RUnlock()
-	if len(src) == 0 {
+	if len(src) == 0 || (!at.IsZero() && now.Sub(at) >= sessionCacheTTL) {
+		s.mu.Unlock()
 		s.cacheMisses.Add(1)
 		return nil
 	}
-	if !at.IsZero() && time.Since(at) >= sessionCacheTTL {
-		s.cacheMisses.Add(1)
-		return nil
-	}
-	s.cacheHits.Add(1)
 	cp := make([]any, len(src))
 	copy(cp, src)
+	s.promoteSessionCacheLocked(key)
+	s.mu.Unlock()
+	s.cacheHits.Add(1)
 	return cp
+}
+
+// peekSessionCache returns a copy of a live entry without recording hit/miss
+// telemetry or changing LRU order. Account-affinity scans use this so routing
+// probes do not distort /v1/sessions counters or eviction order.
+func (s *Server) peekSessionCache(key string) []any {
+	if key == "" {
+		return nil
+	}
+	s.mu.RLock()
+	now := time.Now()
+	src := s.sessionCache[key]
+	at := s.sessionCacheAt[key]
+	if len(src) == 0 || (!at.IsZero() && now.Sub(at) >= sessionCacheTTL) {
+		s.mu.RUnlock()
+		return nil
+	}
+	cp := make([]any, len(src))
+	copy(cp, src)
+	s.mu.RUnlock()
+	return cp
+}
+
+// deleteSessionCache removes a continuation entry and schedules a disk flush so
+// the invalidation survives a restart. Concurrent callers and an empty key are
+// safe; the flush is coalesced by the existing atomic writer.
+func (s *Server) deleteSessionCache(key string) {
+	if key == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.sessionCache, key)
+	delete(s.sessionCacheAt, key)
+	if len(s.sessionOrder) > 0 {
+		kept := s.sessionOrder[:0]
+		for _, k := range s.sessionOrder {
+			if k != key {
+				kept = append(kept, k)
+			}
+		}
+		s.sessionOrder = kept
+	}
+	s.mu.Unlock()
+	s.flushSessionCacheToDisk()
 }
 
 func (s *Server) putSessionCache(key string, meta []any) {
@@ -163,16 +230,16 @@ func (s *Server) putSessionCache(key string, meta []any) {
 	now := time.Now()
 	s.mu.Lock()
 	if _, exists := s.sessionCache[key]; !exists {
-		if len(s.sessionOrder) >= 256 {
+		if len(s.sessionOrder) >= sessionCacheMaxEntries {
 			oldest := s.sessionOrder[0]
 			s.sessionOrder = s.sessionOrder[1:]
 			delete(s.sessionCache, oldest)
 			delete(s.sessionCacheAt, oldest)
 		}
-		s.sessionOrder = append(s.sessionOrder, key)
 	}
 	s.sessionCache[key] = cp
 	s.sessionCacheAt[key] = now
+	s.promoteSessionCacheLocked(key)
 	s.mu.Unlock()
 	s.flushSessionCacheToDisk()
 }

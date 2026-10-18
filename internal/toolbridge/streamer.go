@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
+
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 var callSeq atomic.Uint64
@@ -107,7 +109,13 @@ type streamedCallState struct {
 	headerSent bool
 	sentArgs   string
 	finalArgs  string
+	doneArgs   map[string]any
 	done       bool
+	invalid    bool
+}
+
+func (st *streamedCallState) emittedAny() bool {
+	return st.headerSent || st.sentArgs != "" || st.finalArgs != ""
 }
 
 // LiveToolCallStreamer incrementally emits OpenAI tool_calls delta chunks as Gemini Web
@@ -118,6 +126,7 @@ type LiveToolCallStreamer struct {
 	emit     func(delta map[string]any)
 	states   []streamedCallState
 	aborted  bool
+	err      error
 }
 
 // NewLiveToolCallStreamer constructs an incremental tool_calls streamer for one attempt.
@@ -140,105 +149,270 @@ func NewLiveToolCallStreamer(tools any, toolChoice any, emit func(delta map[stri
 // SentAny reports whether at least one tool_calls chunk has been emitted.
 func (s *LiveToolCallStreamer) SentAny() bool {
 	for _, st := range s.states {
-		if st.headerSent || st.sentArgs != "" {
+		if st.headerSent || st.sentArgs != "" || st.finalArgs != "" {
 			return true
 		}
 	}
 	return false
 }
 
-func (s *LiveToolCallStreamer) ensureState(idx int, name string) *streamedCallState {
+// Err reports a terminal revision or validation error detected while streaming.
+func (s *LiveToolCallStreamer) Err() error {
+	if s == nil {
+		return nil
+	}
+	return s.err
+}
+
+func (s *LiveToolCallStreamer) ensureState(idx int) *streamedCallState {
 	for len(s.states) <= idx {
 		s.states = append(s.states, streamedCallState{
 			id: nextToolCallID(),
 		})
 	}
-	if s.states[idx].name == "" {
-		s.states[idx].name = name
-	}
 	return &s.states[idx]
 }
 
+func (s *LiveToolCallStreamer) resetState(idx int, name string) {
+	id := ""
+	if idx >= 0 && idx < len(s.states) {
+		id = s.states[idx].id
+	}
+	if id == "" {
+		id = nextToolCallID()
+	}
+	s.states[idx] = streamedCallState{id: id, name: name}
+}
+
+func upstreamRevisionError(detail string) error {
+	return transport.NewUpstreamError("upstream_revision: "+detail, 502, "upstream_revision", nil, nil)
+}
+
+func (s *LiveToolCallStreamer) revision(idx int, st *streamedCallState, detail string) error {
+	if st != nil {
+		st.invalid = true
+	}
+	err := upstreamRevisionError("tool call " + strconv.Itoa(idx) + " " + detail)
+	s.err = err
+	return err
+}
+
+func (s *LiveToolCallStreamer) emitHeader(idx int, st *streamedCallState, name string) error {
+	if st.headerSent {
+		if st.name != name {
+			return s.revision(idx, st, "changed name after its header was emitted")
+		}
+		return nil
+	}
+	st.name = name
+	st.headerSent = true
+	emitToolCallHeader(s.emit, idx, st.id, name)
+	return nil
+}
+
+func emitToolCallHeader(emit func(delta map[string]any), idx int, id, name string) {
+	emit(map[string]any{
+		"tool_calls": []map[string]any{
+			{
+				"index": idx,
+				"id":    id,
+				"type":  "function",
+				"function": map[string]any{
+					"name":      name,
+					"arguments": "",
+				},
+			},
+		},
+	})
+}
+
+func canonicalArgumentString(args map[string]any) string {
+	if args == nil {
+		args = map[string]any{}
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+func callArgsEqual(a, b map[string]any) bool {
+	if a == nil {
+		a = map[string]any{}
+	}
+	if b == nil {
+		b = map[string]any{}
+	}
+	return jsonEqual(a, b)
+}
+
+// completeStreamedArgs resolves the final argument bytes for a call whose partial
+// prefix has already been emitted. It only succeeds when the emitted prefix remains a
+// byte prefix of a valid JSON object whose parsed value matches the authoritative call,
+// so the concatenated stream can never carry stale or repaired-away values.
+func completeStreamedArgs(st *streamedCallState, rawArgs, canonical string, authoritative map[string]any) (string, bool) {
+	prefix := st.sentArgs
+	if prefix == "" {
+		return canonical, true
+	}
+	if strings.HasPrefix(canonical, prefix) {
+		return canonical, true
+	}
+	if !strings.HasPrefix(rawArgs, prefix) {
+		return "", false
+	}
+	candidates := []string{rawArgs}
+	if repaired := repairSanitizedHTMLInJSON(rawArgs); repaired != rawArgs {
+		candidates = append(candidates, repaired)
+	}
+	for _, candidate := range candidates {
+		if !strings.HasPrefix(candidate, prefix) || !json.Valid([]byte(candidate)) {
+			continue
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(candidate), &parsed); err != nil || parsed == nil {
+			continue
+		}
+		if callArgsEqual(parsed, authoritative) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func (s *LiveToolCallStreamer) firstEmittedIndex() int {
+	for i := range s.states {
+		if s.states[i].emittedAny() {
+			return i
+		}
+	}
+	return -1
+}
+
+// abortOrRevision fails closed with upstream_revision when any streamed state would be
+// left stale, and otherwise aborts silently like the historical best-effort streamer.
+func (s *LiveToolCallStreamer) abortOrRevision(idx int, detail string) error {
+	if idx < 0 || idx >= len(s.states) || !s.states[idx].emittedAny() {
+		idx = s.firstEmittedIndex()
+	}
+	if idx >= 0 && idx < len(s.states) {
+		return s.revision(idx, &s.states[idx], detail)
+	}
+	s.aborted = true
+	return nil
+}
+
 // Push inspects the cumulative candidate text and emits any newly available tool call
-// headers or verified argument slices.
+// headers or verified argument slices. It preserves the historical signature and
+// ignores the revision error; callers that need to fail closed should use PushError.
 func (s *LiveToolCallStreamer) Push(text string) {
-	if s == nil || s.aborted || s.emit == nil {
-		return
+	_ = s.PushError(text)
+}
+
+// PushError is Push with terminal revision and validation errors reported to the caller.
+func (s *LiveToolCallStreamer) PushError(text string) error {
+	if s == nil {
+		return nil
+	}
+	if s.err != nil {
+		return s.err
+	}
+	if s.aborted || s.emit == nil {
+		return nil
 	}
 	arrStart := findToolCallsArrayStart(text)
 	if arrStart < 0 {
-		return
+		if idx := s.firstEmittedIndex(); idx >= 0 {
+			return s.revision(idx, &s.states[idx], "disappeared from the candidate text")
+		}
+		return nil
 	}
 	pos := arrStart
 	for idx := 0; ; idx++ {
 		pos = skipJSONWSAndCommas(text, pos)
 		if pos >= len(text) || text[pos] == ']' {
-			return
+			for j := idx; j < len(s.states); j++ {
+				if s.states[j].emittedAny() {
+					return s.revision(j, &s.states[j], "was removed after it was streamed")
+				}
+			}
+			return nil
 		}
 		if text[pos] != '{' {
-			s.aborted = true
-			return
+			return s.abortOrRevision(idx, "regressed to a malformed tool-call object")
 		}
 		objEnd := findSingleBalancedObjectEnd(text, pos)
 		if objEnd > pos {
-			if idx < len(s.states) && s.states[idx].done {
-				pos = objEnd
-				continue
-			}
 			rawObj := text[pos:objEnd]
 			parsed, ok := unmarshalCandidateObject(rawObj)
 			if !ok {
-				s.aborted = true
-				return
+				return s.abortOrRevision(idx, "regressed to a malformed completed call")
 			}
 			normCalls, err := normaliseCalls(map[string]any{"tool_calls": []any{parsed}}, s.allow)
-			if err != nil || len(normCalls) != 1 {
+			if err != nil {
+				if idx < len(s.states) && s.states[idx].emittedAny() {
+					return s.revision(idx, &s.states[idx], "changed to an invalid completed call")
+				}
 				s.aborted = true
-				return
+				s.err = err
+				return err
+			}
+			if len(normCalls) != 1 {
+				return s.abortOrRevision(idx, "regressed to an empty completed call")
 			}
 			call := normCalls[0]
-			if s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && idx == 0 && call.Name != s.contract.ForcedFunction {
-				s.aborted = true
-				return
+			if s.contract != nil && s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && idx == 0 && call.Name != s.contract.ForcedFunction {
+				return s.abortOrRevision(idx, "changed to a function that is not forced")
 			}
-			st := s.ensureState(idx, call.Name)
-			st.name = call.Name
-			if !st.headerSent {
-				st.headerSent = true
-				s.emit(map[string]any{
-					"tool_calls": []map[string]any{
-						{
-							"index": idx,
-							"id":    st.id,
-							"type":  "function",
-							"function": map[string]any{
-								"name":      st.name,
-								"arguments": "",
-							},
-						},
-					},
-				})
+			st := s.ensureState(idx)
+			if st.invalid {
+				return s.revision(idx, st, "is invalid")
 			}
-			if st.sentArgs != "" {
-				rawArgs := extractRawArgumentsObject(rawObj)
-				if strings.HasPrefix(rawArgs, st.sentArgs) {
-					tail := rawArgs[len(st.sentArgs):]
-					if strings.Contains(tail, " |>") || !json.Valid([]byte(st.sentArgs+tail)) {
-						tail = repairSanitizedHTMLInJSON(tail)
-					}
-					if tail != "" {
-						emitArgumentStringChunks(s.emit, idx, tail)
-					}
-					st.finalArgs = st.sentArgs + tail
-					st.done = true
+			if st.done {
+				if st.name == call.Name && callArgsEqual(st.doneArgs, call.Arguments) {
+					// Whitespace and key-order changes are not revisions.
 					pos = objEnd
 					continue
 				}
+				if st.emittedAny() {
+					return s.revision(idx, st, "changed after it was completed")
+				}
+				s.resetState(idx, call.Name)
+				st = &s.states[idx]
 			}
-			b, _ := json.Marshal(call.Arguments)
-			fullArgs := string(b)
-			emitArgumentStringChunks(s.emit, idx, fullArgs)
-			st.finalArgs = fullArgs
+			if st.headerSent && st.name != call.Name {
+				return s.revision(idx, st, "changed name after its header was emitted")
+			}
+			if st.name == "" {
+				st.name = call.Name
+			}
+			canonical := canonicalArgumentString(call.Arguments)
+			if st.sentArgs != "" {
+				completed, ok := completeStreamedArgs(st, extractRawArgumentsObject(rawObj), canonical, call.Arguments)
+				if !ok {
+					return s.revision(idx, st, "partial arguments are no longer a monotonic prefix")
+				}
+				if err := s.emitHeader(idx, st, call.Name); err != nil {
+					return err
+				}
+				if tail := completed[len(st.sentArgs):]; tail != "" {
+					emitArgumentStringChunks(s.emit, idx, tail)
+				}
+				st.sentArgs = completed
+				st.finalArgs = completed
+				st.doneArgs = call.Arguments
+				st.done = true
+				pos = objEnd
+				continue
+			}
+			if err := s.emitHeader(idx, st, call.Name); err != nil {
+				return err
+			}
+			emitArgumentStringChunks(s.emit, idx, canonical)
+			st.sentArgs = canonical
+			st.finalArgs = canonical
+			st.doneArgs = call.Arguments
 			st.done = true
 			pos = objEnd
 			continue
@@ -248,118 +422,220 @@ func (s *LiveToolCallStreamer) Push(text string) {
 		partialObj := text[pos:]
 		name, argsOffset, ok := parsePartialCallPrefix(partialObj)
 		if !ok {
-			return
+			if idx < len(s.states) && s.states[idx].emittedAny() {
+				return s.revision(idx, &s.states[idx], "regressed to an incomplete object")
+			}
+			return nil
 		}
 		if _, allowed := s.allow[name]; !allowed {
-			return
+			if idx < len(s.states) && s.states[idx].emittedAny() {
+				return s.revision(idx, &s.states[idx], "changed to a tool that is not allowed")
+			}
+			return nil
 		}
-		if s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && idx == 0 && name != s.contract.ForcedFunction {
-			return
+		if s.contract != nil && s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && idx == 0 && name != s.contract.ForcedFunction {
+			if idx < len(s.states) && s.states[idx].emittedAny() {
+				return s.revision(idx, &s.states[idx], "changed to a function that is not forced")
+			}
+			return nil
 		}
 		partialArgs := partialObj[argsOffset:]
+		if argsEnd := findSingleBalancedObjectEnd(partialArgs, 0); argsEnd >= 0 && strings.Contains(partialArgs[argsEnd:], "{") {
+			if idx < len(s.states) && s.states[idx].emittedAny() {
+				return s.revision(idx, &s.states[idx], "appended a second JSON object to partial arguments")
+			}
+			return nil
+		}
+		st := s.ensureState(idx)
+		if st.invalid {
+			return s.revision(idx, st, "is invalid")
+		}
+		if st.done {
+			if st.emittedAny() {
+				return s.revision(idx, st, "regressed from a completed call to a partial object")
+			}
+			s.resetState(idx, name)
+			st = &s.states[idx]
+		}
+		if st.headerSent && st.name != name {
+			return s.revision(idx, st, "changed name while streaming partial arguments")
+		}
+		if st.name == "" {
+			st.name = name
+		}
+		prefix := st.sentArgs
+		if prefix != "" && (len(partialArgs) < len(prefix) || !strings.HasPrefix(partialArgs, prefix)) {
+			return s.revision(idx, st, "partial arguments are no longer a monotonic prefix")
+		}
 		headerOK, safeLen := verifyPartialArgsForLiveStream(partialArgs, s.allow[name])
 		if !headerOK {
-			return
+			if prefix != "" {
+				return s.revision(idx, st, "partial arguments are no longer schema-safe")
+			}
+			return nil
 		}
-		st := s.ensureState(idx, name)
-		if !st.headerSent {
-			st.headerSent = true
-			s.emit(map[string]any{
-				"tool_calls": []map[string]any{
-					{
-						"index": idx,
-						"id":    st.id,
-						"type":  "function",
-						"function": map[string]any{
-							"name":      st.name,
-							"arguments": "",
-						},
-					},
-				},
-			})
+		if err := s.emitHeader(idx, st, name); err != nil {
+			return err
 		}
-		if safeLen > len(st.sentArgs) && strings.HasPrefix(partialArgs[:safeLen], st.sentArgs) {
+		if safeLen > len(st.sentArgs) {
+			if safeLen > len(partialArgs) {
+				safeLen = len(partialArgs)
+			}
+			if !strings.HasPrefix(partialArgs[:safeLen], st.sentArgs) {
+				return s.revision(idx, st, "partial arguments are no longer a monotonic prefix")
+			}
 			delta := partialArgs[len(st.sentArgs):safeLen]
 			st.sentArgs = partialArgs[:safeLen]
 			emitArgumentStringChunks(s.emit, idx, delta)
 		}
-		return
+		return nil
 	}
 }
 
+func rawArgsForCallIndex(text string, target int) string {
+	arrStart := findToolCallsArrayStart(text)
+	if arrStart < 0 {
+		return ""
+	}
+	pos := arrStart
+	for idx := 0; ; idx++ {
+		pos = skipJSONWSAndCommas(text, pos)
+		if pos >= len(text) || text[pos] == ']' || text[pos] != '{' {
+			return ""
+		}
+		objEnd := findSingleBalancedObjectEnd(text, pos)
+		if objEnd <= pos {
+			return ""
+		}
+		if idx == target {
+			return extractRawArgumentsObject(text[pos:objEnd])
+		}
+		pos = objEnd
+	}
+}
+
+func (s *LiveToolCallStreamer) authoritativeToolCalls(calls []Call) []OpenAIToolCall {
+	out := make([]OpenAIToolCall, 0, len(calls))
+	for idx, c := range calls {
+		callID := ""
+		if s != nil && idx < len(s.states) {
+			callID = s.states[idx].id
+		}
+		if callID == "" {
+			callID = nextToolCallID()
+		}
+		out = append(out, OpenAIToolCall{
+			ID:   callID,
+			Type: "function",
+			Function: OpenAIFunctionCall{
+				Name:      c.Name,
+				Arguments: canonicalArgumentString(c.Arguments),
+			},
+		})
+	}
+	return out
+}
+
 // Finalize completes emission of all validated tool calls at the end of a turn and returns
-// the canonical OpenAIToolCall slice with matching IDs and argument strings.
+// the canonical OpenAIToolCall slice with matching IDs and argument strings. It preserves
+// the historical signature; callers that must fail closed on upstream revisions should
+// use FinalizeError. If a revision invalidates streamed state, the returned calls still
+// carry authoritative arguments and are never stale.
 func (s *LiveToolCallStreamer) Finalize(calls []Call, fullText string) []OpenAIToolCall {
-	if s != nil && !s.aborted && fullText != "" {
-		s.Push(fullText)
+	out, err := s.FinalizeError(calls, fullText)
+	if err != nil {
+		return s.authoritativeToolCalls(calls)
+	}
+	return out
+}
+
+// FinalizeError is Finalize with terminal revision errors reported to the caller.
+// Completed calls are authoritative: a streamed call whose name or parsed arguments
+// changed after any part was emitted yields an upstream_revision error instead of stale
+// argument bytes.
+func (s *LiveToolCallStreamer) FinalizeError(calls []Call, fullText string) ([]OpenAIToolCall, error) {
+	if s != nil {
+		if fullText != "" {
+			if err := s.PushError(fullText); err != nil {
+				return nil, err
+			}
+		}
+		if s.err != nil {
+			return nil, s.err
+		}
 	}
 	out := make([]OpenAIToolCall, 0, len(calls))
 	for idx, c := range calls {
-		argsMap := c.Arguments
-		if argsMap == nil {
-			argsMap = map[string]any{}
-		}
-		b, _ := json.Marshal(argsMap)
-		argsStr := string(b)
+		argsStr := canonicalArgumentString(c.Arguments)
 		callID := ""
 		if s != nil && idx < len(s.states) {
 			st := &s.states[idx]
+			if st.invalid {
+				return nil, s.revision(idx, st, "is invalid")
+			}
 			callID = st.id
 			if st.done && st.finalArgs != "" {
-				out = append(out, OpenAIToolCall{
-					ID:   callID,
-					Type: "function",
-					Function: OpenAIFunctionCall{
-						Name:      c.Name,
-						Arguments: st.finalArgs,
-					},
-				})
-				continue
+				if st.name != c.Name || !callArgsEqual(st.doneArgs, c.Arguments) {
+					if st.emittedAny() {
+						return nil, s.revision(idx, st, "changed after it was completed")
+					}
+					s.resetState(idx, c.Name)
+					st = &s.states[idx]
+				} else {
+					if !json.Valid([]byte(st.finalArgs)) {
+						return nil, s.revision(idx, st, "produced malformed final arguments")
+					}
+					parsed, ok := unmarshalCandidateObject(st.finalArgs)
+					if !ok || !callArgsEqual(parsed, c.Arguments) {
+						return nil, s.revision(idx, st, "returned stale final arguments")
+					}
+					out = append(out, OpenAIToolCall{
+						ID:   callID,
+						Type: "function",
+						Function: OpenAIFunctionCall{
+							Name:      c.Name,
+							Arguments: st.finalArgs,
+						},
+					})
+					continue
+				}
+			}
+			if st.headerSent && st.name != c.Name {
+				if st.emittedAny() {
+					return nil, s.revision(idx, st, "changed name after its header was emitted")
+				}
+				s.resetState(idx, c.Name)
+				st = &s.states[idx]
 			}
 			if s.emit != nil {
 				if !st.headerSent {
+					st.name = c.Name
 					st.headerSent = true
-					s.emit(map[string]any{
-						"tool_calls": []map[string]any{
-							{
-								"index": idx,
-								"id":    callID,
-								"type":  "function",
-								"function": map[string]any{
-									"name":      c.Name,
-									"arguments": "",
-								},
-							},
-						},
-					})
+					emitToolCallHeader(s.emit, idx, callID, c.Name)
 				}
-				if st.sentArgs != "" && strings.HasPrefix(argsStr, st.sentArgs) {
-					if tail := argsStr[len(st.sentArgs):]; tail != "" {
+				if st.sentArgs != "" {
+					completed, ok := completeStreamedArgs(st, rawArgsForCallIndex(fullText, idx), argsStr, c.Arguments)
+					if !ok {
+						return nil, s.revision(idx, st, "partial arguments are no longer a monotonic prefix")
+					}
+					if tail := completed[len(st.sentArgs):]; tail != "" {
 						emitArgumentStringChunks(s.emit, idx, tail)
 					}
-				} else if st.sentArgs == "" {
+					st.sentArgs = completed
+					st.finalArgs = completed
+				} else {
 					emitArgumentStringChunks(s.emit, idx, argsStr)
+					st.sentArgs = argsStr
+					st.finalArgs = argsStr
 				}
+				st.doneArgs = c.Arguments
 				st.done = true
-				st.finalArgs = argsStr
 			}
 		}
 		if callID == "" {
 			callID = nextToolCallID()
 			if s != nil && s.emit != nil {
-				s.emit(map[string]any{
-					"tool_calls": []map[string]any{
-						{
-							"index": idx,
-							"id":    callID,
-							"type":  "function",
-							"function": map[string]any{
-								"name":      c.Name,
-								"arguments": "",
-							},
-						},
-					},
-				})
+				emitToolCallHeader(s.emit, idx, callID, c.Name)
 				emitArgumentStringChunks(s.emit, idx, argsStr)
 			}
 		}
@@ -372,7 +648,15 @@ func (s *LiveToolCallStreamer) Finalize(calls []Call, fullText string) []OpenAIT
 			},
 		})
 	}
-	return out
+	if s != nil {
+		for idx := len(calls); idx < len(s.states); idx++ {
+			st := &s.states[idx]
+			if st.emittedAny() {
+				return nil, s.revision(idx, st, "was removed from the completed calls")
+			}
+		}
+	}
+	return out, nil
 }
 
 func findToolCallsArrayStart(s string) int {
@@ -513,16 +797,114 @@ func parsePartialCallPrefix(partialObj string) (name string, argsBraceOffset int
 	return toolName, pos, true
 }
 
+func findJSONValueEnd(s string, start int) int {
+	if start >= len(s) {
+		return -1
+	}
+	switch s[start] {
+	case '{':
+		return findSingleBalancedObjectEnd(s, start)
+	case '[':
+		depth := 0
+		inStr := false
+		escaped := false
+		for i := start; i < len(s); i++ {
+			ch := s[i]
+			if inStr {
+				if escaped {
+					escaped = false
+				} else if ch == '\\' {
+					escaped = true
+				} else if ch == '"' {
+					inStr = false
+				}
+				continue
+			}
+			if ch == '"' {
+				inStr = true
+				continue
+			}
+			if ch == '[' || ch == '{' {
+				depth++
+			} else if ch == ']' || ch == '}' {
+				depth--
+				if depth == 0 {
+					return i + 1
+				}
+			}
+		}
+		return -1
+	case '"':
+		_, next, ok := parseJSONStringLiteral(s, start)
+		if !ok {
+			return -1
+		}
+		return next
+	default:
+		i := start
+		for i < len(s) && s[i] != ',' && s[i] != '}' && s[i] != ']' &&
+			s[i] != ' ' && s[i] != '\t' && s[i] != '\r' && s[i] != '\n' {
+			i++
+		}
+		if i == start {
+			return -1
+		}
+		return i
+	}
+}
+
+// extractRawArgumentsObject returns the raw JSON object used as arguments regardless of
+// top-level key ordering, mirroring normaliseCalls' argument-key preference.
 func extractRawArgumentsObject(rawObj string) string {
-	_, argsOffset, ok := parsePartialCallPrefix(rawObj)
-	if !ok {
+	pos := skipJSONWS(rawObj, 0)
+	if pos >= len(rawObj) || rawObj[pos] != '{' {
 		return ""
 	}
-	end := findSingleBalancedObjectEnd(rawObj, argsOffset)
-	if end <= argsOffset {
-		return ""
+	pos++
+	keys := [...]string{"arguments", "parameters", "args", "input", "params", "action_input"}
+	spans := make([][2]int, len(keys))
+	for {
+		pos = skipJSONWS(rawObj, pos)
+		if pos >= len(rawObj) || rawObj[pos] == '}' {
+			break
+		}
+		key, next, ok := parseJSONStringLiteral(rawObj, pos)
+		if !ok {
+			break
+		}
+		pos = skipJSONWS(rawObj, next)
+		if pos >= len(rawObj) || rawObj[pos] != ':' {
+			break
+		}
+		pos = skipJSONWS(rawObj, pos+1)
+		valueStart := pos
+		valueEnd := findJSONValueEnd(rawObj, valueStart)
+		if valueEnd <= valueStart {
+			break
+		}
+		key = strings.TrimSpace(key)
+		for i, want := range keys {
+			if key == want && spans[i][1] == 0 {
+				spans[i] = [2]int{valueStart, valueEnd}
+				break
+			}
+		}
+		pos = skipJSONWS(rawObj, valueEnd)
+		if pos < len(rawObj) && rawObj[pos] == ',' {
+			pos++
+			continue
+		}
+		break
 	}
-	return rawObj[argsOffset:end]
+	for _, span := range spans {
+		if span[1] > span[0] {
+			if rawObj[span[0]] != '{' {
+				return ""
+			}
+			return rawObj[span[0]:span[1]]
+		}
+	}
+	return ""
 }
 
 func verifyPartialArgsForLiveStream(partialArgs string, schema map[string]any) (headerOK bool, safeLen int) {
