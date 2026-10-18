@@ -490,6 +490,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	attachmentParts := prep.attachmentParts
 	hasher := prep.hasher
 	cacheKey := prep.cacheKey
+	cacheUsed := cacheKey != ""
 	respID := "resp_" + randomHex(8)
 	rsID := "rs_" + randomHex(6)
 	msgID := "msg_" + randomHex(6)
@@ -869,10 +870,10 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						// Thoughts are normalized monotonically via mergeStreamedThoughts.
 						// A matching served-model id proves no downgrade is in progress, so
 						// the headers no longer need to be held for an HTTP error.
-						if !headersSent && servedID != "" && !identityConflict && gemini.IsMatchingServedModel(*model, servedID, servedLabel) {
+						if !headersSent && canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel) {
 							startStream(false)
 						}
-						identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
+						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if identityVerified && s.Cfg.LiveThoughts {
 							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 								emitReasoningDelta(thoughts[len(sentThought):])
@@ -881,7 +882,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 								startStream(false)
 							}
 						}
-						canStreamText := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
+						canStreamText := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if canStreamText {
 							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
 								emitTextDelta(text[len(sentText):])
@@ -1159,7 +1160,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"cached_tokens":      0,
 				"attempts":           curAttempt + 1,
 				"prepare_ms":         prepareMs,
-				"cache_hit":          cacheKey != "",
+				"cache_hit":          cacheUsed,
 				"cache_prefix_split": prep.cacheSplit,
 				"upload_ms":          uploadMs.Load(),
 				"identity_ms":        identityMs.Load(),
@@ -1408,7 +1409,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			"cached_tokens":      cachedTok,
 			"attempts":           curAttempt + 1,
 			"prepare_ms":         prepareMs,
-			"cache_hit":          cacheKey != "",
+			"cache_hit":          cacheUsed,
 			"cache_prefix_split": prep.cacheSplit,
 			"upload_ms":          uploadMs.Load(),
 			"identity_ms":        identityMs.Load(),

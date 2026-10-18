@@ -87,6 +87,14 @@ type AuthScope struct {
 	Admin     bool
 }
 
+// canStreamVerified is the single commit predicate for model output in both
+// OpenAI-compatible streaming handlers. Eager mode and disabled downgrade
+// rejection are explicit policy overrides; strict mode requires a non-empty,
+// non-conflicting served identity that matches the requested model.
+func canStreamVerified(eagerStream, rejectDowngrade, identityConflict bool, model gemini.ModelInfo, servedID, servedLabel string) bool {
+	return eagerStream || !rejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(model, servedID, servedLabel))
+}
+
 type cachedUpload struct {
 	File gemini.UploadedFile
 	At   time.Time

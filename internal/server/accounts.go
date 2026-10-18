@@ -919,6 +919,28 @@ func (s *Server) hasSessionCacheHit(a *AccountState, modelName string, hasher *p
 	return false
 }
 
+// consumeSessionCacheForGeneration scans without telemetry, then consumes only
+// the newest matching prefix. This prevents one request from counting a miss for
+// every older prefix it probes and promotes only the continuation actually used.
+func (s *Server) consumeSessionCacheForGeneration(accountID, modelName string, hasher *prompt.HistoryHasher) (string, []any, int) {
+	if !s.Cfg.SessionCache || accountID == "" || modelName == "" || hasher == nil || hasher.Len() < 3 {
+		return "", nil, 0
+	}
+	for split := hasher.Len() - 1; split >= 2; split-- {
+		key := hasher.HashPrefix(accountID, modelName, split)
+		if len(s.peekSessionCache(key)) == 0 {
+			continue
+		}
+		meta, ok := s.takeSessionCache(key)
+		if !ok {
+			return "", nil, 0
+		}
+		return key, meta, split
+	}
+	s.cacheMisses.Add(1)
+	return "", nil, 0
+}
+
 func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]bool, originGroup string, requested string, hasher *prompt.HistoryHasher) (*AccountState, *gemini.ModelInfo) {
 	if s.rotate() {
 		return s.pickRotateFallback(accts, tried, originGroup, requested)
@@ -1654,23 +1676,20 @@ func (s *Server) prepareGeneration(
 	cacheKey := ""
 	cacheSplit := 0
 	if s.Cfg.SessionCache && !opts.Temporary && hasher != nil {
-		for split := len(messages) - 1; split >= 2; split-- {
-			prefixKey := hasher.HashPrefix(account.ID, mid, split)
-			if cachedMeta := s.getSessionCache(prefixKey); len(cachedMeta) > 0 {
-				opts.Metadata = cachedMeta
-				cacheKey = prefixKey
-				cacheSplit = split
-				deltaPrompt, _, dErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
-					StartIndex:      split,
-					MaxPromptChars:  s.Cfg.MaxPromptChars,
-					MaxOldToolChars: s.Cfg.MaxOldToolChars,
-					AllowOverflow:   false,
-				})
-				if dErr == nil {
-					curPrompt = deltaPrompt
-					attachmentParts = prompt.ExtractImageParts(messages[split:])
-				}
-				break
+		selectedKey, cachedMeta, split := s.consumeSessionCacheForGeneration(account.ID, mid, hasher)
+		if len(cachedMeta) > 0 {
+			opts.Metadata = cachedMeta
+			cacheKey = selectedKey
+			cacheSplit = split
+			deltaPrompt, _, dErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
+				StartIndex:      split,
+				MaxPromptChars:  s.Cfg.MaxPromptChars,
+				MaxOldToolChars: s.Cfg.MaxOldToolChars,
+				AllowOverflow:   false,
+			})
+			if dErr == nil {
+				curPrompt = deltaPrompt
+				attachmentParts = prompt.ExtractImageParts(messages[split:])
 			}
 		}
 	}

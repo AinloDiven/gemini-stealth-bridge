@@ -156,10 +156,10 @@ func (s *Server) promoteSessionCacheLocked(key string) {
 	s.sessionOrder = append(s.sessionOrder, key)
 }
 
-// getSessionCache returns a copy of a live entry and records the lookup. A hit
-// also promotes the entry to the newest LRU position; the TTL is based on when
-// the entry was written, so reads do not extend its lifetime.
-func (s *Server) getSessionCache(key string) []any {
+// takeSessionCache consumes one continuation entry, promoting it only when a
+// generation actually uses it. Hit/miss counters are updated once per consume
+// attempt; affinity scans use peekSessionCache and never reach this method.
+func (s *Server) takeSessionCache(key string) ([]any, bool) {
 	s.mu.Lock()
 	now := time.Now()
 	src := s.sessionCache[key]
@@ -167,13 +167,21 @@ func (s *Server) getSessionCache(key string) []any {
 	if len(src) == 0 || (!at.IsZero() && now.Sub(at) >= sessionCacheTTL) {
 		s.mu.Unlock()
 		s.cacheMisses.Add(1)
-		return nil
+		return nil, false
 	}
 	cp := make([]any, len(src))
 	copy(cp, src)
 	s.promoteSessionCacheLocked(key)
 	s.mu.Unlock()
 	s.cacheHits.Add(1)
+	return cp, true
+}
+
+// getSessionCache returns a copy of a live entry and records the lookup. It is
+// retained for direct callers and tests; generation lookup uses a single
+// selected key through takeSessionCache.
+func (s *Server) getSessionCache(key string) []any {
+	cp, _ := s.takeSessionCache(key)
 	return cp
 }
 
@@ -288,6 +296,31 @@ func (s *Server) saveSessionContinuation(
 	s.putSessionCache(nextKey, gemini.BuildContinuationMetadata(cid, rid, rcid, contextToken))
 }
 
+func (s *Server) getUploadCache(key string) (gemini.UploadedFile, bool) {
+	if key == "" {
+		return gemini.UploadedFile{}, false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	cached, ok := s.uploadCache[key]
+	if !ok || now.Sub(cached.At) >= 25*time.Minute {
+		s.mu.Unlock()
+		return gemini.UploadedFile{}, false
+	}
+	for i, k := range s.uploadOrder {
+		if k != key {
+			continue
+		}
+		if i != len(s.uploadOrder)-1 {
+			copy(s.uploadOrder[i:], s.uploadOrder[i+1:])
+			s.uploadOrder[len(s.uploadOrder)-1] = key
+		}
+		break
+	}
+	s.mu.Unlock()
+	return cached.File, true
+}
+
 func (s *Server) uploadAttachments(
 	ctx context.Context,
 	acctID string,
@@ -312,11 +345,8 @@ func (s *Server) uploadCached(ctx context.Context, acctID string, c UpstreamClie
 	if len(att.Data) == 0 && att.RemoteURL != "" {
 		urlSum := sha256.Sum256([]byte(att.RemoteURL))
 		urlKey := acctID + ":url:" + hex.EncodeToString(urlSum[:])
-		s.mu.RLock()
-		cachedURL, okURL := s.uploadCache[urlKey]
-		s.mu.RUnlock()
-		if okURL && time.Since(cachedURL.At) < 25*time.Minute {
-			return cachedURL.File, nil
+		if cachedURL, okURL := s.getUploadCache(urlKey); okURL {
+			return cachedURL, nil
 		}
 		fetched, err := prompt.FetchRemoteImage(ctx, att.RemoteURL, 0)
 		if err != nil {
@@ -337,11 +367,8 @@ func (s *Server) uploadCachedBytes(ctx context.Context, acctID string, c Upstrea
 	sum := sha256.Sum256(att.Data)
 	cacheKey := acctID + ":" + hex.EncodeToString(sum[:])
 
-	s.mu.RLock()
-	cached, ok := s.uploadCache[cacheKey]
-	s.mu.RUnlock()
-	if ok && time.Since(cached.At) < 25*time.Minute {
-		return cached.File, nil
+	if cached, ok := s.getUploadCache(cacheKey); ok {
+		return cached, nil
 	}
 
 	uf, err := c.UploadFile(ctx, att.Data, att.Filename, att.ContentType)

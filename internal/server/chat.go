@@ -106,6 +106,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	attachmentParts := prep.attachmentParts
 	hasher := prep.hasher
 	cacheKey := prep.cacheKey
+	cacheUsed := cacheKey != ""
 	cmplID := "chatcmpl-" + randomHex(8)
 	created := time.Now().Unix()
 	eagerStream := strings.EqualFold(s.Cfg.StreamBufferMode, "eager")
@@ -339,7 +340,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		lastActiveKeepaliveAt := attemptStartedAt
 		var toolStreamer *toolbridge.LiveToolCallStreamer
 		preambleFlushed := false
-		if stream && buffered && hasTools {
+		if stream && buffered && hasTools && s.Cfg.LiveToolCalls {
 			toolStreamer = toolbridge.NewLiveToolCallStreamer(toolsRaw, toolChoiceRaw, func(d map[string]any) {
 				startStream(false)
 				if !preambleFlushed {
@@ -435,12 +436,6 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					if frameMismatch {
 						return transport.ErrStopStreaming
 					}
-					identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
-					if identityVerified && toolStreamer != nil {
-						if err := toolStreamer.PushError(text); err != nil {
-							return err
-						}
-					}
 					if stream && !buffered && ctx.Err() == nil {
 						if !strings.HasPrefix(text, sentText) || (s.Cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
@@ -461,7 +456,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
 						// Hold all model output until the requested identity is verified.
-						identityVerified := eagerStream || !s.Cfg.RejectDowngrade || (!identityConflict && servedID != "" && gemini.IsMatchingServedModel(*model, servedID, servedLabel))
+						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if !headersSent && identityVerified {
 							startStream(false)
 						}
@@ -767,7 +762,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"cached_tokens":      0,
 				"attempts":           curAttempt + 1,
 				"prepare_ms":         prepareMs,
-				"cache_hit":          cacheKey != "",
+				"cache_hit":          cacheUsed,
 				"cache_prefix_split": prep.cacheSplit,
 				"upload_ms":          uploadMs.Load(),
 				"identity_ms":        identityMs.Load(),
@@ -933,7 +928,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			"cached_tokens":      cachedTok,
 			"attempts":           curAttempt + 1,
 			"prepare_ms":         prepareMs,
-			"cache_hit":          cacheKey != "",
+			"cache_hit":          cacheUsed,
 			"cache_prefix_split": prep.cacheSplit,
 			"upload_ms":          uploadMs.Load(),
 			"identity_ms":        identityMs.Load(),

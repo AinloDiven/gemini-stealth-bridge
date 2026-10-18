@@ -31,6 +31,7 @@ type Config struct {
 	LiveThoughts            bool
 	SessionCache            bool
 	KeepToolPreamble        bool
+	LiveToolCalls           bool
 	MaxPromptChars          int
 	MaxOldToolChars         int
 	RotateCookiesEvery      time.Duration
@@ -181,6 +182,7 @@ func FromEnv() *Config {
 		LiveThoughts:            envBool("BRIDGE_LIVE_THOUGHTS", true),
 		SessionCache:            envBool("BRIDGE_SESSION_CACHE", true),
 		KeepToolPreamble:        envBool("BRIDGE_TOOL_PREAMBLE", false),
+		LiveToolCalls:           envBool("BRIDGE_LIVE_TOOL_CALLS", false),
 		MaxPromptChars:          envPositiveInt("BRIDGE_MAX_PROMPT_CHARS", 850000, 1024, &warnings),
 		MaxOldToolChars:         envPositiveInt("BRIDGE_MAX_OLD_TOOL_CHARS", 32000, 256, &warnings),
 		RotateCookiesEvery:      time.Duration(envPositiveInt("BRIDGE_ROTATE_COOKIES_MS", 540000, 1000, &warnings)) * time.Millisecond,

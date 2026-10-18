@@ -379,6 +379,7 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 | `BRIDGE_TEMPORARY` | `false` | Request temporary Gemini conversations; skips continuation-cache reuse |
 | `BRIDGE_SESSION_CACHE` | `true` | Persist and reuse conversation continuation metadata |
 | `BRIDGE_TOOL_PREAMBLE` | `false` | Preserve assistant text before tool calls as answer text rather than moving it into reasoning |
+| `BRIDGE_LIVE_TOOL_CALLS` | `false` | Opt in to incremental tool-call deltas; default buffers and validates the complete call before emitting it, avoiding failures from upstream revisions |
 | `BRIDGE_MAX_PROMPT_CHARS` | `850000` | Inline history budget before older turns are offloaded; not a token count |
 | `BRIDGE_MAX_OLD_TOOL_CHARS` | `32000` | Compaction threshold for older tool-result messages |
 | `BRIDGE_HISTORY_OFFLOAD` | `true` | Upload older conversation turns as text attachments when inline budget is exceeded; `false` forces inline compaction only |

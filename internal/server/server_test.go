@@ -840,6 +840,35 @@ func TestStreamingToolCallNeverLeaksThinkingProcessOrSplitsPreambleAcrossToolCal
 	}
 }
 
+func TestDefaultToolStreamingBuffersUntilFinalValidation(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "read_file",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"path": map[string]any{"type": "string"}},
+					"required":   []any{"path"},
+				},
+			},
+		},
+	}
+	partial := `{"tool_calls":[{"name":"read_file","arguments":{"path":"` + strings.Repeat("a", 180)
+	final := `{"tool_calls":[{"name":"read_file","arguments":{"path":"/tmp/final"}}]}`
+	rec := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
+		makeFrame(partial, "", false, testModel.ModelID),
+		makeFrame(final, "", true, testModel.ModelID),
+	}), map[string]any{"stream": true, "tools": tools})
+	if rec.Code != 200 {
+		t.Fatalf("expected final validated tool call to succeed, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "upstream_revision") || !strings.Contains(rec.Body.String(), "/tmp/final") {
+		t.Fatalf("expected only authoritative final arguments, got %s", rec.Body.String())
+	}
+}
+
 func TestToolCallPreservedWhenFinalFrameOverwritesWithGeminiErrorReply(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 
