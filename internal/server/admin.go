@@ -225,6 +225,11 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 	s.rotateMu.Lock()
 	rotCursor := s.rotateCursor
 	s.rotateMu.Unlock()
+	if rotCursor == "" && s.rotate() {
+		if accts := s.Accounts(); len(accts) > 0 {
+			rotCursor = accts[0].ID
+		}
+	}
 
 	s.mu.RLock()
 	cfg := s.Cfg

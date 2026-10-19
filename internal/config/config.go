@@ -14,7 +14,7 @@ import (
 )
 
 // Version is the build version of gemini-stealth-bridge (overridable via -ldflags).
-var Version = "0.2.1"
+var Version = "0.3.0"
 
 // Config holds all runtime settings for the gemini-stealth-bridge daemon.
 // Environment variables are 100% compatible with gemini-app-bridge.

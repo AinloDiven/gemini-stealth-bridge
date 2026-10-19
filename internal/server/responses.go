@@ -960,7 +960,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			}
 			if errCode == "account_banned" {
 				s.markAccountQuarantined(account, runCheck.Error())
-			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" {
+			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" {
 				s.markAccountFailure(account, runCheck.Error())
 				if errCode != "empty_upstream_response" {
 					s.refreshQuotaAsync(account, c)

@@ -123,7 +123,7 @@
     }
 
     .top-bar-inner {
-      max-width: 1240px;
+      max-width: 1120px;
       margin: 0 auto;
       min-height: 56px;
       display: flex;
@@ -295,12 +295,12 @@
 
     /* Main Container */
     .shell {
-      max-width: 1240px;
+      max-width: 1120px;
       margin: 0 auto;
       padding: 24px 24px 64px;
       display: flex;
       flex-direction: column;
-      gap: 20px;
+      gap: 16px;
     }
 
     .view-section[hidden] {
@@ -591,16 +591,21 @@
     .status-note {
       font-size: 0.75rem;
       color: var(--text-secondary);
-      white-space: nowrap;
+      max-width: 190px;
+      line-height: 1.35;
     }
 
-    /* Column 3: Quota Meter (Single-Line Clean Layout) */
+    /* Column 3: Quota Meter (Proportional Non-Scrolling Layout) */
+    .acct-table td.col-quota,
+    .acct-table th.col-quota {
+      width: 48%;
+    }
+
     .quota-stack {
       display: flex;
       flex-direction: column;
       gap: 8px;
-      min-width: 210px;
-      max-width: 270px;
+      width: 100%;
     }
 
     .quota-item {
@@ -639,16 +644,16 @@
     }
 
     .quota-bar-bg {
-      height: 6px;
+      height: 7px;
       background: var(--surface-track);
-      border-radius: 3px;
+      border-radius: 4px;
       overflow: hidden;
     }
 
     .quota-bar-fill {
       height: 100%;
       background: var(--accent-bar);
-      border-radius: 3px;
+      border-radius: 4px;
     }
 
     .quota-bar-fill.warn {
@@ -659,36 +664,122 @@
       background: var(--status-err-fg);
     }
 
-    /* Column 4: Traffic & Session */
-    .traffic-cell {
-      white-space: nowrap;
-      font-size: 0.75rem;
-    }
-
-    .traffic-primary {
-      color: var(--text-primary);
-      font-weight: 500;
-    }
-
-    .traffic-sub {
-      color: var(--text-secondary);
-      margin-top: 2px;
-    }
-
-    /* Column 5: Single-Row Actions */
+    /* Column 4: Compact Order & Menu Actions */
     .actions-cell {
       text-align: right;
       white-space: nowrap;
+      width: 1%;
     }
 
     .row-actions {
       display: inline-flex;
       align-items: center;
       justify-content: flex-end;
-      gap: 6px;
+      gap: 4px;
       white-space: nowrap;
     }
 
+    .btn-icon {
+      width: 30px;
+      height: 30px;
+      min-height: 30px;
+      padding: 0;
+      border-radius: 6px;
+      background: var(--surface-subtle);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+      font-size: 0.85rem;
+      line-height: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+
+    .btn-icon:hover:not(:disabled),
+    .btn-icon[aria-expanded="true"] {
+      background: var(--surface-hover);
+      border-color: var(--border-strong);
+    }
+
+    .btn-icon:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    /* Floating Row Action Popover Menu */
+    .action-popover {
+      position: fixed;
+      z-index: 80;
+      min-width: 215px;
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      box-shadow: var(--shadow-modal);
+      padding: 5px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .action-popover[hidden] {
+      display: none !important;
+    }
+
+    .popover-meta {
+      padding: 6px 10px 5px;
+      font-size: 0.6875rem;
+      color: var(--text-secondary);
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 2px;
+      white-space: nowrap;
+    }
+
+    .menu-item {
+      appearance: none;
+      width: 100%;
+      border: none;
+      background: transparent;
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 0.8125rem;
+      font-weight: 400;
+      text-align: left;
+      padding: 7px 10px;
+      border-radius: 5px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .menu-item:hover:not(:disabled) {
+      background: var(--surface-subtle);
+    }
+
+    .menu-item:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    .menu-item-danger {
+      color: var(--status-err-fg);
+    }
+
+    .menu-item-danger:hover:not(:disabled),
+    .menu-item-danger[data-confirm="1"] {
+      background: var(--status-err-bg);
+      color: var(--status-err-fg);
+      font-weight: 500;
+    }
+
+    .menu-divider {
+      height: 1px;
+      background: var(--border);
+      margin: 3px 0;
+    }
     /* Empty / Loading / Error Box */
     .state-box {
       padding: 40px 24px;
@@ -931,10 +1022,17 @@
       .btn,
       .btn-row,
       .view-tab,
-      .filter-pill {
+      .filter-pill,
+      .menu-item {
         min-height: 44px;
         padding: 10px 14px;
         white-space: normal;
+      }
+
+      .btn-icon {
+        width: 44px;
+        height: 44px;
+        min-height: 44px;
       }
 
       .check-row {
@@ -968,10 +1066,14 @@
         border-bottom: 1px solid var(--border);
       }
 
-      .acct-table td {
+      .acct-table td,
+      .acct-table td.col-quota,
+      .acct-table td.actions-cell {
         padding: 6px 0;
         border: none;
         text-align: left;
+        width: 100%;
+        min-width: 0;
       }
 
       .acct-table td::before {
@@ -1089,9 +1191,8 @@
               <tr>
                 <th scope="col">Account</th>
                 <th scope="col">Status</th>
-                <th scope="col">Active Quota Window (5h / Weekly)</th>
-                <th scope="col">Traffic &amp; Session</th>
-                <th scope="col" class="col-actions">Order &amp; Actions</th>
+                <th scope="col" class="col-quota">Active Quota Window (5h / Weekly)</th>
+                <th scope="col" class="col-actions">Actions</th>
               </tr>
             </thead>
             <tbody id="accounts-tbody"></tbody>
@@ -1292,6 +1393,9 @@
     </div>
   </div>
 
+  <!-- FLOATING ROW ACTION POPOVER MENU -->
+  <div id="action-popover" class="action-popover" role="menu" hidden></div>
+
   <script>
     (function () {
       const THEME_KEY = 'gsb_ui_theme';
@@ -1417,6 +1521,7 @@
         if (ev.key === 'Escape') {
           if (!importModal.hidden) closeImportModal();
           if (!authModal.hidden) closeAuthModal();
+          closeActionPopover();
         }
       });
 
@@ -1652,9 +1757,9 @@
       }
 
       function renderAccounts(accounts) {
+        closeActionPopover();
         updateFilterCounts(accounts);
         tbodyEl.textContent = '';
-
         if (!Array.isArray(accounts) || accounts.length === 0) {
           tableWrap.hidden = true;
           stateEl.hidden = false;
@@ -1699,7 +1804,8 @@
           if (currentRotateCursor && currentRotateCursor === acct.id) {
             const cur = document.createElement('span');
             cur.className = 'cursor-badge';
-            cur.textContent = 'Active';
+            cur.textContent = 'Current Turn';
+            cur.title = 'Sticky rotation cursor: pool traffic currently routes to this account until its 5h quota window is exhausted, then rotates to the next Ready account.';
             idLine.appendChild(cur);
           }
           tdId.appendChild(idLine);
@@ -1743,36 +1849,23 @@
           tdStatus.appendChild(stWrap);
           tr.appendChild(tdStatus);
 
-          // 3. Rolling 5h Credit Pool
+          // 3. Active Quota Window (5h / Weekly)
           const tdQuota = document.createElement('td');
-          tdQuota.setAttribute('data-label', 'Rolling 5h Credit Pool');
+          tdQuota.className = 'col-quota';
+          tdQuota.setAttribute('data-label', 'Active Quota Window');
           tdQuota.appendChild(renderQuotaCell(acct.quota));
           tr.appendChild(tdQuota);
 
-          // 4. Traffic & Session
-          const tdTraffic = document.createElement('td');
-          tdTraffic.setAttribute('data-label', 'Traffic & Session');
-          tdTraffic.className = 'traffic-cell mono';
-          const l1 = document.createElement('div');
-          l1.className = 'traffic-primary';
-          l1.textContent = (acct.recentRpm || 0) + ' RPM · ' + (acct.totalRequests || 0) + ' reqs';
-          const l2 = document.createElement('div');
-          l2.className = 'traffic-sub';
-          l2.textContent = ((acct.models && acct.models.length) || 0) + ' models · rot ' + formatRelativeTime(acct.rotatedAt);
-          tdTraffic.appendChild(l1);
-          tdTraffic.appendChild(l2);
-          tr.appendChild(tdTraffic);
-
-          // 5. Order & Actions (Single Non-Wrapping Row)
+          // 4. Compact Order & Three-Dots Menu
           const tdAct = document.createElement('td');
-          tdAct.setAttribute('data-label', 'Order & Actions');
+          tdAct.setAttribute('data-label', 'Actions');
           tdAct.className = 'actions-cell';
           const actRow = document.createElement('div');
           actRow.className = 'row-actions';
 
           const btnUp = document.createElement('button');
           btnUp.type = 'button';
-          btnUp.className = 'btn btn-row mono';
+          btnUp.className = 'btn-icon mono';
           btnUp.textContent = '↑';
           btnUp.title = 'Move account higher in priority order';
           btnUp.setAttribute('aria-label', 'Move ' + acct.id + ' up');
@@ -1784,7 +1877,7 @@
 
           const btnDown = document.createElement('button');
           btnDown.type = 'button';
-          btnDown.className = 'btn btn-row mono';
+          btnDown.className = 'btn-icon mono';
           btnDown.textContent = '↓';
           btnDown.title = 'Move account lower in priority order';
           btnDown.setAttribute('aria-label', 'Move ' + acct.id + ' down');
@@ -1794,43 +1887,19 @@
           });
           actRow.appendChild(btnDown);
 
-          const btnProbe = document.createElement('button');
-          btnProbe.type = 'button';
-          btnProbe.className = 'btn btn-row';
-          btnProbe.textContent = 'Refresh';
-          btnProbe.addEventListener('click', function () {
-            runAccountAction(acct.id, 'probe', btnProbe);
+          const btnMore = document.createElement('button');
+          btnMore.type = 'button';
+          btnMore.className = 'btn-icon mono';
+          btnMore.textContent = '⋯';
+          btnMore.title = 'Account actions for ' + acct.id;
+          btnMore.setAttribute('aria-label', 'Actions for ' + acct.id);
+          btnMore.setAttribute('aria-haspopup', 'menu');
+          btnMore.setAttribute('aria-expanded', 'false');
+          btnMore.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            toggleActionPopover(acct, btnMore);
           });
-          actRow.appendChild(btnProbe);
-
-          const btnToggle = document.createElement('button');
-          btnToggle.type = 'button';
-          btnToggle.className = 'btn btn-row';
-          btnToggle.textContent = acct.disabled ? 'Resume' : 'Pause';
-          btnToggle.addEventListener('click', function () {
-            runAccountAction(acct.id, 'toggle', btnToggle);
-          });
-          actRow.appendChild(btnToggle);
-
-          if (acct.quarantined || acct.fails > 0) {
-            const btnUnq = document.createElement('button');
-            btnUnq.type = 'button';
-            btnUnq.className = 'btn btn-row';
-            btnUnq.textContent = acct.quarantined ? 'Unquarantine' : 'Reset Fails';
-            btnUnq.addEventListener('click', function () {
-              runAccountAction(acct.id, 'unquarantine', btnUnq);
-            });
-            actRow.appendChild(btnUnq);
-          }
-
-          const btnDel = document.createElement('button');
-          btnDel.type = 'button';
-          btnDel.className = 'btn btn-row btn-row-danger';
-          btnDel.textContent = 'Remove';
-          btnDel.addEventListener('click', function () {
-            deleteAccount(acct.id, btnDel);
-          });
-          actRow.appendChild(btnDel);
+          actRow.appendChild(btnMore);
 
           tdAct.appendChild(actRow);
           tr.appendChild(tdAct);
@@ -1942,10 +2011,125 @@
         }
       }
 
+      const actionPopover = document.getElementById('action-popover');
+      let activePopoverBtn = null;
+      let activePopoverAcctId = '';
+
+      function closeActionPopover() {
+        if (actionPopover) actionPopover.hidden = true;
+        if (activePopoverBtn) {
+          activePopoverBtn.setAttribute('aria-expanded', 'false');
+          activePopoverBtn = null;
+        }
+        activePopoverAcctId = '';
+      }
+
+      document.addEventListener('click', function (ev) {
+        if (!actionPopover.hidden && !actionPopover.contains(ev.target)) {
+          closeActionPopover();
+        }
+      });
+
+      window.addEventListener('scroll', closeActionPopover, true);
+      window.addEventListener('resize', closeActionPopover);
+
+      function toggleActionPopover(acct, btn) {
+        if (!actionPopover.hidden && activePopoverAcctId === acct.id) {
+          closeActionPopover();
+          return;
+        }
+        closeActionPopover();
+        activePopoverBtn = btn;
+        activePopoverAcctId = acct.id;
+        btn.setAttribute('aria-expanded', 'true');
+
+        actionPopover.textContent = '';
+
+        const meta = document.createElement('div');
+        meta.className = 'popover-meta mono';
+        meta.textContent = acct.id + ' · ' + (acct.totalRequests || 0) + ' reqs · rot ' + formatRelativeTime(acct.rotatedAt);
+        actionPopover.appendChild(meta);
+
+        const itemProbe = document.createElement('button');
+        itemProbe.type = 'button';
+        itemProbe.className = 'menu-item';
+        itemProbe.setAttribute('role', 'menuitem');
+        itemProbe.textContent = 'Refresh Quota & Session';
+        itemProbe.addEventListener('click', function () {
+          closeActionPopover();
+          runAccountAction(acct.id, 'probe', btn);
+        });
+        actionPopover.appendChild(itemProbe);
+
+        const itemToggle = document.createElement('button');
+        itemToggle.type = 'button';
+        itemToggle.className = 'menu-item';
+        itemToggle.setAttribute('role', 'menuitem');
+        itemToggle.textContent = acct.disabled ? 'Resume Account in Pool' : 'Pause Account in Pool';
+        itemToggle.addEventListener('click', function () {
+          closeActionPopover();
+          runAccountAction(acct.id, 'toggle', btn);
+        });
+        actionPopover.appendChild(itemToggle);
+
+        const itemCopy = document.createElement('button');
+        itemCopy.type = 'button';
+        itemCopy.className = 'menu-item';
+        itemCopy.setAttribute('role', 'menuitem');
+        itemCopy.textContent = 'Copy Key (gsb-' + acct.id + ')';
+        itemCopy.addEventListener('click', function () {
+          closeActionPopover();
+          copyToClipboard('gsb-' + acct.id, 'Copied individual API key "gsb-' + acct.id + '".');
+        });
+        actionPopover.appendChild(itemCopy);
+
+        if (acct.quarantined || acct.fails > 0) {
+          const itemUnq = document.createElement('button');
+          itemUnq.type = 'button';
+          itemUnq.className = 'menu-item';
+          itemUnq.setAttribute('role', 'menuitem');
+          itemUnq.textContent = acct.quarantined ? 'Unquarantine Account' : 'Reset Failure Counter';
+          itemUnq.addEventListener('click', function () {
+            closeActionPopover();
+            runAccountAction(acct.id, 'unquarantine', btn);
+          });
+          actionPopover.appendChild(itemUnq);
+        }
+
+        const div = document.createElement('div');
+        div.className = 'menu-divider';
+        actionPopover.appendChild(div);
+
+        const itemDel = document.createElement('button');
+        itemDel.type = 'button';
+        itemDel.className = 'menu-item menu-item-danger';
+        itemDel.setAttribute('role', 'menuitem');
+        itemDel.textContent = 'Remove Account';
+        itemDel.addEventListener('click', function (ev) {
+          ev.stopPropagation();
+          deleteAccount(acct.id, itemDel);
+        });
+        actionPopover.appendChild(itemDel);
+
+        actionPopover.hidden = false;
+        const rect = btn.getBoundingClientRect();
+        const popRect = actionPopover.getBoundingClientRect();
+        let top = rect.bottom + 6;
+        if (top + popRect.height > window.innerHeight - 12) {
+          top = Math.max(12, rect.top - popRect.height - 6);
+        }
+        let left = rect.right - popRect.width;
+        if (left < 12) left = 12;
+        actionPopover.style.top = top + 'px';
+        actionPopover.style.left = left + 'px';
+      }
+
       async function runAccountAction(id, action, btn) {
-        const orig = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = '...';
+        const orig = btn ? btn.textContent : '';
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = '…';
+        }
         try {
           const res = await apiRequest('/v1/admin/accounts/' + encodeURIComponent(id) + '/' + action, { method: 'POST', body: {} });
           if (res.status === 'error' && res.probeError) {
@@ -1959,33 +2143,29 @@
         } catch (err) {
           showBanner('err', 'Account ' + id + ' ' + action + ' failed: ' + err.message);
         } finally {
-          btn.disabled = false;
-          btn.textContent = orig;
+          if (btn && btn.isConnected) {
+            btn.disabled = false;
+            btn.textContent = orig;
+          }
         }
       }
 
       async function deleteAccount(id, btn) {
         if (btn.getAttribute('data-confirm') !== '1') {
           btn.setAttribute('data-confirm', '1');
-          btn.textContent = 'Confirm?';
-          setTimeout(function () {
-            if (btn.isConnected) {
-              btn.removeAttribute('data-confirm');
-              btn.textContent = 'Remove';
-            }
-          }, 4000);
+          btn.textContent = 'Confirm Remove ' + id + '?';
           return;
         }
         btn.disabled = true;
-        btn.textContent = '...';
+        btn.textContent = 'Removing...';
         try {
           await apiRequest('/v1/admin/accounts/' + encodeURIComponent(id), { method: 'DELETE' });
+          closeActionPopover();
           showBanner('ok', 'Removed account ' + id + ' from the pool.');
           await loadAll(false);
         } catch (err) {
+          closeActionPopover();
           showBanner('err', 'Failed to remove account ' + id + ': ' + err.message);
-          btn.disabled = false;
-          btn.textContent = 'Remove';
         }
       }
 
