@@ -19,7 +19,8 @@ var (
 	trailingTagRe         = regexp.MustCompile("(?is)(?:```(?:json|tool_call|tool_calls|function_call|function_calls)?|</?(?:tool_call|tool_calls|function_call|function_calls)>)\\s*$")
 	trailingEnvRe         = regexp.MustCompile(`(?s)\{\s*"\s*(?:tool_calls|toolCalls|tool_call|function_call|function_calls|functionCalls)\s*"[\s\S]*$`)
 	sanitizedPipeRe       = regexp.MustCompile(`<([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s+\|>`)
-	htmlTagRe             = regexp.MustCompile(`<([A-Za-z][A-Za-z0-9:_-]*\s[^>\n]*?)>`)
+	htmlTagRe                       = regexp.MustCompile(`<([A-Za-z][A-Za-z0-9:_-]*\s[^>\n]*?)>`)
+	missingQuoteAfterEscapedQuoteRe = regexp.MustCompile(`^\s*(?:,\s*"[A-Za-z0-9_.-]+"\s*:|\}\s*,\s*"[A-Za-z0-9_.-]+"\s*:|\}\s*\}\s*(?:,\s*\{|\]\s*\}))`)
 )
 
 type candidateSpan struct {
@@ -42,6 +43,12 @@ func hasUnbalancedToolEnvelopeOpener(s string) bool {
 		if len(objs) == 0 || objs[0][0] != 0 || !hasBalancedBracketsOutsideStrings(s[loc[0]:loc[0]+objs[0][1]]) {
 			return true
 		}
+		candSpan := s[loc[0] : loc[0]+objs[0][1]]
+		if isStandaloneSpan(s, loc[0], loc[0]+objs[0][1]) && !strings.Contains(candSpan, "[...]") && !strings.Contains(candSpan, "{...}") {
+			if _, ok := unmarshalCandidateObject(candSpan); !ok {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -55,6 +62,9 @@ func hasBalancedBracketsOutsideStrings(s string) bool {
 		if inStr {
 			if esc {
 				esc = false
+				if ch == '"' && missingQuoteAfterEscapedQuoteRe.MatchString(s[i+1:]) {
+					inStr = false
+				}
 			} else if ch == '\\' {
 				esc = true
 			} else if ch == '"' {
@@ -88,6 +98,9 @@ func findBalancedObjects(s string) [][2]int {
 		if inStr {
 			if esc {
 				esc = false
+				if ch == '"' && missingQuoteAfterEscapedQuoteRe.MatchString(s[i+1:]) {
+					inStr = false
+				}
 			} else if ch == '\\' {
 				esc = true
 			} else if ch == '"' {
@@ -196,6 +209,10 @@ func repairJSONStringEscapes(s string) string {
 				case '"', '\\', '/', 'b', 'f', 'n', 'r', 't':
 					out.WriteByte(ch)
 					out.WriteByte(next)
+					if next == '"' && missingQuoteAfterEscapedQuoteRe.MatchString(s[i+2:]) {
+						out.WriteByte('"')
+						inStr = false
+					}
 					i++
 					continue
 				case 'u':
@@ -479,19 +496,6 @@ func resolveAllowedToolName(name string, allow map[string]map[string]any) string
 	return name
 }
 
-func synthesizeIntentArg(toolName string, args map[string]any) string {
-	if op, ok := args["op"].(string); ok && strings.TrimSpace(op) != "" {
-		return "Running " + toolName + " " + strings.TrimSpace(op)
-	}
-	if p, ok := args["path"].(string); ok && strings.TrimSpace(p) != "" {
-		return "Accessing " + toolName + " path"
-	}
-	if toolName != "" {
-		return "Running " + toolName
-	}
-	return "Executing tool call"
-}
-
 func inferToolNameFromSchema(candArgs map[string]any, allow map[string]map[string]any, prevName string) string {
 	if len(candArgs) == 0 || len(allow) == 0 {
 		return ""
@@ -758,8 +762,6 @@ func normaliseCalls(envelope map[string]any, allow map[string]map[string]any) ([
 					if propMap, ok := props[reqKey].(map[string]any); ok {
 						if defVal, hasDef := propMap["default"]; hasDef && defVal != nil {
 							args[reqKey] = defVal
-						} else if reqKey == "i" && propMap["type"] == "string" && propMap["enum"] == nil && propMap["const"] == nil {
-							args[reqKey] = synthesizeIntentArg(name, args)
 						}
 					}
 				}

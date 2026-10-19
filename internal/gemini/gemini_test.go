@@ -500,3 +500,21 @@ func TestConcurrentStreamCookieGenerationGuard(t *testing.T) {
 		t.Fatalf("stale stream Set-Cookie overwrote newer rotated cookie! got: %s", ac.CookieHeader())
 	}
 }
+
+func TestKoreanInlineThinkingHeaderAndIndonesianCannedErrorReply(t *testing.T) {
+	rawText := " 생각이: Let's mark `Analyze fleet operations` as done and move to `Analyze rush hour`.\n```json\n{\"tool_calls\":[{\"name\":\"todo\",\"arguments\":{\"op\":\"done\"}}]}\n```"
+	cleanText, cleanThoughts := sanitizeCandidateTextAndThoughts(rawText, "", true)
+	if !strings.Contains(cleanThoughts, "Let's mark `Analyze fleet operations` as done") {
+		t.Fatalf("expected inline Korean thinking header routed to thoughts, got thoughts=%q text=%q", cleanThoughts, cleanText)
+	}
+	if !strings.HasPrefix(cleanText, "```json") {
+		t.Fatalf("expected cleanText to start with tool_calls fence, got %q", cleanText)
+	}
+
+	if got := GeminiErrorReply("Saya adalah model bahasa, dan saya tidak dirancang untuk itu."); got == "" {
+		t.Fatal("expected Indonesian canned refusal to be recognized by GeminiErrorReply")
+	}
+	if got := GeminiErrorReply("I'm a language model, and I'm not designed to do that."); got == "" {
+		t.Fatal("expected English canned refusal to be recognized by GeminiErrorReply")
+	}
+}

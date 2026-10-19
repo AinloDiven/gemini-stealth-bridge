@@ -142,3 +142,56 @@ func TestBuildUsageWithCache(t *testing.T) {
 		t.Fatalf("expected prompt_tokens=500, got %v", usage["prompt_tokens"])
 	}
 }
+
+func TestFlattenMessagesContinuationIncludesRequiredToolArgsInReminder(t *testing.T) {
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "todo",
+				"description": "Manage todo items",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"op": map[string]any{"type": "string"},
+						"i":  map[string]any{"type": "string"},
+					},
+					"required": []any{"op", "i"},
+				},
+			},
+		},
+	}
+	messages := []map[string]any{
+		{"role": "user", "content": "start audit"},
+		{"role": "assistant", "content": nil, "tool_calls": []any{
+			map[string]any{
+				"id":   "call_1",
+				"type": "function",
+				"function": map[string]any{
+					"name":      "todo",
+					"arguments": `{"op":"init","i":"Init"}`,
+				},
+			},
+		}},
+		{"role": "tool", "tool_call_id": "call_1", "name": "todo", "content": "ok"},
+	}
+
+	turn1, _, err := FlattenMessages(messages[:1], tools, "auto", FlattenOptions{StartIndex: 0})
+	if err != nil {
+		t.Fatalf("FlattenMessages StartIndex=0 failed: %v", err)
+	}
+	if !strings.Contains(turn1, "# Tool calling") {
+		t.Fatalf("expected full tool instructions on StartIndex=0, got:\n%s", turn1)
+	}
+
+	cont, _, err := FlattenMessages(messages, tools, "auto", FlattenOptions{StartIndex: 2})
+	if err != nil {
+		t.Fatalf("FlattenMessages StartIndex=2 failed: %v", err)
+	}
+	if strings.Contains(cont, "# Tool calling") {
+		t.Fatalf("expected full tool instructions omitted on StartIndex>0, got:\n%s", cont)
+	}
+	if !strings.Contains(cont, "todo(op, i)") {
+		t.Fatalf("expected continuation reminder to include required parameter names todo(op, i), got:\n%s", cont)
+	}
+}

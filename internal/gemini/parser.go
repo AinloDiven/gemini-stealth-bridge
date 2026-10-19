@@ -49,6 +49,14 @@ var (
 		"i encountered an error doing what you asked.",
 		"i encountered an error while doing what you asked.",
 		"i ran into an error while doing what you asked.",
+		"i'm a language model, and i'm not designed to do that.",
+		"i am a language model, and i am not designed to do that.",
+		"i'm just a language model, so i can't help with that.",
+		"i am just a language model, so i cannot help with that.",
+		"saya adalah model bahasa, dan saya tidak dirancang untuk itu.",
+		"saya hanya model bahasa, jadi saya tidak bisa membantu terkait hal itu.",
+		"maaf, ada yang salah. silakan coba lagi.",
+		"maaf, terjadi kesalahan. silakan coba lagi.",
 	}
 	geminiErrorReplyAnywhere = []string{
 		"i encountered an error doing what you asked",
@@ -58,6 +66,7 @@ var (
 		"i am having a hard time fulfilling your request",
 		"i seem to be encountering an error",
 		"i seem to be having trouble",
+		"saya adalah model bahasa, dan saya tidak dirancang untuk itu",
 	}
 	hex16Re                 = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
 	googleUserContentRe     = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
@@ -72,9 +81,9 @@ var (
 			"(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning|" +
 			"思考过程|思考過程|思维链|思維鏈|推理过程|推理過程|内部推理|內部推理|思考|" +
 			"思考プロセス|推論プロセス|" +
-			"생각\\s*과정|추론\\s*과정|" +
+			"생각\\s*과정|추론\\s*과정|생각이|생각|" +
 			"quá\\s+trình\\s+suy\\s+nghĩ)" +
-			"(?:\\*\\*|__)?\\s*[:：]?(?:\\*\\*|__)?[ \\t]*\\r?\\n+",
+			"(?:(?:\\*\\*|__)?\\s*[:：](?:\\*\\*|__)?[ \\t]*(?:\\r?\\n+)?|(?:\\*\\*|__)?[ \\t]*\\r?\\n+)",
 	)
 	fencedToolStartRe   = regexp.MustCompile("(?is)```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*(?:\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls|name|tool|tool_name|function)\\s*\"\\s*:|\\[\\s*\\{\\s*\"\\s*(?:name|tool|tool_name|function)\\s*\"\\s*:)")
 	xmlToolStartRe      = regexp.MustCompile("(?is)<(?:tool_call|tool_calls|function_call|function_calls)\\b")
@@ -265,7 +274,7 @@ func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string,
 			"internal reasoning:", "**internal reasoning",
 			"思考过程：", "思考过程:", "**思考过程", "### 思考过程",
 			"思考過程：", "思维链：", "推理过程：", "思考：",
-			"思考プロセス：", "생각 과정:", "💭", "🧠",
+			"思考プロセス：", "생각 과정:", "생각이:", "생각:", "💭", "🧠",
 			"[harness reminder:", "[tool reminder:", "assistant:",
 		} {
 			if len(lowerTrimmed) < len(prefix) && strings.HasPrefix(prefix, lowerTrimmed) {

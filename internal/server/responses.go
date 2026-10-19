@@ -864,7 +864,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							sentText = text
 						}
 					} else if stream && buffered && ctx.Err() == nil && !done {
-						if sentText != "" && !strings.HasPrefix(text, sentText) {
+						if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
 						// Thoughts are normalized monotonically via mergeStreamedThoughts.
@@ -952,24 +952,28 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					s.refreshQuotaAsync(account, c)
 				}
 			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 				s.deleteSessionCache(cacheKey)
 				cacheKey = ""
 			}
 
-			// Headers, reasoning, or text already shown to the client commit the
-			// response; a retry would duplicate or contradict it.
+			payloadCommitted := func() bool {
+				return sentText != "" || messageAdded
+			}
 			responseCommitted := func() bool {
 				streamMu.Lock()
 				headers := headersSent
 				streamMu.Unlock()
-				return headers || sentText != "" || sentThought != ""
+				return headers || payloadCommitted() || sentThought != ""
 			}
+			inStreamRetryable := (errCode == "tool_call_error" ||
+				errCode == "upstream_error_reply" ||
+				errCode == "empty_upstream_response" ||
+				errCode == "incomplete_upstream_response") && !payloadCommitted()
 			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
 				(retryDeadline.IsZero() || time.Now().Before(retryDeadline)) &&
-				!responseCommitted() && ctx.Err() == nil &&
+				(!responseCommitted() || inStreamRetryable) && ctx.Err() == nil &&
 				errCode != "account_banned"
-
 			if canRetryMore {
 				if errCode == "session_busy" {
 					lastRetryReason = "session_busy"
@@ -1076,6 +1080,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					}
 				}
 				if errCode == "upstream_transport_error" ||
+					errCode == "upstream_error" ||
 					errCode == "incomplete_upstream_response" ||
 					errCode == "tool_call_error" {
 					lastRetryReason = errCode
@@ -1086,6 +1091,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					opts.Metadata = nil
 					opts.Files = nil
 					curPrompt = fullPrompt
+					if errCode == "tool_call_error" {
+						curPrompt = appendToolErrorCorrection(fullPrompt, runCheck.Error())
+					}
 					attachmentParts = fullAttachmentParts
 					continue
 				}
@@ -1283,8 +1291,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				nextOutIdx = 1
 			}
 			if contentStr != "" || len(oaCalls) == 0 {
-				if len(contentStr) > len(sentText) {
-					emitTextDelta(contentStr[len(sentText):])
+				if tail, ok := remainingStreamTail(contentStr, sentText); ok && tail != "" {
+					emitTextDelta(tail)
 				} else if !messageAdded {
 					emitTextDelta("")
 				}

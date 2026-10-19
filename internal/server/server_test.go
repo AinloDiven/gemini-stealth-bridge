@@ -2310,3 +2310,114 @@ func TestResponsesCanonicalizesAssistantFunctionCallTurn(t *testing.T) {
 		t.Fatalf("call id changed: %#v", call)
 	}
 }
+
+func TestStreamingToolCallErrorRetriesInStreamAndAppendsCorrection(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.MaxAttempts = 3
+	srv.Cfg.MaxUpstreamAttempts = 3
+
+	var calls atomic.Int32
+	var secondPrompt string
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, promptStr string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			n := calls.Add(1)
+			if n == 1 {
+				// Frame 1: verified model identity commits SSE 200 OK headers, but no text/tool delta is emitted yet.
+				_ = onFrame(&gemini.LineParseResult{
+					CID: "c1", RID: "r1", AnsweredModelID: testModel.ModelID,
+					Frames: []gemini.Frame{makeFrame("```json\n{\"tool_calls\":[{\"name\":\"read_file\"", "thinking attempt 1", false, testModel.ModelID)},
+				})
+				// Frame 2 (done): missing required "path" property -> triggers tool_call_error
+				_ = onFrame(&gemini.LineParseResult{
+					CID: "c1", RID: "r1", ContextToken: "ctx1", AnsweredModelID: testModel.ModelID,
+					Frames: []gemini.Frame{makeFrame("```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{}}]}\n```", "thinking attempt 1", true, testModel.ModelID)},
+				})
+				return &gemini.StreamResponse{Status: 200, CID: "c1", RID: "r1"}, nil
+			}
+			secondPrompt = promptStr
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c2", RID: "r2", ContextToken: "ctx2", AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{makeFrame("```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/fixed.txt\"}}]}\n```", "thinking attempt 2", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200, CID: "c2", RID: "r2"}, nil
+		},
+	}
+
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "read_file",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string"},
+					},
+					"required": []any{"path"},
+				},
+			},
+		},
+	}
+	rec := runChat(t, srv, acct, client, map[string]any{
+		"stream": true,
+		"tools":  tools,
+	})
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 upstream attempts for in-stream tool_call_error recovery, got %d (body=%s)", calls.Load(), rec.Body.String())
+	}
+	if !strings.Contains(secondPrompt, "[System correction:") || !strings.Contains(secondPrompt, "missing required property") {
+		t.Fatalf("expected retry prompt to include system correction, got:\n%s", secondPrompt)
+	}
+	if !strings.Contains(rec.Body.String(), `/tmp/fixed.txt`) || !strings.Contains(rec.Body.String(), `"finish_reason":"tool_calls"`) {
+		t.Fatalf("expected recovered tool_calls in SSE stream, got:\n%s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "thinking attempt 2") {
+		t.Fatalf("expected retry attempt not to concatenate duplicate reasoning onto already streamed reasoning, got:\n%s", rec.Body.String())
+	}
+}
+
+func TestStreamedPreambleWithLeadingWhitespaceDoesNotTriggerFalseUpstreamRevision(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.KeepToolPreamble = true
+	longPreamble := " " + strings.Repeat("Analyzing transit headway and corridor speed bottlenecks. ", 8)
+	toolBlock := "\n\n```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/data.db\"}}]}\n```"
+
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, promptStr string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c1", RID: "r1", AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{makeFrame(longPreamble, "", false, testModel.ModelID)},
+			})
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c1", RID: "r1", ContextToken: "ctx1", AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{makeFrame(longPreamble+toolBlock, "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200, CID: "c1", RID: "r1"}, nil
+		},
+	}
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "read_file",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"path": map[string]any{"type": "string"},
+					},
+					"required": []any{"path"},
+				},
+			},
+		},
+	}
+	rec := runChat(t, srv, acct, client, map[string]any{
+		"stream": true,
+		"tools":  tools,
+	})
+	if strings.Contains(rec.Body.String(), "upstream_revision") {
+		t.Fatalf("unexpected false upstream_revision on leading-space preamble:\n%s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `/tmp/data.db`) || !strings.Contains(rec.Body.String(), `"finish_reason":"tool_calls"`) {
+		t.Fatalf("expected tool_calls completion, got:\n%s", rec.Body.String())
+	}
+}

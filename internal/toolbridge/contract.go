@@ -314,6 +314,18 @@ func BuildToolInstructions(tools any, toolChoice any) (string, error) {
 
 // BuildToolReminder renders the footer reminder placed right before Assistant:.
 func BuildToolReminder(tools any, toolChoice any) (string, error) {
+	return buildToolReminder(tools, toolChoice, false)
+}
+
+// BuildContinuationToolReminder renders the footer reminder for continuation
+// turns (StartIndex > 0) where the full BuildToolInstructions block is omitted.
+// It always includes required parameter names so smaller models do not forget
+// mandatory schema properties on turn 2+.
+func BuildContinuationToolReminder(tools any, toolChoice any) (string, error) {
+	return buildToolReminder(tools, toolChoice, true)
+}
+
+func buildToolReminder(tools any, toolChoice any, forceRequiredArgs bool) (string, error) {
 	contract, err := ValidateToolRequest(tools, toolChoice)
 	if err != nil {
 		return "", err
@@ -325,18 +337,19 @@ func BuildToolReminder(tools any, toolChoice any) (string, error) {
 	compactOn, _ := getCompactOptions()
 	summaries := make([]string, 0, len(contract.Tools))
 	for _, d := range contract.Tools {
-		if compactOn {
+		if compactOn && !forceRequiredArgs {
 			summaries = append(summaries, d.Name)
 			continue
 		}
 		reqList := extractStringSlice(d.Parameters["required"])
 		if len(reqList) > 0 {
 			summaries = append(summaries, fmt.Sprintf("%s(%s)", d.Name, strings.Join(reqList, ", ")))
+		} else if compactOn {
+			summaries = append(summaries, d.Name)
 		} else {
 			summaries = append(summaries, d.Name+"()")
 		}
 	}
-
 	lines := []string{
 		fmt.Sprintf("[Tool reminder: Available tools: %s.", strings.Join(summaries, ", ")),
 		"JSON tool calls (`{\"tool_calls\":[{\"name\":\"<tool>\",\"arguments\":{...}}]}`) are plain-text JSON replies to the caller and remain available on every turn.",

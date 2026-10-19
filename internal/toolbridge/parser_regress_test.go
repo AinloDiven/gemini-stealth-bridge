@@ -134,22 +134,55 @@ func TestRedundantClosingBracesInToolEnvelope(t *testing.T) {
 	}
 }
 
-func TestMissingRequiredIntentPropertySynthesizedOrMerged(t *testing.T) {
-	// 1. Model completely omits "i" on todo
-	res1, err := InterpretReply(`{"tool_calls":[{"name":"todo","arguments":{"op":"init","items":["Audit database"]}}]}`, sampleReproTools(), "auto")
+func TestTopLevelToolArgumentsMergedIntoArgumentsObject(t *testing.T) {
+	// 1. Model puts required schema properties at the top level of the tool call object alongside "arguments"
+	res1, err := InterpretReply(`{"tool_calls":[{"name":"todo","i":"Initializing audit tasks","arguments":{"op":"init","items":["Audit database"]}}]}`, sampleReproTools(), "auto")
 	if err != nil {
-		t.Fatalf("expected missing 'i' to be synthesized for todo, got err: %v", err)
+		t.Fatalf("expected top-level schema property to merge into arguments, got err: %v", err)
 	}
-	if res1 == nil || len(res1.Calls) != 1 || res1.Calls[0].Arguments["i"] != "Running todo init" {
-		t.Fatalf("expected synthesized 'i' = 'Running todo init', got %+v", res1)
+	if res1 == nil || len(res1.Calls) != 1 || res1.Calls[0].Arguments["i"] != "Initializing audit tasks" {
+		t.Fatalf("expected merged 'i' = 'Initializing audit tasks', got %+v", res1)
 	}
 
-	// 2. Model puts "i" at top level of tool call object alongside "arguments"
-	res2, err := InterpretReply(`{"tool_calls":[{"name":"todo","i":"Initializing audit tasks","arguments":{"op":"init","items":["Audit database"]}}]}`, sampleReproTools(), "auto")
-	if err != nil {
-		t.Fatalf("expected top-level 'i' to merge into arguments, got err: %v", err)
+	// 2. When a required property is genuinely missing everywhere, validation must still reject with tool_call_error
+	_, err = InterpretReply(`{"tool_calls":[{"name":"todo","arguments":{"op":"init","items":["Audit database"]}}]}`, sampleReproTools(), "auto")
+	if err == nil || !strings.Contains(err.Error(), "violate the tool schema") {
+		t.Fatalf("expected missing required property to return schema violation error, got: %v", err)
 	}
-	if res2 == nil || len(res2.Calls) != 1 || res2.Calls[0].Arguments["i"] != "Initializing audit tasks" {
-		t.Fatalf("expected merged 'i' = 'Initializing audit tasks', got %+v", res2)
+}
+
+func TestMissingClosingQuoteAfterEscapedQuoteInToolEnvelope(t *testing.T) {
+	// Exact malformed envelope produced by gemini-flash-lite in OpenCode session ses_eada53788ffejfflU7vYDhB2x0:
+	// Note `\"},"name":"bash"}` at the end of the first command string (missing closing `"` after `\"`).
+	raw := "```json\n{\"tool_calls\":[{\"arguments\":{\"command\":\"python3 -c \\\"import sqlite3; conn = sqlite3.connect('transpadang_unified.db'); print(conn.execute('SELECT koridor, COUNT(DISTINCT bus), COUNT(*) FROM positions GROUP BY koridor').fetchall())\\\",\"i\":\"Count buses\"},\"name\":\"bash\"},{\"arguments\":{\"command\":\"python3 -c \\\"import sqlite3, json; conn = sqlite3.connect('transpadang_unified.db'); print(conn.execute('SELECT payload FROM halte_snapshots LIMIT 1').fetchone())\\\"\",\"i\":\"Sample halte\"},\"name\":\"bash\"}]}\n```"
+	res, err := InterpretReply(raw, sampleReproTools(), "auto")
+	if err != nil {
+		t.Fatalf("expected missing closing quote after escaped quote to be repaired, got err: %v", err)
+	}
+	if res == nil || len(res.Calls) != 2 {
+		t.Fatalf("expected 2 repaired bash tool calls, got %+v", res)
+	}
+
+	// Also test when `\"},` is immediately before `"name"` (arguments object closes right after command):
+	toolsNoIntent := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "shell",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"command": map[string]any{"type": "string"}},
+					"required":   []any{"command"},
+				},
+			},
+		},
+	}
+	openCodeRaw := "```json\n{\"tool_calls\":[{\"arguments\":{\"command\":\"python3 -c \\\"import sqlite3; conn = sqlite3.connect('transpadang_unified.db'); print(conn.execute('SELECT koridor, COUNT(DISTINCT bus), COUNT(*) FROM positions GROUP BY koridor').fetchall())\\\"},\"name\":\"shell\"},{\"arguments\":{\"command\":\"python3 -c \\\"import sqlite3, json; conn = sqlite3.connect('transpadang_unified.db'); print(conn.execute('SELECT payload FROM halte_snapshots LIMIT 1').fetchone())\\\"\"},\"name\":\"shell\"}]}\n```"
+	res2, err := InterpretReply(openCodeRaw, toolsNoIntent, "auto")
+	if err != nil {
+		t.Fatalf("expected OpenCode payload to repair and parse, got err: %v", err)
+	}
+	if res2 == nil || len(res2.Calls) != 2 || res2.Calls[0].Name != "shell" || res2.Calls[1].Name != "shell" {
+		t.Fatalf("expected 2 shell calls from OpenCode payload, got %+v", res2)
 	}
 }

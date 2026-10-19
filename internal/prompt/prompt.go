@@ -509,7 +509,11 @@ func FlattenMessagesWithStats(
 
 	reminder := ""
 	if hasTools {
-		reminder, _ = toolbridge.BuildToolReminder(tools, toolChoice)
+		if opts.StartIndex > 0 {
+			reminder, _ = toolbridge.BuildContinuationToolReminder(tools, toolChoice)
+		} else {
+			reminder, _ = toolbridge.BuildToolReminder(tools, toolChoice)
+		}
 	}
 	footer := ""
 	if reminder != "" {

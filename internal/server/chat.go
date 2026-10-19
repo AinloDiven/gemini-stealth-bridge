@@ -310,6 +310,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	triedAccounts := map[string]bool{account.ID: true}
 	freshSocketNext := false
 	rebootstrapNext := false
+	priorAttemptSentThought := false
 	for attempt := range maxAttempts {
 		curAttempt = attempt
 		var (
@@ -347,8 +348,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					preambleFlushed = true
 					if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
 						if s.Cfg.KeepToolPreamble {
-							if len(pre) > len(sentText) && strings.HasPrefix(pre, sentText) {
-								emit(sseDeltaContent{Content: pre[len(sentText):]}, nil, nil)
+							if tail, ok := remainingStreamTail(pre, sentText); ok && tail != "" {
+								emit(sseDeltaContent{Content: tail}, nil, nil)
 								sentText = pre
 							}
 						} else if s.Cfg.LiveThoughts {
@@ -356,7 +357,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 					}
 				}
-				if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
+				if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 					emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
 					sentThought = thoughts
 				}
@@ -452,7 +453,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 							}
 						}
 					} else if stream && buffered && ctx.Err() == nil && !done {
-						if sentText != "" && !strings.HasPrefix(text, sentText) {
+						if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
 						// Hold all model output until the requested identity is verified.
@@ -466,7 +467,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 									thoughts = appendPreambleToThoughts(thoughts, pre)
 								}
 							}
-							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
+							if !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 								startStream(false)
 								emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
 								sentThought = thoughts
@@ -553,25 +554,34 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					s.refreshQuotaAsync(account, c)
 				}
 			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 				s.deleteSessionCache(cacheKey)
 				cacheKey = ""
 			}
 
-			// Headers, reasoning, text, or tool-call deltas already shown to the
-			// client commit the response; a retry would duplicate or contradict it.
+			// Content or tool-call deltas already shown to the client commit the
+			// answer payload; a retry would duplicate or contradict it.
+			payloadCommitted := func() bool {
+				return sentText != "" || (toolStreamer != nil && toolStreamer.SentAny())
+			}
 			responseCommitted := func() bool {
 				streamMu.Lock()
 				headers := headersSent
 				streamMu.Unlock()
-				return headers || sentText != "" || sentThought != "" || (toolStreamer != nil && toolStreamer.SentAny())
+				return headers || payloadCommitted() || sentThought != ""
 			}
+			inStreamRetryable := (errCode == "tool_call_error" ||
+				errCode == "upstream_error_reply" ||
+				errCode == "empty_upstream_response" ||
+				errCode == "incomplete_upstream_response") && !payloadCommitted()
 			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
 				(retryDeadline.IsZero() || time.Now().Before(retryDeadline)) &&
-				!responseCommitted() && ctx.Err() == nil &&
+				(!responseCommitted() || inStreamRetryable) && ctx.Err() == nil &&
 				errCode != "account_banned"
-
 			if canRetryMore {
+				if sentThought != "" {
+					priorAttemptSentThought = true
+				}
 				if errCode == "session_busy" {
 					lastRetryReason = "session_busy"
 					if scope.AccountID == "" {
@@ -677,6 +687,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 				}
 				if errCode == "upstream_transport_error" ||
+					errCode == "upstream_error" ||
 					errCode == "incomplete_upstream_response" ||
 					errCode == "tool_call_error" {
 					lastRetryReason = errCode
@@ -687,6 +698,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					opts.Metadata = nil
 					opts.Files = nil
 					curPrompt = fullPrompt
+					if errCode == "tool_call_error" {
+						curPrompt = appendToolErrorCorrection(fullPrompt, runCheck.Error())
+					}
 					attachmentParts = fullAttachmentParts
 					continue
 				}
@@ -821,13 +835,15 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			if stream && buffered {
 				startStream(false)
 				if toolStreamer == nil || !toolStreamer.SentAny() {
-					if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
+					if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 						emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
 						sentThought = thoughts
 					}
-					if contentStr, ok := content.(string); ok && len(contentStr) > len(sentText) && strings.HasPrefix(contentStr, sentText) {
-						emit(sseDeltaContent{Content: contentStr[len(sentText):]}, nil, nil)
-						sentText = contentStr
+					if contentStr, ok := content.(string); ok {
+						if tail, ok := remainingStreamTail(contentStr, sentText); ok && tail != "" {
+							emit(sseDeltaContent{Content: tail}, nil, nil)
+							sentText = contentStr
+						}
 					}
 				}
 				if toolStreamer != nil {
@@ -857,13 +873,15 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		if stream {
 			startStream(false)
 			if buffered && len(calls) == 0 {
-				if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
+				if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 					emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
 					sentThought = thoughts
 				}
-				if contentStr, ok := content.(string); ok && len(contentStr) > len(sentText) && strings.HasPrefix(contentStr, sentText) {
-					emit(sseDeltaContent{Content: contentStr[len(sentText):]}, nil, nil)
-					sentText = contentStr
+				if contentStr, ok := content.(string); ok {
+					if tail, ok := remainingStreamTail(contentStr, sentText); ok && tail != "" {
+						emit(sseDeltaContent{Content: tail}, nil, nil)
+						sentText = contentStr
+					}
 				}
 			}
 			if served != nil && servedID != model.ModelID {
@@ -1036,7 +1054,7 @@ func (s *Server) evaluateAttemptCompletion(
 	if s.Cfg.RejectDowngrade && servedID == "" {
 		return nil, transport.NewUpstreamError("upstream did not identify the served model", 502, "model_identity_unknown", nil, nil)
 	}
-	if sentText != "" && !strings.HasPrefix(text, sentText) {
+	if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {
 		return nil, transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 	}
 
@@ -1047,11 +1065,45 @@ func (s *Server) evaluateAttemptCompletion(
 		if err != nil {
 			return nil, err
 		}
-		if sentText != "" && interpreted != nil && len(interpreted.Calls) > 0 && !strings.HasPrefix(interpreted.Text, sentText) {
+		if sentText != "" && interpreted != nil && len(interpreted.Calls) > 0 && !hasCompatibleStreamPrefix(interpreted.Text, sentText) {
 			return nil, transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 		}
 	}
 	return interpreted, nil
+}
+
+func remainingStreamTail(full, sent string) (string, bool) {
+	if sent == "" {
+		return full, true
+	}
+	if strings.HasPrefix(full, sent) {
+		return full[len(sent):], true
+	}
+	fullTrimLeft := strings.TrimLeft(full, " \t\r\n")
+	sentTrimLeft := strings.TrimLeft(sent, " \t\r\n")
+	if strings.HasPrefix(fullTrimLeft, sentTrimLeft) {
+		return fullTrimLeft[len(sentTrimLeft):], true
+	}
+	fullTrimBoth := strings.TrimRight(fullTrimLeft, " \t\r\n")
+	sentTrimBoth := strings.TrimRight(sentTrimLeft, " \t\r\n")
+	if fullTrimBoth != "" && fullTrimBoth == sentTrimBoth {
+		return "", true
+	}
+	return "", false
+}
+
+func hasCompatibleStreamPrefix(full, sent string) bool {
+	_, ok := remainingStreamTail(full, sent)
+	return ok
+}
+
+func appendToolErrorCorrection(fullPrompt, errMsg string) string {
+	note := fmt.Sprintf("[System correction: Your previous reply failed tool validation (%s). Output ONLY a valid JSON ```json {\"tool_calls\":[...]} ``` block with all required schema properties.]", strings.TrimSpace(errMsg))
+	const suffix = "\n\nAssistant:"
+	if strings.HasSuffix(fullPrompt, suffix) {
+		return fullPrompt[:len(fullPrompt)-len(suffix)] + "\n\n" + note + suffix
+	}
+	return fullPrompt + "\n\n" + note
 }
 
 func (s *Server) computeChatUsage(

@@ -401,11 +401,11 @@ func (sc *StealthClient) Do(ctx context.Context, opts RequestOptions) (*Response
 		n, rerr := resp.Body.Read(readBuf)
 		if n > 0 {
 			chunkStr := string(readBuf[:n])
-			if fbTimer != nil {
-				fbTimer.Stop()
-			}
 			if streaming {
 				if !isHeartbeatOrLengthChunk(chunkStr) {
+					if fbTimer != nil {
+						fbTimer.Stop()
+					}
 					if ttfbMs < 0 {
 						ttfbMs = time.Since(sendAt).Milliseconds()
 					}

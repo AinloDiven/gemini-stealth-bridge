@@ -709,6 +709,9 @@ func findSingleBalancedObjectEnd(s string, start int) int {
 		if inStr {
 			if escaped {
 				escaped = false
+				if ch == '"' && missingQuoteAfterEscapedQuoteRe.MatchString(s[i+1:]) {
+					inStr = false
+				}
 			} else if ch == '\\' {
 				escaped = true
 			} else if ch == '"' {
