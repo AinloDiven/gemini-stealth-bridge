@@ -121,7 +121,7 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 				role, _ := item["role"].(string)
 
 				switch itemType {
-				case "function_call":
+				case "function_call", "custom_tool_call":
 					callID, _ := item["call_id"].(string)
 					if callID == "" {
 						callID, _ = item["id"].(string)
@@ -134,7 +134,11 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 						callIDToName[callID] = name
 					}
 					argsStr := "{}"
-					if a, ok := item["arguments"].(string); ok && a != "" {
+					if itemType == "custom_tool_call" {
+						inStr, _ := item["input"].(string)
+						b, _ := json.Marshal(map[string]any{"input": inStr})
+						argsStr = string(b)
+					} else if a, ok := item["arguments"].(string); ok && a != "" {
 						argsStr = a
 					} else if aObj, ok := item["arguments"].(map[string]any); ok {
 						b, _ := json.Marshal(aObj)
@@ -150,7 +154,7 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 					})
 					continue
 
-				case "function_call_output":
+				case "function_call_output", "custom_tool_call_output":
 					flushPendingAssistant()
 					callID, _ := item["call_id"].(string)
 					if callID == "" {
@@ -177,7 +181,6 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 						"content":      outStr,
 					})
 					continue
-
 				case "reasoning":
 					if pendingAssistant != nil {
 						flushPendingAssistant()
@@ -350,43 +353,117 @@ func normalizeResponsesContentParts(raw any) any {
 }
 
 func normalizeResponsesTools(raw any) any {
+	out, _, _ := normalizeResponsesToolsWithMeta(raw)
+	return out
+}
+
+func normalizeResponsesToolsWithMeta(raw any) (normalized any, customTools map[string]bool, namespaceOf map[string]string) {
 	arr, ok := raw.([]any)
 	if !ok {
-		return raw
+		return raw, nil, nil
 	}
+	customTools = make(map[string]bool)
+	namespaceOf = make(map[string]string)
 	out := make([]any, 0, len(arr))
-	for _, tAny := range arr {
-		tMap, ok := tAny.(map[string]any)
-		if !ok || tMap == nil {
-			out = append(out, tAny)
-			continue
-		}
-		if _, hasFn := tMap["function"].(map[string]any); hasFn {
+	var visit func(items []any, ns string)
+	visit = func(items []any, ns string) {
+		for _, tAny := range items {
+			tMap, ok := tAny.(map[string]any)
+			if !ok || tMap == nil {
+				out = append(out, tAny)
+				continue
+			}
+			tType, _ := tMap["type"].(string)
+			if tType == "namespace" {
+				nsName, _ := tMap["name"].(string)
+				if subTools, ok := tMap["tools"].([]any); ok {
+					visit(subTools, nsName)
+				}
+				continue
+			}
+			if fnSub, hasFn := tMap["function"].(map[string]any); hasFn && fnSub != nil {
+				if fnName, _ := fnSub["name"].(string); fnName != "" && ns != "" {
+					namespaceOf[fnName] = ns
+				}
+				if tType == "custom" {
+					if fnName, _ := fnSub["name"].(string); fnName != "" {
+						customTools[fnName] = true
+					}
+				}
+				out = append(out, tMap)
+				continue
+			}
+			name, _ := tMap["name"].(string)
+			if name == "" && tType == "local_shell" {
+				name = "local_shell"
+			}
+			if name != "" {
+				if ns != "" {
+					namespaceOf[name] = ns
+				}
+				fnObj := map[string]any{
+					"name": name,
+				}
+				if desc, ok := tMap["description"].(string); ok {
+					fnObj["description"] = desc
+				} else if tType == "local_shell" {
+					fnObj["description"] = "Execute a shell command in the local workspace."
+				}
+				if params, exists := tMap["parameters"]; exists {
+					fnObj["parameters"] = params
+				} else if schema, exists := tMap["input_schema"]; exists {
+					fnObj["input_schema"] = schema
+				} else if tType == "custom" {
+					customTools[name] = true
+					fnObj["parameters"] = map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"input": map[string]any{
+								"type":        "string",
+								"description": "Raw input string for " + name + ".",
+							},
+						},
+						"required": []any{"input"},
+					}
+				} else if tType == "local_shell" {
+					fnObj["parameters"] = map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"command": map[string]any{
+								"type":        "array",
+								"items":       map[string]any{"type": "string"},
+								"description": "Command and arguments to execute.",
+							},
+						},
+						"required": []any{"command"},
+					}
+				}
+				out = append(out, map[string]any{
+					"type":     "function",
+					"function": fnObj,
+				})
+				continue
+			}
 			out = append(out, tMap)
-			continue
 		}
-		name, _ := tMap["name"].(string)
-		if name != "" {
-			fnObj := map[string]any{
-				"name": name,
-			}
-			if desc, ok := tMap["description"].(string); ok {
-				fnObj["description"] = desc
-			}
-			if params, exists := tMap["parameters"]; exists {
-				fnObj["parameters"] = params
-			} else if schema, exists := tMap["input_schema"]; exists {
-				fnObj["input_schema"] = schema
-			}
-			out = append(out, map[string]any{
-				"type":     "function",
-				"function": fnObj,
-			})
-			continue
-		}
-		out = append(out, tMap)
 	}
-	return out
+	visit(arr, "")
+	return out, customTools, namespaceOf
+}
+
+func extractCustomToolInput(argsJSON string) string {
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &parsed); err == nil && parsed != nil {
+		if s, ok := parsed["input"].(string); ok {
+			return s
+		}
+		for _, v := range parsed {
+			if s, ok := v.(string); ok {
+				return s
+			}
+		}
+	}
+	return argsJSON
 }
 
 func normalizeResponsesToolChoice(raw any) any {
@@ -456,13 +533,12 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			return
 		}
 	}
-
+	_, customTools, namespaceOf := normalizeResponsesToolsWithMeta(body["tools"])
 	messages, toolsRaw, toolChoiceRaw, normErr := NormalizeResponsesInput(body)
 	if normErr != nil {
 		sendChatError(w, false, normErr)
 		return
 	}
-
 	reqStartedAt := time.Now()
 	prep, prepErr := s.prepareGeneration(ctx, body, scope, messages, toolsRaw, toolChoiceRaw)
 	prepareMs := time.Since(reqStartedAt).Milliseconds()
@@ -1310,14 +1386,33 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		for idx, tc := range oaCalls {
 			fcID := fmt.Sprintf("fc_%s_%d", randomHex(4), idx+1)
 			fcIDs[idx] = fcID
-			outputItems = append(outputItems, map[string]any{
+			if customTools[tc.Function.Name] {
+				item := map[string]any{
+					"id":      fcID,
+					"type":    "custom_tool_call",
+					"call_id": tc.ID,
+					"name":    tc.Function.Name,
+					"input":   extractCustomToolInput(tc.Function.Arguments),
+					"status":  "completed",
+				}
+				if ns := namespaceOf[tc.Function.Name]; ns != "" {
+					item["namespace"] = ns
+				}
+				outputItems = append(outputItems, item)
+				continue
+			}
+			item := map[string]any{
 				"id":        fcID,
 				"type":      "function_call",
 				"call_id":   tc.ID,
 				"name":      tc.Function.Name,
 				"arguments": tc.Function.Arguments,
 				"status":    "completed",
-			})
+			}
+			if ns := namespaceOf[tc.Function.Name]; ns != "" {
+				item["namespace"] = ns
+			}
+			outputItems = append(outputItems, item)
 		}
 
 		if stream {
@@ -1387,6 +1482,50 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			for idx, tc := range oaCalls {
 				fcID := fcIDs[idx]
 				fcOutIdx := nextOutIdx + idx
+				ns := namespaceOf[tc.Function.Name]
+				if customTools[tc.Function.Name] {
+					rawIn := extractCustomToolInput(tc.Function.Arguments)
+					doneItem := map[string]any{
+						"id":      fcID,
+						"type":    "custom_tool_call",
+						"call_id": tc.ID,
+						"name":    tc.Function.Name,
+						"input":   rawIn,
+						"status":  "completed",
+					}
+					addedItem := map[string]any{
+						"id":      fcID,
+						"type":    "custom_tool_call",
+						"call_id": tc.ID,
+						"name":    tc.Function.Name,
+						"input":   "",
+						"status":  "in_progress",
+					}
+					if ns != "" {
+						doneItem["namespace"] = ns
+						addedItem["namespace"] = ns
+					}
+					emitSSE("response.output_item.added", map[string]any{
+						"output_index": fcOutIdx,
+						"item":         addedItem,
+					})
+					markMeaningfulOutput(&firstToolMs)
+					emitSSE("response.custom_tool_call_input.delta", map[string]any{
+						"item_id":      fcID,
+						"output_index": fcOutIdx,
+						"delta":        rawIn,
+					})
+					emitSSE("response.custom_tool_call_input.done", map[string]any{
+						"item_id":      fcID,
+						"output_index": fcOutIdx,
+						"input":        rawIn,
+					})
+					emitSSE("response.output_item.done", map[string]any{
+						"output_index": fcOutIdx,
+						"item":         doneItem,
+					})
+					continue
+				}
 				doneItem := map[string]any{
 					"id":        fcID,
 					"type":      "function_call",
@@ -1395,16 +1534,21 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					"arguments": tc.Function.Arguments,
 					"status":    "completed",
 				}
+				addedItem := map[string]any{
+					"id":        fcID,
+					"type":      "function_call",
+					"call_id":   tc.ID,
+					"name":      tc.Function.Name,
+					"arguments": "",
+					"status":    "in_progress",
+				}
+				if ns != "" {
+					doneItem["namespace"] = ns
+					addedItem["namespace"] = ns
+				}
 				emitSSE("response.output_item.added", map[string]any{
 					"output_index": fcOutIdx,
-					"item": map[string]any{
-						"id":        fcID,
-						"type":      "function_call",
-						"call_id":   tc.ID,
-						"name":      tc.Function.Name,
-						"arguments": "",
-						"status":    "in_progress",
-					},
+					"item":         addedItem,
 				})
 				// The argument delta is the first client-visible function-call
 				// output, including calls whose argument object is empty.

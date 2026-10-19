@@ -17,11 +17,35 @@ var (
 	truncatedEnvRe                  = regexp.MustCompile("(?is)(?:(?:^|[\\r\\n]\\s*|```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*|<(?:tool_call|tool_calls|function_call|function_calls)>\\s*)\\{\\s*\"\\s*(?:tool_calls|toolCalls|tool_call|function_call|function_calls|functionCalls)\\s*\"\\s*:|(?:```(?:json|tool_call|tool_calls|function_call|function_calls)|<(?:tool_call|tool_calls|function_call|function_calls)>)\\s*\\{\\s*\"\\s*(?:name|tool|tool_name)\\s*\"\\s*:)")
 	gapFenceRe                      = regexp.MustCompile("(?is)^(?:\\s|```(?:json|tool_call|tool_calls|function_call|function_calls)?|</?(?:tool_call|tool_calls|function_call|function_calls)>)*$")
 	trailingTagRe                   = regexp.MustCompile("(?is)(?:```(?:json|tool_call|tool_calls|function_call|function_calls)?|</?(?:tool_call|tool_calls|function_call|function_calls)>)\\s*$")
-	trailingEnvRe                   = regexp.MustCompile(`(?s)\{\s*"\s*(?:tool_calls|toolCalls|tool_call|function_call|function_calls|functionCalls)\s*"[\s\S]*$`)
+	trailingEnvRe                   = regexp.MustCompile(`(?s)\{\s*"?\s*(?:tool_calls|toolCalls|tool_call|function_call|function_calls|functionCalls)\s*"?\s*:[\s\S]*$`)
 	sanitizedPipeRe                 = regexp.MustCompile(`<([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s+\|>`)
 	htmlTagRe                       = regexp.MustCompile(`<([A-Za-z][A-Za-z0-9:_-]*\s[^>\n]*?)>`)
 	missingQuoteAfterEscapedQuoteRe = regexp.MustCompile(`^\s*(?:,\s*"[A-Za-z0-9_.-]+"\s*:|\}\s*,\s*"[A-Za-z0-9_.-]+"\s*:|\}\s*\}\s*(?:,\s*\{|\]\s*\}))`)
+	markdownAutolinkRe              = regexp.MustCompile(`\[(https?://[^\]\s]+)\]\((https?://[^)\s]+)\)`)
+	toolProtocolRefusalRe           = regexp.MustCompile(`(?is)(?:\b(?:reached|hit|exceeded|exhausted|used\s+up|out\s+of)\s+(?:the\s+|my\s+|our\s+)?(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\b|\b(?:tool[- ]?call|function[- ]?call|tool)\s+(?:budget|limit|quota|allowance)\s+(?:is\s+|has\s+been\s+)?(?:reached|exceeded|exhausted|depleted)\b|\b(?:prompt\s+injection|jailbreak)[\s\S]{0,80}\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)\b|\b(?:tool_calls|function_call|tool[- ]?calling\s+protocol)[\s\S]{0,80}\b(?:prompt\s+injection|jailbreak)\b|\b(?:cannot|can't|unable\s+to|no\s+longer\s+able\s+to|refuse\s+to)\s+(?:emit|output|produce|use|follow|obey)\s+(?:the\s+)?(?:tool_calls|tool[- ]?calling\s+protocol)\b)`)
 )
+
+func unwrapIdenticalMarkdownLinks(s string) string {
+	return markdownAutolinkRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := markdownAutolinkRe.FindStringSubmatch(m)
+		if len(sub) == 3 && sub[1] == sub[2] {
+			return sub[1]
+		}
+		return m
+	})
+}
+
+// IsToolProtocolRefusal reports whether a short plain-text reply is an invented
+// refusal of the tool-calling protocol itself (such as hallucinating an
+// exhausted "tool budget" or claiming the tool_calls JSON format is a prompt
+// injection).
+func IsToolProtocolRefusal(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || len(trimmed) > 1200 {
+		return false
+	}
+	return toolProtocolRefusalRe.MatchString(trimmed)
+}
 
 type candidateSpan struct {
 	raw    string
@@ -138,6 +162,7 @@ func repairJSONStringEscapes(s string) string {
 	out.Grow(len(s) + 16)
 	inStr := false
 	var stack []byte
+	var lastSig byte
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
 		if !inStr {
@@ -148,11 +173,13 @@ func repairJSONStringEscapes(s string) string {
 			}
 			if ch == '{' {
 				stack = append(stack, '}')
+				lastSig = '{'
 				out.WriteByte(ch)
 				continue
 			}
 			if ch == '[' {
 				stack = append(stack, ']')
+				lastSig = '['
 				out.WriteByte(ch)
 				continue
 			}
@@ -163,6 +190,7 @@ func repairJSONStringEscapes(s string) string {
 				expected := stack[len(stack)-1]
 				if ch == expected {
 					stack = stack[:len(stack)-1]
+					lastSig = ch
 					out.WriteByte(ch)
 					continue
 				}
@@ -183,12 +211,51 @@ func repairJSONStringEscapes(s string) string {
 				if j < len(s) && (s[j] == '}' || s[j] == ']') {
 					continue
 				}
+				lastSig = ','
+				out.WriteByte(ch)
+				continue
+			}
+			if ch == ':' {
+				lastSig = ':'
+				out.WriteByte(ch)
+				continue
+			}
+			// Quote bare identifier keys inside JSON objects: {name: "bash"} -> {"name": "bash"}
+			if len(stack) > 0 && stack[len(stack)-1] == '}' && ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_') {
+				kEnd := i + 1
+				for kEnd < len(s) {
+					c := s[kEnd]
+					if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' {
+						kEnd++
+					} else {
+						break
+					}
+				}
+				colonIdx := kEnd
+				for colonIdx < len(s) && (s[colonIdx] == ' ' || s[colonIdx] == '\t' || s[colonIdx] == '\r' || s[colonIdx] == '\n') {
+					colonIdx++
+				}
+				if colonIdx < len(s) && s[colonIdx] == ':' {
+					if lastSig != '{' && lastSig != ',' && lastSig != 0 {
+						out.WriteByte(',')
+					}
+					out.WriteByte('"')
+					out.WriteString(s[i:kEnd])
+					out.WriteByte('"')
+					lastSig = '"'
+					i = kEnd - 1
+					continue
+				}
+			}
+			if ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' {
+				lastSig = ch
 			}
 			out.WriteByte(ch)
 			continue
 		}
 		if ch == '"' {
 			inStr = false
+			lastSig = '"'
 			out.WriteByte(ch)
 			continue
 		}
@@ -769,9 +836,18 @@ func normaliseCalls(envelope map[string]any, allow map[string]map[string]any) ([
 		}
 
 		for k, v := range args {
-			if s, ok := v.(string); ok && strings.Contains(s, " |>") {
-				args[k] = sanitizedPipeRe.ReplaceAllString(s, `<$1 | $2>`)
+			if s, ok := v.(string); ok {
+				if strings.Contains(s, " |>") {
+					s = sanitizedPipeRe.ReplaceAllString(s, `<$1 | $2>`)
+				}
+				if strings.Contains(s, "](") {
+					s = unwrapIdenticalMarkdownLinks(s)
+				}
+				args[k] = s
 			}
+		}
+		if schema != nil {
+			CoerceArgumentsToSchema(schema, args)
 		}
 
 		if errStr := CheckSchema(schema, args, "arguments"); errStr != "" {
@@ -956,6 +1032,9 @@ func InterpretReply(reply string, tools any, toolChoice any) (*InterpretResult, 
 	if contract.ChoiceMode == "required" || contract.ChoiceMode == "function" {
 		return nil, toolCallError(fmt.Sprintf("the model did not return the required tool call (%s)", parsed.Reason))
 	}
+	if IsToolProtocolRefusal(reply) {
+		return nil, toolCallError("the model refused the tool-calling protocol (hallucinated tool limit or refusal)")
+	}
 	return nil, nil
 }
 
@@ -974,11 +1053,6 @@ func ExtractPreToolPreamble(text string) string {
 	before = strings.TrimSpace(trailingEnvRe.ReplaceAllString(before, ""))
 	return before
 }
-
-// SafeStreamablePrefix returns a safe prefix of text that can be streamed live
-// before generation completes when tools are enabled, holding back a 140-byte
-// lookahead guard and refusing to stream if text starts with or contains any
-// tool-call envelope/fence markers.
 func SafeStreamablePrefix(text string) string {
 	if len(text) <= 320 {
 		return ""

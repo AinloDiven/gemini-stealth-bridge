@@ -425,6 +425,9 @@ func FlattenMessagesWithStats(
 				text = trailingToolCallRe.ReplaceAllString(text, "")
 				text = strings.TrimSpace(text)
 			}
+			if toolbridge.IsToolProtocolRefusal(text) {
+				text = ""
+			}
 		}
 
 		if role == "assistant" {
@@ -868,7 +871,7 @@ func NewHistoryHasher(messages []map[string]any, tools any, toolChoice any) *His
 	var footer bytes.Buffer
 	footer.WriteByte(']')
 	if tools != nil || toolChoice != nil {
-		tb, _ := json.Marshal(tools)
+		tb, _ := json.Marshal(toolbridge.StripServerInjectedTools(tools))
 		cb, _ := json.Marshal(toolChoice)
 		footer.WriteByte(',')
 		footer.Write(tb)

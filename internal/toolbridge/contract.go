@@ -10,13 +10,129 @@ import (
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
-var toolNameRe = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+var (
+	toolNameRe = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
+
+	mediaIntentDirectRe = regexp.MustCompile(`(?i)\b(?:generate_media|veo|imagen|nano\s*banana|text[- ]to[- ]image|text[- ]to[- ]video|explainer\s+video)\b`)
+	mediaIntentActionRe = regexp.MustCompile(`(?i)\b(?:generate|create|make|render|draw|paint|design|illustrate|produce|bikin|buat|buatkan|bikinkan|lukis|gambar(?:kan)?)\b[^\n.!?]{0,64}\b(?:image|images|picture|pictures|photo|photos|illustration|poster|banner|thumbnail|logo|wallpaper|artwork|gambar|foto|ilustrasi|lukisan|video|videos|klip|clip|clips|animasi|animation|mp4)\b`)
+	mediaIntentNounRe   = regexp.MustCompile(`(?i)\b(?:video|klip|animasi|mp4)\b[^\n.!?]{0,48}\b(?:generate|create|make|render|bikin|buat|buatkan|bikinkan|explainer|promosi|promo|demo|tutorial|30\s*detik|10\s*detik|seconds)\b`)
+)
 
 // BuiltinMediaToolName is the server-side tool injected into agent tool lists
 // so Gemini can invoke native Imagen / Nano Banana (image) and Veo (video)
 // generation during tool-enabled coding/agent sessions.
 const BuiltinMediaToolName = "generate_media"
 
+// ShouldAugmentMediaTool reports whether a conversation history has explicit
+// image/video generation intent (or prior generate_media calls) so normal
+// coding/analysis turns are never polluted with media tool definitions.
+func ShouldAugmentMediaTool(messages []map[string]any) bool {
+	userChecked := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		m := messages[i]
+		if m == nil {
+			continue
+		}
+		role, _ := m["role"].(string)
+		if role == "assistant" || role == "model" || role == "tool" {
+			if name, _ := m["name"].(string); name == BuiltinMediaToolName {
+				return true
+			}
+			if tcs, ok := m["tool_calls"].([]any); ok {
+				for _, tcAny := range tcs {
+					if tcMap, ok := tcAny.(map[string]any); ok {
+						if fn, ok := tcMap["function"].(map[string]any); ok {
+							if fnName, _ := fn["name"].(string); fnName == BuiltinMediaToolName {
+								return true
+							}
+						}
+					}
+				}
+			}
+			if s, ok := m["content"].(string); ok && strings.Contains(s, BuiltinMediaToolName) {
+				return true
+			}
+			continue
+		}
+		if role != "user" && role != "" {
+			continue
+		}
+		if userChecked >= 3 {
+			continue
+		}
+		userChecked++
+		text := extractUserMessageTextForIntent(m["content"])
+		if text == "" {
+			continue
+		}
+		if len(text) > 4000 {
+			text = text[len(text)-4000:]
+		}
+		if mediaIntentDirectRe.MatchString(text) || mediaIntentActionRe.MatchString(text) || mediaIntentNounRe.MatchString(text) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractUserMessageTextForIntent(content any) string {
+	switch c := content.(type) {
+	case string:
+		return c
+	case []any:
+		var parts []string
+		for _, itemAny := range c {
+			if itemMap, ok := itemAny.(map[string]any); ok {
+				if t, ok := itemMap["text"].(string); ok && t != "" {
+					parts = append(parts, t)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
+// StripServerInjectedTools returns a slice of tools with server-injected tools
+// (such as BuiltinMediaToolName) removed so SessionCache hashes stay invariant.
+func StripServerInjectedTools(tools any) any {
+	rawSlice, ok := tools.([]any)
+	if !ok || len(rawSlice) == 0 {
+		return tools
+	}
+	hasInjected := false
+	for _, item := range rawSlice {
+		if extractToolDefName(item) == BuiltinMediaToolName {
+			hasInjected = true
+			break
+		}
+	}
+	if !hasInjected {
+		return tools
+	}
+	out := make([]any, 0, len(rawSlice)-1)
+	for _, item := range rawSlice {
+		if extractToolDefName(item) == BuiltinMediaToolName {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func extractToolDefName(item any) string {
+	m, ok := item.(map[string]any)
+	if !ok || m == nil {
+		return ""
+	}
+	if fn, ok := m["function"].(map[string]any); ok && fn != nil {
+		if n, _ := fn["name"].(string); n != "" {
+			return n
+		}
+	}
+	n, _ := m["name"].(string)
+	return n
+}
 // AugmentToolsWithMediaGenerator appends the server-side generate_media tool
 // when tools are enabled in "auto" mode and the caller has not already defined
 // a tool with that name.

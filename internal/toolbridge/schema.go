@@ -6,6 +6,7 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"strconv"
 	"unicode/utf8"
 )
 
@@ -423,4 +424,210 @@ func compactSchemaValue(v any, maxDescChars int) any {
 	default:
 		return v
 	}
+}
+
+// CoerceArgumentsToSchema attempts lossless, schema-guided type coercion on
+// properties in args that would otherwise fail CheckSchema (for example string
+// "50" -> 50 for integer, "true" -> true for boolean, JSON-encoded array/object
+// strings, or scalar string -> []string when an array is required). Values that
+// already satisfy their schema are never modified.
+func CoerceArgumentsToSchema(schema map[string]any, args map[string]any) {
+	if schema == nil || args == nil {
+		return
+	}
+	coerceMapWithRoot(schema, schema, args, 0)
+}
+
+func coerceMapWithRoot(schema map[string]any, root map[string]any, obj map[string]any, depth int) {
+	if depth > 16 || schema == nil || obj == nil {
+		return
+	}
+	if ref, ok := schema["$ref"].(string); ok && ref != "" {
+		if resolved, found := resolveSchemaRef(root, ref); found {
+			if rMap, ok2 := resolved.(map[string]any); ok2 {
+				schema = rMap
+			}
+		}
+	}
+	props, _ := schema["properties"].(map[string]any)
+	if props == nil {
+		return
+	}
+	for k, val := range obj {
+		propSchema, exists := props[k]
+		if !exists || propSchema == nil {
+			continue
+		}
+		if checkSchemaWithRoot(propSchema, root, val, k, 0) == "" {
+			continue
+		}
+		if coerced, ok := coerceValueWithRoot(propSchema, root, val, k, depth+1); ok {
+			if checkSchemaWithRoot(propSchema, root, coerced, k, 0) == "" {
+				obj[k] = coerced
+			}
+		}
+	}
+}
+
+func coerceValueWithRoot(schema any, root map[string]any, val any, path string, depth int) (any, bool) {
+	if depth > 16 || schema == nil {
+		return val, false
+	}
+	sMap, ok := schema.(map[string]any)
+	if !ok || sMap == nil {
+		return val, false
+	}
+	if ref, ok := sMap["$ref"].(string); ok && ref != "" {
+		if resolved, found := resolveSchemaRef(root, ref); found {
+			return coerceValueWithRoot(resolved, root, val, path, depth+1)
+		}
+	}
+	for _, kw := range []string{"anyOf", "oneOf"} {
+		if branches, ok := sMap[kw].([]any); ok && len(branches) > 0 {
+			for _, br := range branches {
+				if cVal, ok2 := coerceValueWithRoot(br, root, val, path, depth+1); ok2 {
+					if checkSchemaWithRoot(sMap, root, cVal, path, 0) == "" {
+						return cVal, true
+					}
+				}
+			}
+		}
+	}
+
+	allowedTypes := extractStringSlice(sMap["type"])
+	if tStr, ok := sMap["type"].(string); ok && tStr != "" {
+		allowedTypes = []string{tStr}
+	}
+	if len(allowedTypes) == 0 {
+		if _, hasProps := sMap["properties"]; hasProps {
+			allowedTypes = []string{"object"}
+		} else if _, hasItems := sMap["items"]; hasItems {
+			allowedTypes = []string{"array"}
+		}
+	}
+
+	switch v := val.(type) {
+	case string:
+		trimmed := strings.TrimSpace(v)
+		for _, t := range allowedTypes {
+			switch t {
+			case "integer":
+				if iVal, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+					cand := float64(iVal)
+					if checkSchemaWithRoot(sMap, root, cand, path, 0) == "" {
+						return cand, true
+					}
+				}
+				if fVal, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fVal) && !math.IsInf(fVal, 0) && math.Trunc(fVal) == fVal {
+					if checkSchemaWithRoot(sMap, root, fVal, path, 0) == "" {
+						return fVal, true
+					}
+				}
+			case "number":
+				if fVal, err := strconv.ParseFloat(trimmed, 64); err == nil && !math.IsNaN(fVal) && !math.IsInf(fVal, 0) {
+					if checkSchemaWithRoot(sMap, root, fVal, path, 0) == "" {
+						return fVal, true
+					}
+				}
+			case "boolean":
+				switch strings.ToLower(trimmed) {
+				case "true":
+					if checkSchemaWithRoot(sMap, root, true, path, 0) == "" {
+						return true, true
+					}
+				case "false":
+					if checkSchemaWithRoot(sMap, root, false, path, 0) == "" {
+						return false, true
+					}
+				}
+			case "array":
+				if strings.HasPrefix(trimmed, "[") {
+					if arr, ok := unmarshalCandidateArray(trimmed); ok {
+						if itemSchema := sMap["items"]; itemSchema != nil {
+							for i, elem := range arr {
+								if checkSchemaWithRoot(itemSchema, root, elem, path, 0) != "" {
+									if cElem, ok2 := coerceValueWithRoot(itemSchema, root, elem, path, depth+1); ok2 {
+										arr[i] = cElem
+									}
+								}
+							}
+						}
+						if checkSchemaWithRoot(sMap, root, arr, path, 0) == "" {
+							return arr, true
+						}
+					}
+				}
+				if v != "" {
+					var arr []any
+					if strings.Contains(v, "\n") {
+						for _, line := range strings.Split(v, "\n") {
+							if s := strings.TrimSpace(line); s != "" {
+								arr = append(arr, s)
+							}
+						}
+					}
+					if len(arr) == 0 {
+						arr = []any{v}
+					}
+					if checkSchemaWithRoot(sMap, root, arr, path, 0) == "" {
+						return arr, true
+					}
+				}
+			case "object":
+				if strings.HasPrefix(trimmed, "{") {
+					if parsedObj, ok := unmarshalCandidateObject(trimmed); ok {
+						coerceMapWithRoot(sMap, root, parsedObj, depth+1)
+						if checkSchemaWithRoot(sMap, root, parsedObj, path, 0) == "" {
+							return parsedObj, true
+						}
+					}
+				}
+			}
+		}
+	case float64:
+		for _, t := range allowedTypes {
+			if t == "string" {
+				s := strconv.FormatFloat(v, 'f', -1, 64)
+				if checkSchemaWithRoot(sMap, root, s, path, 0) == "" {
+					return s, true
+				}
+			}
+		}
+	case bool:
+		for _, t := range allowedTypes {
+			if t == "string" {
+				s := strconv.FormatBool(v)
+				if checkSchemaWithRoot(sMap, root, s, path, 0) == "" {
+					return s, true
+				}
+			}
+		}
+	case map[string]any:
+		cp := make(map[string]any, len(v))
+		for mk, mv := range v {
+			cp[mk] = mv
+		}
+		coerceMapWithRoot(sMap, root, cp, depth+1)
+		if checkSchemaWithRoot(sMap, root, cp, path, 0) == "" {
+			return cp, true
+		}
+	case []any:
+		if itemSchema := sMap["items"]; itemSchema != nil {
+			cp := make([]any, len(v))
+			changed := false
+			for i, elem := range v {
+				cp[i] = elem
+				if checkSchemaWithRoot(itemSchema, root, elem, path, 0) != "" {
+					if cElem, ok2 := coerceValueWithRoot(itemSchema, root, elem, path, depth+1); ok2 {
+						cp[i] = cElem
+						changed = true
+					}
+				}
+			}
+			if changed && checkSchemaWithRoot(sMap, root, cp, path, 0) == "" {
+				return cp, true
+			}
+		}
+	}
+	return val, false
 }

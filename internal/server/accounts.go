@@ -12,6 +12,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1587,6 +1588,10 @@ func (s *Server) prepareGeneration(
 		return nil, transport.NewUpstreamError("no accounts configured", 503, "auth_unavailable", nil, nil)
 	}
 
+	if toolbridge.ShouldAugmentMediaTool(messages) {
+		toolsRaw = toolbridge.AugmentToolsWithMediaGenerator(toolsRaw, toolChoiceRaw)
+	}
+
 	var hasher *prompt.HistoryHasher
 	if s.Cfg.SessionCache && len(messages) >= 3 {
 		hasher = prompt.NewHistoryHasher(messages, toolsRaw, toolChoiceRaw)
@@ -1617,7 +1622,6 @@ func (s *Server) prepareGeneration(
 		return nil, err
 	}
 
-	toolsRaw = toolbridge.AugmentToolsWithMediaGenerator(toolsRaw, toolChoiceRaw)
 	contract, err := toolbridge.ValidateToolRequest(toolsRaw, toolChoiceRaw)
 	if err != nil {
 		return nil, err
@@ -1682,6 +1686,10 @@ func (s *Server) prepareGeneration(
 	effortVal := extractEffortFromBody(body)
 	if (effortVal == nil || effortVal == "") && inlineThink != "" {
 		effortVal = inlineThink
+	}
+	if !hasTools && (effortVal == nil || effortVal == "") && isLightweightTitleRequest(messages) {
+		effortVal = "low"
+		tempReq = true
 	}
 	thinkLvl := gemini.ThinkingLevelFor(effortVal, mid, strconv.Itoa(s.Cfg.DefaultThinking))
 	effortStr := "low"
@@ -1753,4 +1761,21 @@ func (s *Server) prepareGeneration(
 		cacheKey:            cacheKey,
 		cacheSplit:          cacheSplit,
 	}, nil
+}
+
+var lightweightTitleRe = regexp.MustCompile(`(?i)\b(?:generate\s+a\s+(?:concise|short|brief)[,\s]+(?:single[- ]line\s+)?(?:task\s+|session\s+|chat\s+|conversation\s+)?title|write\s+a\s+(?:concise|short|brief)\s+(?:3[-–]6\s+word\s+)?title\s+for\s+this|summarize\s+this\s+(?:conversation|message|chat)\s+(?:in|into)\s+a\s+short\s+title)\b`)
+
+func isLightweightTitleRequest(messages []map[string]any) bool {
+	if len(messages) == 0 || len(messages) > 4 {
+		return false
+	}
+	for _, m := range messages {
+		if m == nil {
+			continue
+		}
+		if s, ok := m["content"].(string); ok && len(s) <= 2000 && lightweightTitleRe.MatchString(s) {
+			return true
+		}
+	}
+	return false
 }

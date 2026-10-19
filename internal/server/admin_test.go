@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -288,6 +289,9 @@ func TestServerSideMediaGeneratorToolAndImageEndpoint(t *testing.T) {
 	rec := runChat(t, srv, acct, client, map[string]any{
 		"tools":       tools,
 		"tool_choice": "auto",
+		"messages": []any{
+			map[string]any{"role": "user", "content": "generate an image of a neon cyberpunk cat"},
+		},
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK from agent generate_media + bash workflow, got %d: %s", rec.Code, rec.Body.String())
@@ -414,5 +418,166 @@ func TestStreamingPoolRotatesOnSubstitutionAfterHeadersAndMediaRound(t *testing.
 	}
 	if !strings.Contains(rec.Body.String(), `"finish_reason":"tool_calls"`) || !strings.Contains(rec.Body.String(), "./explainer.mp4") {
 		t.Fatalf("expected completed tool_calls stream from acct2, got:\n%s", rec.Body.String())
+	}
+}
+
+func TestMediaToolZeroOverheadOnCodingTurnsAndSessionCacheContinuity(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+
+	var capturedPrompts []string
+	var capturedMeta [][]any
+	turn := 0
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			turn++
+			capturedPrompts = append(capturedPrompts, prompt)
+			capturedMeta = append(capturedMeta, opts.Metadata)
+			_ = onFrame(&gemini.LineParseResult{
+				CID: fmt.Sprintf("cid_%d", turn),
+				RID: fmt.Sprintf("rid_%d", turn),
+				Frames: []gemini.Frame{
+					makeFrame("```json\n{\"tool_calls\":[{\"name\":\"bash\",\"arguments\":{\"command\":\"ls -la\"}}]}\n```", "", true, testModel.ModelID),
+				},
+			})
+			return &gemini.StreamResponse{Status: 200, CID: fmt.Sprintf("cid_%d", turn), RID: fmt.Sprintf("rid_%d", turn)}, nil
+		},
+	}
+
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "bash",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"command": map[string]any{"type": "string"}},
+					"required":   []any{"command"},
+				},
+			},
+		},
+	}
+
+	// Turn 1: Pure coding/audit request -> generate_media must NOT be injected into prompt!
+	msgsTurn1 := []any{
+		map[string]any{"role": "user", "content": "lakukan audit penuh terhadap database sqlite transpadang"},
+	}
+	rec1 := runChat(t, srv, acct, client, map[string]any{
+		"tools":       tools,
+		"tool_choice": "auto",
+		"messages":    msgsTurn1,
+	})
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("turn 1 failed: %d %s", rec1.Code, rec1.Body.String())
+	}
+	if strings.Contains(capturedPrompts[0], "generate_media") {
+		t.Fatalf("expected pure coding turn NOT to contain generate_media in prompt, got:\n%s", capturedPrompts[0])
+	}
+
+	var resp1 map[string]any
+	_ = json.Unmarshal(rec1.Body.Bytes(), &resp1)
+	choice1 := resp1["choices"].([]any)[0].(map[string]any)
+	msg1 := choice1["message"].(map[string]any)
+	tcs1 := msg1["tool_calls"].([]any)
+	tcID1 := tcs1[0].(map[string]any)["id"].(string)
+
+	// Turn 2: Tool result continuation -> must HIT SessionCache (opts.Metadata non-empty)!
+	msgsTurn2 := []any{
+		map[string]any{"role": "user", "content": "lakukan audit penuh terhadap database sqlite transpadang"},
+		map[string]any{"role": "assistant", "tool_calls": tcs1},
+		map[string]any{"role": "tool", "tool_call_id": tcID1, "name": "bash", "content": "tracker_202610.db"},
+	}
+	rec2 := runChat(t, srv, acct, client, map[string]any{
+		"tools":       tools,
+		"tool_choice": "auto",
+		"messages":    msgsTurn2,
+	})
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("turn 2 failed: %d %s", rec2.Code, rec2.Body.String())
+	}
+	if len(capturedMeta[1]) == 0 {
+		t.Fatalf("expected Turn 2 with tools to HIT SessionCache (opts.Metadata non-empty), got nil")
+	}
+
+	var resp2 map[string]any
+	_ = json.Unmarshal(rec2.Body.Bytes(), &resp2)
+	tcs2 := resp2["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)["tool_calls"].([]any)
+	tcID2 := tcs2[0].(map[string]any)["id"].(string)
+
+	// Turn 3: User now asks to generate an explainer video -> generate_media activates WITHOUT invalidating SessionCache!
+	msgsTurn3 := append(append([]any{}, msgsTurn2...),
+		map[string]any{"role": "assistant", "tool_calls": tcs2},
+		map[string]any{"role": "tool", "tool_call_id": tcID2, "name": "bash", "content": "done"},
+		map[string]any{"role": "user", "content": "sekarang buatkan video explainer dari hasil audit ini"},
+	)
+	rec3 := runChat(t, srv, acct, client, map[string]any{
+		"tools":       tools,
+		"tool_choice": "auto",
+		"messages":    msgsTurn3,
+	})
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("turn 3 failed: %d %s", rec3.Code, rec3.Body.String())
+	}
+	if len(capturedMeta[2]) == 0 {
+		t.Fatalf("expected Turn 3 (media tool activated mid-session) to STILL HIT SessionCache")
+	}
+	if !strings.Contains(capturedPrompts[2], "generate_media") {
+		t.Fatalf("expected Turn 3 with video intent to include generate_media in continuation reminder, got:\n%s", capturedPrompts[2])
+	}
+}
+
+func TestResponsesCustomToolAndNamespaceNormalization(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	acct.Client = clientFromFrames([]gemini.Frame{
+		makeFrame("```json\n{\"tool_calls\":[{\"name\":\"apply_patch\",\"arguments\":{\"input\":\"*** Begin Patch\\n*** End Patch\"}},{\"name\":\"query_db\",\"arguments\":{\"sql\":\"SELECT 1\"}}]}\n```", "", true, testModel.ModelID),
+	})
+
+	body := map[string]any{
+		"model": testModel.ModelName,
+		"input": []any{
+			map[string]any{"type": "message", "role": "user", "content": "patch and query"},
+			map[string]any{"type": "custom_tool_call", "call_id": "call_prev", "name": "apply_patch", "input": "*** Begin Patch\n*** End Patch"},
+			map[string]any{"type": "custom_tool_call_output", "call_id": "call_prev", "output": "Applied"},
+		},
+		"tools": []any{
+			map[string]any{
+				"type":        "custom",
+				"name":        "apply_patch",
+				"description": "Apply a patch",
+			},
+			map[string]any{
+				"type": "namespace",
+				"name": "mcp__sqlite",
+				"tools": []any{
+					map[string]any{
+						"type": "function",
+						"name": "query_db",
+						"parameters": map[string]any{
+							"type":       "object",
+							"properties": map[string]any{"sql": map[string]any{"type": "string"}},
+							"required":   []any{"sql"},
+						},
+					},
+				},
+			},
+		},
+	}
+	rec := httptest.NewRecorder()
+	srv.HandleResponses(context.Background(), rec, body, AuthScope{OK: true, AccountID: "acct"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from HandleResponses, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	output, _ := resp["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("expected 2 output items (custom_tool_call + namespaced function_call), got %+v", output)
+	}
+	item0 := output[0].(map[string]any)
+	if item0["type"] != "custom_tool_call" || item0["input"] != "*** Begin Patch\n*** End Patch" {
+		t.Fatalf("expected custom_tool_call with raw input, got %+v", item0)
+	}
+	item1 := output[1].(map[string]any)
+	if item1["type"] != "function_call" || item1["namespace"] != "mcp__sqlite" {
+		t.Fatalf("expected function_call with namespace=mcp__sqlite, got %+v", item1)
 	}
 }

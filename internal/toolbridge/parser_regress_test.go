@@ -186,3 +186,70 @@ func TestMissingClosingQuoteAfterEscapedQuoteInToolEnvelope(t *testing.T) {
 		t.Fatalf("expected 2 shell calls from OpenCode payload, got %+v", res2)
 	}
 }
+
+func TestSchemaDrivenArgumentCoercionAndBareKeys(t *testing.T) {
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "query_logs",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"limit":   map[string]any{"type": "integer"},
+						"ratio":   map[string]any{"type": "number"},
+						"follow":  map[string]any{"type": "boolean"},
+						"paths":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+						"options": map[string]any{"type": "object", "properties": map[string]any{"port": map[string]any{"type": "integer"}}},
+						"url":     map[string]any{"type": "string"},
+					},
+					"required": []any{"limit", "follow", "paths"},
+				},
+			},
+		},
+	}
+
+	// Bare keys, missing comma before bare key, stringified numbers/booleans/array/object, and bare-URL markdown autolink
+	raw := "```json\n{tool_calls: [{name: \"query_logs\" arguments: {limit: \"50\", ratio: \"0.75\", follow: \"true\", paths: \"a.log\\nb.log\", options: \"{\\\"port\\\": \\\"8080\\\"}\", url: \"[https://api.example.com/v1](https://api.example.com/v1)\"}}]}\n```"
+	res, err := InterpretReply(raw, tools, "auto")
+	if err != nil {
+		t.Fatalf("expected bare-key + schema coercion to succeed, got err: %v", err)
+	}
+	if res == nil || len(res.Calls) != 1 {
+		t.Fatalf("expected 1 call, got %+v", res)
+	}
+	args := res.Calls[0].Arguments
+	if args["limit"] != float64(50) {
+		t.Fatalf("expected limit=50, got %#v", args["limit"])
+	}
+	if args["ratio"] != float64(0.75) {
+		t.Fatalf("expected ratio=0.75, got %#v", args["ratio"])
+	}
+	if args["follow"] != true {
+		t.Fatalf("expected follow=true, got %#v", args["follow"])
+	}
+	paths, ok := args["paths"].([]any)
+	if !ok || len(paths) != 2 || paths[0] != "a.log" || paths[1] != "b.log" {
+		t.Fatalf("expected paths=['a.log','b.log'], got %#v", args["paths"])
+	}
+	opts, ok := args["options"].(map[string]any)
+	if !ok || opts["port"] != float64(8080) {
+		t.Fatalf("expected options.port=8080, got %#v", args["options"])
+	}
+	if args["url"] != "https://api.example.com/v1" {
+		t.Fatalf("expected unwrapped bare URL, got %#v", args["url"])
+	}
+}
+
+func TestToolProtocolRefusalDetection(t *testing.T) {
+	// Hallucinated tool-budget refusal must trigger tool_call_error retry
+	_, err := InterpretReply("I have exhausted my tool-call budget for this turn, so I cannot run another command.", sampleReproTools(), "auto")
+	if err == nil || !strings.Contains(err.Error(), "refused the tool-calling protocol") {
+		t.Fatalf("expected tool protocol refusal error, got: %v", err)
+	}
+	// Normal prose explanation must NOT false-positive
+	res, err := InterpretReply("I will now summarize the database audit findings for the past month.", sampleReproTools(), "auto")
+	if err != nil || res != nil {
+		t.Fatalf("expected normal prose to pass through without error, got res=%+v err=%v", res, err)
+	}
+}
