@@ -110,12 +110,12 @@ func FromEnv() *Config {
 	rawThink := strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_THINKING"))
 	defThinkKey := strings.ToLower(rawThink)
 	if defThinkKey == "" {
-		defThinkKey = "high"
+		defThinkKey = "low"
 	}
 	defThink, ok := ThinkingLevels[defThinkKey]
 	if !ok {
-		warnings = append(warnings, fmt.Sprintf("invalid BRIDGE_DEFAULT_THINKING=%q; falling back to \"high\"", rawThink))
-		defThink = 2
+		warnings = append(warnings, fmt.Sprintf("invalid BRIDGE_DEFAULT_THINKING=%q; falling back to \"low\"", rawThink))
+		defThink = 1
 	}
 
 	impersonate := envStr("BRIDGE_IMPERSONATE", "chrome_150_psk")

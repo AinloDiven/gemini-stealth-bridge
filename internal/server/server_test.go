@@ -334,7 +334,7 @@ func TestThinkingLevelMappingAndToolCalling(t *testing.T) {
 		}
 		_ = runChat(t, srv, acct, client, extra)
 	}
-	expected := []int{1, 4, 2, 2}
+	expected := []int{1, 4, 2, 1}
 	for i := range expected {
 		if seenLevels[i] != expected[i] {
 			t.Fatalf("expected thinking levels %v, got %v", expected, seenLevels)

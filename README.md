@@ -304,10 +304,10 @@ For multi-turn calls, resend the conversation in `input`, including assistant ou
 - `tool_choice` supports `auto`, `none`, `required`, or a named function. To force a function, use `{"type":"function","function":{"name":"get_status"}}` for Chat or `{"type":"function","name":"get_status"}` for Responses. The bridge returns calls; it never executes your functions. Append the assistant call and matching tool result to the next request's history.
 - Chat image content uses `{"type":"image_url","image_url":{"url":"..."}}`; Responses uses `{"type":"input_image","image_url":"..."}`. URLs can be base64 image data URLs or public HTTPS URLs. Remote-image downloads are limited to 20 MiB and reject private/loopback destinations by default. The total JSON request body is limited to 32 MiB.
 - Set Chat `reasoning_effort` or Responses `reasoning.effort` to `low`, `medium`, or `high`. A model suffix such as `gemini-flash@think=high` is also accepted; an explicit body setting takes precedence.
-- The configured default thinking effort is `high` for reasoning-capable models. Disabling-style values map to `low`; they do not disable Gemini's thinking entirely.
+- The configured default thinking effort is `low` for reasoning-capable models. Disabling-style values map to `low`; they do not disable Gemini's thinking entirely.
 - `BRIDGE_LIVE_THOUGHTS=false` suppresses separately extracted reasoning output; it does not change the upstream thinking level or guarantee removal of every model-written reasoning passage from ordinary answer text.
 - When tools are enabled, prose answers longer than 320 bytes stream live instead of being held for the full turn; mid-answer tool envelopes and fenced envelope look-alikes inside plain prose stay out of the streamed prefix until parsing commits the turn. Envelope mentions quoted as documentation pass through as text and never error as malformed calls.
-- The thinking-effort config maps only `low`, `medium`, and `high`; an explicit `BRIDGE_DEFAULT_THINKING=medium` in the environment or an explicit body `effort` overrides the built-in `high` default for that deployment or request.
+- The thinking-effort config maps only `low`, `medium`, and `high`; an explicit `BRIDGE_DEFAULT_THINKING=medium` in the environment or an explicit body `effort` raises the built-in `low` default for that deployment or request.
 
 ### Endpoint reference
 
@@ -377,7 +377,7 @@ Set environment variables before starting `./gsb`. The binary reads `HOST` and `
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BRIDGE_DEFAULT_THINKING` | `high` | Effort applied when a request sends no `reasoning_effort`: `low`, `medium`, or `high`. Also advertised as `thinking.default` in `/v1/models`, so metadata matches behaviour. Models that do not list the configured level keep their own default |
+| `BRIDGE_DEFAULT_THINKING` | `low` | Effort applied when a request sends no `reasoning_effort`: `low`, `medium`, or `high`. Also advertised as `thinking.default` in `/v1/models`, so metadata matches behaviour. Models that do not list the configured level keep their own default |
 | `BRIDGE_REJECT_DOWNGRADE` | `true` | Reject detected upstream model substitution instead of silently returning another model |
 | `BRIDGE_LIVE_THOUGHTS` | `true` | Include separately extracted reasoning in API output |
 | `BRIDGE_TEMPORARY` | `false` | Request temporary Gemini conversations; skips continuation-cache reuse |
