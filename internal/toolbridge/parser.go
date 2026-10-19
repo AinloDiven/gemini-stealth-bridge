@@ -30,6 +30,21 @@ type candidateSpan struct {
 	fenced bool
 }
 
+// hasUnbalancedToolEnvelopeOpener reports whether the reply contains a
+// `{"tool_calls": ...` (or alias) opener whose object NEVER reaches a balanced
+// close — i.e. the JSON was cut off mid-envelope. Prose mentions inside inline
+// code with placeholders like [...] or <tool> still open an object that closes
+// unbalanced only when truncated for real, so this is the structural signal.
+func hasUnbalancedToolEnvelopeOpener(s string) bool {
+	openerRe := regexp.MustCompile(`(?is)\{\s*"\s*(?:tool_calls|toolCalls|tool_call|function_call|function_calls|functionCalls)\s*"\s*:`)
+	for _, loc := range openerRe.FindAllStringIndex(s, -1) {
+		if len(findBalancedObjects(s[loc[0]:])) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func findBalancedObjects(s string) [][2]int {
 	var spans [][2]int
 	depth := 0
@@ -278,6 +293,13 @@ func callCandidates(text string) []candidateSpan {
 	out = append(out, candidateSpan{raw: trimmed, start: 0, end: len(trimmed), whole: true, fenced: false})
 	for _, loc := range fencedBlockRe.FindAllStringSubmatchIndex(trimmed, -1) {
 		if exampleIntroRe.MatchString(trimmed[:loc[0]]) {
+			continue
+		}
+		// A fenced envelope is a tool call only when the fence sits on its own
+		// line(s) (standalone). Fenced JSON embedded at the end of a prose
+		// bullet/paragraph (e.g. "… blok ```json {"tool_calls":[…]} ``` di dalam
+		// penjelasan") is a prose mention, not a call.
+		if !isStandaloneSpan(trimmed, loc[0], loc[1]) {
 			continue
 		}
 		subStart, subEnd := -1, -1
@@ -762,7 +784,14 @@ func ParseToolReply(reply string, tools any) (*ParseResult, error) {
 		}
 	}
 	if found == nil {
-		if truncatedEnvRe.MatchString(trimmed) {
+		// A genuinely truncated/malformed envelope means the reply contains an
+		// UNBALANCED {"tool_calls": ... opener that never closes (no balanced
+		// object could be produced by callCandidates). Prose that merely
+		// MENTIONS the envelope inside inline code, a fenced example with
+		// placeholders like [...] or <tool>, or a balanced but single-call
+		// object that failed schema validation is NOT truncation — those keep
+		// the "no tool call envelope" reason so callers can surface the text.
+		if hasUnbalancedToolEnvelopeOpener(trimmed) {
 			return nil, toolCallError("the model attempted a tool_calls JSON envelope that was malformed or truncated")
 		}
 		return &ParseResult{Reason: "no tool call envelope in the reply", Text: trimmed}, nil

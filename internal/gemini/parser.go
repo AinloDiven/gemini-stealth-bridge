@@ -302,14 +302,37 @@ func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string,
 	// 5. Handle unclosed <think> / <thinking> / <thought> block at start or tail (even if done=true)
 	if hasThinkTag || hasCodeTag {
 		if openThinkStartRe.MatchString(text) {
+			// An OPEN think marker at the very start of the text. If the whole
+			// remainder looks like think content (or the stream is mid-flight),
+			// convert it to thoughts. But a literal marker embedded in prose
+			// followed by real answer sentences is NOT a think block: keep it
+			// intact on a final frame.
 			inner := openThinkTagOnlyRe.ReplaceAllString(text, "")
+			if done && inner != "" {
+				// Heuristic: on a final frame the model usually answers in
+				// paragraphs. A genuine unclosed think block that swallowed the
+				// whole answer is rare; treat the text as content if it has
+				// sentence-like prose after the marker's first line.
+				if firstNL := strings.IndexByte(inner, '\n'); firstNL >= 0 && strings.TrimSpace(inner[firstNL+1:]) != "" {
+					return text, joinThoughts(thoughts, extraThoughts)
+				}
+			}
 			appendThought(inner)
 			return "", joinThoughts(thoughts, extraThoughts)
 		}
 		if loc := trailingOpenThinkRe.FindStringSubmatchIndex(text); len(loc) >= 4 {
-			inner := text[loc[2]:loc[3]]
-			appendThought(inner)
-			text = strings.TrimRight(text[:loc[0]], " \t\r\n")
+			// A literal </think>/<thinking>/<thought> embedded mid-sentence in prose (a line
+			// ABOUT think tags, a mermaid label, etc.) must NOT swallow the rest
+			// of the answer. A genuine unclosed think block sits at the very tail
+			// of the reply with no further prose AFTER the tag's line.
+			rem := text[loc[0]:loc[3]]
+			nextNL := strings.IndexByte(rem, '\n')
+			proseAfterTagLine := nextNL >= 0 && strings.TrimSpace(rem[nextNL+1:]) != ""
+			if !done || !proseAfterTagLine {
+				inner := text[loc[2]:loc[3]]
+				appendThought(inner)
+				text = strings.TrimRight(text[:loc[0]], " \t\r\n")
+			}
 		}
 	}
 
