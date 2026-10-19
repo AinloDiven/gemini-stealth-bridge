@@ -1,0 +1,487 @@
+package server
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
+)
+
+type requestBaseURLKey struct{}
+
+func withRequestBaseURL(ctx context.Context, r *http.Request, defaultPort int) context.Context {
+	if r == nil {
+		return ctx
+	}
+	scheme := "http"
+	if r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		scheme = "https"
+	}
+	host := strings.TrimSpace(r.Header.Get("X-Forwarded-Host"))
+	if host == "" {
+		host = strings.TrimSpace(r.Host)
+	}
+	if host == "" {
+		if defaultPort <= 0 {
+			defaultPort = 20133
+		}
+		host = fmt.Sprintf("127.0.0.1:%d", defaultPort)
+	}
+	return context.WithValue(ctx, requestBaseURLKey{}, scheme+"://"+host)
+}
+
+func (s *Server) requestBaseURL(ctx context.Context) string {
+	if v, ok := ctx.Value(requestBaseURLKey{}).(string); ok && v != "" {
+		return v
+	}
+	port := s.Cfg.Port
+	if port <= 0 {
+		port = 20133
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", port)
+}
+
+type mediaEntry struct {
+	ID          string
+	AccountID   string
+	UpstreamURL string
+	FallbackURL string
+	MimeType    string
+	Ext         string
+	Title       string
+	CreatedAt   time.Time
+
+	fetchMu sync.Mutex
+	Data    []byte
+}
+
+type mediaDownloader interface {
+	DownloadMedia(ctx context.Context, rawURL, fallbackURL string) ([]byte, string, error)
+}
+
+const maxCachedMediaEntries = 96
+
+func (s *Server) registerMedia(ctx context.Context, accountID, upstreamURL, fallbackURL, mimeType, ext, title string) (string, *mediaEntry) {
+	if upstreamURL == "" {
+		return "", nil
+	}
+	if ext == "" {
+		ext = "bin"
+	}
+	sum := sha256.Sum256([]byte(accountID + "|" + upstreamURL))
+	id := hex.EncodeToString(sum[:12]) + "." + ext
+	proxyURL := s.requestBaseURL(ctx) + "/v1/media/" + id
+
+	s.mediaMu.Lock()
+	if s.mediaItems == nil {
+		s.mediaItems = make(map[string]*mediaEntry)
+	}
+	entry, exists := s.mediaItems[id]
+	if !exists {
+		entry = &mediaEntry{
+			ID:          id,
+			AccountID:   accountID,
+			UpstreamURL: upstreamURL,
+			FallbackURL: fallbackURL,
+			MimeType:    mimeType,
+			Ext:         ext,
+			Title:       title,
+			CreatedAt:   s.now(),
+		}
+		s.mediaItems[id] = entry
+		s.mediaOrder = append(s.mediaOrder, id)
+		for len(s.mediaOrder) > maxCachedMediaEntries {
+			oldest := s.mediaOrder[0]
+			s.mediaOrder = s.mediaOrder[1:]
+			delete(s.mediaItems, oldest)
+		}
+	}
+	s.mediaMu.Unlock()
+
+	return proxyURL, entry
+}
+
+func (s *Server) ensureMediaBytes(ctx context.Context, entry *mediaEntry) ([]byte, string, error) {
+	if entry == nil {
+		return nil, "", fmt.Errorf("media entry not found")
+	}
+	entry.fetchMu.Lock()
+	defer entry.fetchMu.Unlock()
+
+	if len(entry.Data) > 0 {
+		return entry.Data, entry.MimeType, nil
+	}
+
+	acct := s.findAccountByID(entry.AccountID)
+	if acct == nil {
+		accts := s.Accounts()
+		if len(accts) > 0 {
+			acct = accts[0]
+		}
+	}
+	if acct == nil {
+		return nil, "", fmt.Errorf("account %s not available to fetch media", entry.AccountID)
+	}
+
+	client := s.clientFor(acct)
+	dl, ok := client.(mediaDownloader)
+	if !ok {
+		return nil, "", fmt.Errorf("upstream client does not support media download")
+	}
+
+	data, ct, err := dl.DownloadMedia(ctx, entry.UpstreamURL, entry.FallbackURL)
+	if err != nil {
+		return nil, "", err
+	}
+	if ct != "" && ct != "application/octet-stream" {
+		entry.MimeType = ct
+	}
+	entry.Data = data
+	return entry.Data, entry.MimeType, nil
+}
+
+// HandleGetMedia serves a cached or proxied generated image/video at GET /v1/media/<id>.
+func (s *Server) HandleGetMedia(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/media/")
+	id = strings.TrimPrefix(id, "/media/")
+	id = strings.TrimSpace(id)
+	if id == "" {
+		sendJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "media id required", "type": "not_found_error"}}, nil)
+		return
+	}
+
+	s.mediaMu.RLock()
+	var entry *mediaEntry
+	if s.mediaItems != nil {
+		entry = s.mediaItems[id]
+	}
+	s.mediaMu.RUnlock()
+
+	if entry == nil {
+		sendJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"message": "media not found or expired: " + id, "type": "not_found_error"}}, nil)
+		return
+	}
+
+	data, mimeType, err := s.ensureMediaBytes(r.Context(), entry)
+	if err != nil {
+		sendJSON(w, http.StatusBadGateway, map[string]any{"error": map[string]any{"message": err.Error(), "type": "upstream_error"}}, nil)
+		return
+	}
+	if mimeType == "" {
+		if strings.HasSuffix(id, ".mp4") {
+			mimeType = "video/mp4"
+		} else {
+			mimeType = "image/jpeg"
+		}
+	}
+	w.Header().Set("Content-Type", mimeType)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	http.ServeContent(w, r, entry.ID, entry.CreatedAt, bytes.NewReader(data))
+}
+
+func (s *Server) rewriteFrameMedia(ctx context.Context, accountID string, frame *gemini.Frame) {
+	if frame == nil || (len(frame.GeneratedImages) == 0 && len(frame.GeneratedVideos) == 0) {
+		return
+	}
+	for i := range frame.GeneratedImages {
+		rawURL := frame.GeneratedImages[i].URL
+		if rawURL == "" || strings.Contains(rawURL, "/v1/media/") {
+			continue
+		}
+		proxyURL, _ := s.registerMedia(ctx, accountID, rawURL, "", "image/jpeg", "jpg", frame.GeneratedImages[i].Title)
+		if proxyURL != "" {
+			frame.Text = strings.ReplaceAll(frame.Text, rawURL, proxyURL)
+			frame.GeneratedImages[i].URL = proxyURL
+		}
+	}
+	for i := range frame.GeneratedVideos {
+		rawURL := frame.GeneratedVideos[i].URL
+		if rawURL != "" && !strings.Contains(rawURL, "/v1/media/") {
+			proxyURL, _ := s.registerMedia(ctx, accountID, rawURL, frame.GeneratedVideos[i].StreamURL, "video/mp4", "mp4", frame.GeneratedVideos[i].Title)
+			if proxyURL != "" {
+				frame.Text = strings.ReplaceAll(frame.Text, rawURL, proxyURL)
+				frame.GeneratedVideos[i].URL = proxyURL
+			}
+		}
+		thumbURL := frame.GeneratedVideos[i].ThumbnailURL
+		if thumbURL != "" && !strings.Contains(thumbURL, "/v1/media/") {
+			proxyThumb, _ := s.registerMedia(ctx, accountID, thumbURL, "", "image/jpeg", "jpg", frame.GeneratedVideos[i].Title)
+			if proxyThumb != "" {
+				frame.Text = strings.ReplaceAll(frame.Text, thumbURL, proxyThumb)
+				frame.GeneratedVideos[i].ThumbnailURL = proxyThumb
+			}
+		}
+	}
+}
+
+func hasServerSideMediaCalls(calls []toolbridge.Call) bool {
+	for _, c := range calls {
+		if c.Name == toolbridge.BuiltinMediaToolName {
+			return true
+		}
+	}
+	return false
+}
+
+type generatedMediaResult struct {
+	MediaType    string `json:"media_type"`
+	URL          string `json:"url"`
+	ThumbnailURL string `json:"thumbnail_url,omitempty"`
+	MimeType     string `json:"mime_type"`
+	Markdown     string `json:"markdown"`
+	Entry        *mediaEntry `json:"-"`
+}
+
+func (s *Server) runMediaGenerationOnAccount(
+	ctx context.Context,
+	account *AccountState,
+	model *gemini.ModelInfo,
+	mediaType string,
+	userPrompt string,
+) ([]generatedMediaResult, string, error) {
+	mType := strings.ToLower(strings.TrimSpace(mediaType))
+	if mType != "video" {
+		mType = "image"
+	}
+	cleanPrompt := strings.TrimSpace(userPrompt)
+	if cleanPrompt == "" {
+		return nil, "", transport.NewUpstreamError("prompt is required for media generation", 400, "invalid_request_error", nil, nil)
+	}
+
+	genPrompt := "Generate an image: " + cleanPrompt
+	if mType == "video" {
+		genPrompt = "Generate a video: " + cleanPrompt
+	}
+
+	opts := gemini.StreamOptions{
+		Model:           model,
+		ThinkingLevel:   1,
+		Temporary:       true,
+		Language:        s.Cfg.Locale,
+		DisableTools:    false,
+		HasTools:        false,
+		ProtocolMode:    "web",
+		PersonalContext: "off",
+	}
+
+	client := s.clientFor(account)
+	var (
+		lastFrame gemini.Frame
+		hasFrame  bool
+	)
+	upstream, err := client.StreamGenerateLive(ctx, genPrompt, opts, func(update *gemini.LineParseResult) error {
+		for _, f := range update.Frames {
+			s.rewriteFrameMedia(ctx, account.ID, &f)
+			lastFrame = f
+			hasFrame = true
+		}
+		return nil
+	})
+	if err != nil && !hasFrame {
+		return nil, "", err
+	}
+	if upstream != nil && upstream.Status != 200 && !hasFrame {
+		return nil, "", transport.NewUpstreamError(fmt.Sprintf("upstream HTTP %d during media generation", upstream.Status), 502, "upstream_http_error", nil, nil)
+	}
+
+	var results []generatedMediaResult
+	for _, img := range lastFrame.GeneratedImages {
+		id := strings.TrimPrefix(img.URL, s.requestBaseURL(ctx)+"/v1/media/")
+		s.mediaMu.RLock()
+		entry := s.mediaItems[id]
+		s.mediaMu.RUnlock()
+		alt := img.Title
+		if alt == "" {
+			alt = "Generated Image"
+		}
+		results = append(results, generatedMediaResult{
+			MediaType: "image",
+			URL:       img.URL,
+			MimeType:  "image/jpeg",
+			Markdown:  fmt.Sprintf("![%s](%s)", alt, img.URL),
+			Entry:     entry,
+		})
+	}
+	for _, vid := range lastFrame.GeneratedVideos {
+		id := strings.TrimPrefix(vid.URL, s.requestBaseURL(ctx)+"/v1/media/")
+		s.mediaMu.RLock()
+		entry := s.mediaItems[id]
+		s.mediaMu.RUnlock()
+		title := vid.Title
+		if title == "" {
+			title = "Generated Video"
+		}
+		md := fmt.Sprintf("[Download Video (%s)](%s)", title, vid.URL)
+		if vid.ThumbnailURL != "" {
+			md = fmt.Sprintf("[![%s](%s)](%s)\n\n%s", title, vid.ThumbnailURL, vid.URL, md)
+		}
+		results = append(results, generatedMediaResult{
+			MediaType:    "video",
+			URL:          vid.URL,
+			ThumbnailURL: vid.ThumbnailURL,
+			MimeType:     "video/mp4",
+			Markdown:     md,
+			Entry:        entry,
+		})
+	}
+	return results, lastFrame.Text, nil
+}
+
+// executeServerSideMediaCalls executes any BuiltinMediaToolName ("generate_media")
+// calls inside interpreted.Calls and returns the formatted tool result block to
+// append to curPrompt, plus any remaining client-side tool calls.
+func (s *Server) executeServerSideMediaCalls(
+	ctx context.Context,
+	account *AccountState,
+	model *gemini.ModelInfo,
+	calls []toolbridge.Call,
+) (promptAddition string, clientCalls []toolbridge.Call, err error) {
+	var mediaCalls []toolbridge.Call
+	for _, c := range calls {
+		if c.Name == toolbridge.BuiltinMediaToolName {
+			mediaCalls = append(mediaCalls, c)
+		} else {
+			clientCalls = append(clientCalls, c)
+		}
+	}
+	if len(mediaCalls) == 0 {
+		return "", calls, nil
+	}
+
+	var toolOutputs []string
+	for _, mc := range mediaCalls {
+		mType, _ := mc.Arguments["media_type"].(string)
+		mPrompt, _ := mc.Arguments["prompt"].(string)
+		items, replyText, genErr := s.runMediaGenerationOnAccount(ctx, account, model, mType, mPrompt)
+		var outObj map[string]any
+		if genErr != nil {
+			outObj = map[string]any{
+				"status": "error",
+				"error":  genErr.Error(),
+			}
+		} else if len(items) == 0 {
+			outObj = map[string]any{
+				"status":  "no_media_returned",
+				"message": replyText,
+			}
+		} else {
+			urls := make([]string, 0, len(items))
+			mds := make([]string, 0, len(items))
+			for _, it := range items {
+				urls = append(urls, it.URL)
+				mds = append(mds, it.Markdown)
+			}
+			outObj = map[string]any{
+				"status":             "ok",
+				"media_type":         items[0].MediaType,
+				"url":                items[0].URL,
+				"urls":               urls,
+				"markdown":           strings.Join(mds, "\n\n"),
+				"local_download_cmd": fmt.Sprintf("curl -fsSL %q -o output.%s", items[0].URL, strings.TrimPrefix(filepath.Ext(items[0].URL), ".")),
+				"note":               "The generated media is live at the URL above. If the user asked to save it to a file in the workspace, run the curl command via bash; otherwise include the markdown/URL directly in your final response.",
+			}
+			if items[0].ThumbnailURL != "" {
+				outObj["thumbnail_url"] = items[0].ThumbnailURL
+			}
+		}
+		b, _ := json.Marshal(outObj)
+		callBytes, _ := json.Marshal(map[string]any{
+			"tool_calls": []any{mc},
+		})
+		toolOutputs = append(toolOutputs, fmt.Sprintf(" %s\n\nUser: [Harness tool result for %s]:\n%s", string(callBytes), toolbridge.BuiltinMediaToolName, string(b)))
+	}
+	return strings.Join(toolOutputs, "\n\n") + "\n\nAssistant:", clientCalls, nil
+}
+
+// HandleImageGeneration implements POST /v1/images/generations (OpenAI Images API).
+func (s *Server) HandleImageGeneration(ctx context.Context, w http.ResponseWriter, body map[string]any, scope AuthScope) {
+	s.handleMediaGenerationEndpoint(ctx, w, body, scope, "image")
+}
+
+// HandleVideoGeneration implements POST /v1/videos/generations.
+func (s *Server) HandleVideoGeneration(ctx context.Context, w http.ResponseWriter, body map[string]any, scope AuthScope) {
+	s.handleMediaGenerationEndpoint(ctx, w, body, scope, "video")
+}
+
+func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.ResponseWriter, body map[string]any, scope AuthScope, mediaType string) {
+	if body == nil {
+		sendChatError(w, false, transport.NewUpstreamError("request body must be a JSON object", 400, "invalid_request_error", nil, nil))
+		return
+	}
+	promptStr, _ := body["prompt"].(string)
+	promptStr = strings.TrimSpace(promptStr)
+	if promptStr == "" {
+		sendChatError(w, false, transport.NewUpstreamError("prompt is required", 400, "invalid_request_error", nil, nil))
+		return
+	}
+	requestedModel, _ := body["model"].(string)
+	respFormat, _ := body["response_format"].(string)
+	respFormat = strings.ToLower(strings.TrimSpace(respFormat))
+
+	msgs := []map[string]any{
+		{"role": "user", "content": promptStr},
+	}
+	prepBody := map[string]any{
+		"model":    requestedModel,
+		"messages": []any{msgs[0]},
+	}
+	if requestedModel == "" || strings.HasPrefix(strings.ToLower(requestedModel), "dall-e") || strings.HasPrefix(strings.ToLower(requestedModel), "gpt-image") || strings.HasPrefix(strings.ToLower(requestedModel), "imagen") || strings.HasPrefix(strings.ToLower(requestedModel), "veo") {
+		prepBody["model"] = "gemini-pro"
+	}
+
+	prep, prepErr := s.prepareGeneration(ctx, prepBody, scope, msgs, nil, nil)
+	if prepErr != nil {
+		sendChatError(w, false, prepErr)
+		return
+	}
+
+	items, replyText, err := s.runMediaGenerationOnAccount(ctx, prep.account, prep.model, mediaType, promptStr)
+	if err != nil {
+		sendChatError(w, false, err)
+		return
+	}
+	if len(items) == 0 {
+		msg := "upstream did not return generated " + mediaType
+		if strings.TrimSpace(replyText) != "" {
+			msg = strings.TrimSpace(replyText)
+		}
+		sendChatError(w, false, transport.NewUpstreamError(msg, 502, "media_generation_failed", nil, nil))
+		return
+	}
+
+	dataList := make([]map[string]any, 0, len(items))
+	for _, it := range items {
+		itemMap := map[string]any{
+			"url":            it.URL,
+			"revised_prompt": promptStr,
+			"mime_type":      it.MimeType,
+		}
+		if it.ThumbnailURL != "" {
+			itemMap["thumbnail_url"] = it.ThumbnailURL
+		}
+		if respFormat == "b64_json" && it.Entry != nil {
+			if rawBytes, _, bErr := s.ensureMediaBytes(ctx, it.Entry); bErr == nil && len(rawBytes) > 0 {
+				itemMap["b64_json"] = base64.StdEncoding.EncodeToString(rawBytes)
+			}
+		}
+		dataList = append(dataList, itemMap)
+	}
+
+	sendJSON(w, http.StatusOK, map[string]any{
+		"created": time.Now().Unix(),
+		"data":    dataList,
+	}, nil)
+}

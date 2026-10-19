@@ -362,6 +362,11 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 				return s.abortOrRevision(idx, "regressed to an empty completed call")
 			}
 			call := normCalls[0]
+			if call.Name == BuiltinMediaToolName {
+				// Server-side intercepted tool: hold back from client SSE stream.
+				pos = objEnd
+				continue
+			}
 			if s.contract != nil && s.contract.ChoiceMode == "function" && s.contract.ForcedFunction != "" && idx == 0 && call.Name != s.contract.ForcedFunction {
 				return s.abortOrRevision(idx, "changed to a function that is not forced")
 			}
@@ -425,6 +430,9 @@ func (s *LiveToolCallStreamer) PushError(text string) error {
 			if idx < len(s.states) && s.states[idx].emittedAny() {
 				return s.revision(idx, &s.states[idx], "regressed to an incomplete object")
 			}
+			return nil
+		}
+		if name == BuiltinMediaToolName {
 			return nil
 		}
 		if _, allowed := s.allow[name]; !allowed {

@@ -94,6 +94,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	requested := prep.requested
 	effortStr := prep.effortStr
 	hasTools := prep.hasTools
+	toolsRaw = prep.toolsRaw
 	stream := prep.stream
 	buffered := prep.buffered
 	opts := prep.opts
@@ -311,7 +312,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	freshSocketNext := false
 	rebootstrapNext := false
 	priorAttemptSentThought := false
-	for attempt := range maxAttempts {
+	serverMediaRounds := 0
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		curAttempt = attempt
 		var (
 			candidateID           string
@@ -393,11 +395,17 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			account.mu.Unlock()
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
 				attemptStateMu.Lock()
-				observeIdentity(update.AnsweredModelID, update.AnsweredModelLabel)
+				if update.MediaToolActive {
+					servedID = model.ModelID
+					servedLabel = model.ModelName
+					identityConflict = false
+				} else {
+					observeIdentity(update.AnsweredModelID, update.AnsweredModelLabel)
+				}
 				if servedID != "" {
 					markPhase(&identityMs)
 				}
-				earlyMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
+				earlyMismatch := !update.MediaToolActive && s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
 					return transport.ErrStopStreaming
@@ -421,7 +429,13 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						continue
 					}
 					attemptStateMu.Lock()
+					s.rewriteFrameMedia(ctx, account.ID, &frame)
 					observeIdentity(frame.AnsweredModelID, frame.AnsweredModelLabel)
+					if len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0 {
+						servedID = model.ModelID
+						servedLabel = model.ModelName
+						identityConflict = false
+					}
 					if servedID != "" {
 						markPhase(&identityMs)
 					}
@@ -804,6 +818,17 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		var calls []toolbridge.Call
 		if interpreted != nil {
 			calls = interpreted.Calls
+		}
+		if hasServerSideMediaCalls(calls) && serverMediaRounds < 2 {
+			promptAdd, clientCalls, _ := s.executeServerSideMediaCalls(ctx, account, model, calls)
+			if len(clientCalls) == 0 {
+				curPrompt = curPrompt + promptAdd
+				opts.Metadata = nil
+				serverMediaRounds++
+				attempt--
+				continue
+			}
+			calls = clientCalls
 		}
 		var oaCalls []toolbridge.OpenAIToolCall
 		finish := "stop"

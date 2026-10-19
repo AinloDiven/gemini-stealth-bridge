@@ -1552,6 +1552,7 @@ type preparedGeneration struct {
 	hasTools            bool
 	stream              bool
 	buffered            bool
+	toolsRaw            any
 	opts                gemini.StreamOptions
 	fullPrompt          string
 	curPrompt           string
@@ -1616,6 +1617,7 @@ func (s *Server) prepareGeneration(
 		return nil, err
 	}
 
+	toolsRaw = toolbridge.AugmentToolsWithMediaGenerator(toolsRaw, toolChoiceRaw)
 	contract, err := toolbridge.ValidateToolRequest(toolsRaw, toolChoiceRaw)
 	if err != nil {
 		return nil, err
@@ -1694,7 +1696,7 @@ func (s *Server) prepareGeneration(
 		ThinkingLevel:   thinkLvl,
 		Temporary:       tempReq || s.Cfg.Temporary,
 		Language:        s.Cfg.Locale,
-		DisableTools:    !strings.EqualFold(s.Cfg.ProtocolMode, "web") || hasTools,
+		DisableTools:    hasTools,
 		HasTools:        hasTools,
 		ProtocolMode:    s.Cfg.ProtocolMode,
 		PersonalContext: s.Cfg.PersonalContext,
@@ -1735,6 +1737,7 @@ func (s *Server) prepareGeneration(
 		requested:           requested,
 		effortStr:           effortStr,
 		contract:            contract,
+		toolsRaw:            toolsRaw,
 		hasTools:            hasTools,
 		stream:              stream,
 		buffered:            buffered,

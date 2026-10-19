@@ -132,6 +132,10 @@ type Server struct {
 
 	adminAuthMu    sync.Mutex
 	adminAuthFails map[string][]time.Time
+
+	mediaMu    sync.RWMutex
+	mediaItems map[string]*mediaEntry
+	mediaOrder []string
 }
 
 // New constructs a new Server from cfg.
@@ -299,9 +303,12 @@ func (s *Server) defaultPoolToken() string {
 // ServeHTTP implements http.Handler for all bridge endpoints.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
-	ctx := r.Context()
+	ctx := withRequestBaseURL(r.Context(), r, s.Cfg.Port)
 
 	switch {
+	case r.Method == http.MethodGet && (strings.HasPrefix(p, "/v1/media/") || strings.HasPrefix(p, "/media/")):
+		s.HandleGetMedia(w, r)
+		return
 	case s.Cfg.WebUI && r.Method == http.MethodGet && (p == "/" || p == "/ui" || p == "/ui/" || p == "/dashboard"):
 		s.HandleWebUI(w, r)
 		return
@@ -568,6 +575,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.HandleResponses(ctx, w, body, scope)
+		return
+
+	case r.Method == http.MethodPost && (p == "/v1/images/generations" || p == "/images/generations"):
+		scope := s.ResolveAuthScope(r)
+		if !scope.OK {
+			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
+			return
+		}
+		body, ok := readJSONBody(w, r)
+		if !ok {
+			return
+		}
+		s.HandleImageGeneration(ctx, w, body, scope)
+		return
+
+	case r.Method == http.MethodPost && (p == "/v1/videos/generations" || p == "/videos/generations"):
+		scope := s.ResolveAuthScope(r)
+		if !scope.OK {
+			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
+			return
+		}
+		body, ok := readJSONBody(w, r)
+		if !ok {
+			return
+		}
+		s.HandleVideoGeneration(ctx, w, body, scope)
 		return
 	case r.Method == http.MethodPost && (p == "/v1/refresh" || p == "/refresh"):
 		if r.Header.Get("Origin") != "" {

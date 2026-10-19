@@ -17,6 +17,15 @@ type GeneratedImage struct {
 	Alt   string `json:"alt,omitempty"`
 }
 
+// GeneratedVideo represents a generated video returned inside a StreamGenerate or hNvQHb frame.
+type GeneratedVideo struct {
+	URL          string `json:"url"`
+	StreamURL    string `json:"streamUrl,omitempty"`
+	ThumbnailURL string `json:"thumbnailUrl,omitempty"`
+	Title        string `json:"title,omitempty"`
+	MimeType     string `json:"mimeType,omitempty"`
+}
+
 // Frame is a single parsed candidate frame from a wrb.fr envelope.
 type Frame struct {
 	RCID               string           `json:"rcid"`
@@ -26,6 +35,7 @@ type Frame struct {
 	AnsweredModelID    string           `json:"answeredModelId,omitempty"`
 	AnsweredModelLabel string           `json:"answeredModelLabel,omitempty"`
 	GeneratedImages    []GeneratedImage `json:"generatedImages,omitempty"`
+	GeneratedVideos    []GeneratedVideo `json:"generatedVideos,omitempty"`
 }
 
 // LineParseResult holds the parsed contents of one StreamGenerate line.
@@ -35,6 +45,9 @@ type LineParseResult struct {
 	ContextToken       string
 	AnsweredModelID    string
 	AnsweredModelLabel string
+	AsyncVideoCID      string
+	AsyncVideoStatus   string
+	MediaToolActive    bool
 	StreamEnd          bool
 	Frames             []Frame
 }
@@ -69,8 +82,9 @@ var (
 		"saya adalah model bahasa, dan saya tidak dirancang untuk itu",
 	}
 	hex16Re                 = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
-	googleUserContentRe     = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
-	imageSizeSuffixRe       = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
+	googleUserContentRe           = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
+	imageSizeSuffixRe             = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
+	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)https?://googleusercontent\.com/(?:image_generation_content|generated_video_content)/\S*`)
 	closedThinkBlockRe      = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
 	codeEventBlockRe        = regexp.MustCompile("(?is)```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+\\s*([\\s\\S]*?)```\\s*")
 	openThinkStartRe        = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
@@ -549,6 +563,39 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 			res.AnsweredModelLabel = answeredLabel
 		}
 
+		// Check for async video_generation trigger in pj[6] ("7" in 1-based sparse dictionary) or pj[45] ("46").
+		if toolStatus, ok := jspbField(pj, 6).([]any); ok && len(toolStatus) >= 2 {
+			if toolMeta, ok := toolStatus[1].([]any); ok && len(toolMeta) > 0 {
+				toolName, _ := toolMeta[0].(string)
+				if toolName == "video_generation" {
+					res.MediaToolActive = true
+					if res.CID != "" {
+						res.AsyncVideoCID = res.CID
+					}
+					if msg, _ := toolStatus[0].(string); msg != "" {
+						res.AsyncVideoStatus = msg
+					}
+				} else if len(toolMeta) > 1 {
+					if labelArr, ok := toolMeta[1].([]any); ok && len(labelArr) > 2 {
+						if lbl, _ := labelArr[2].(string); strings.Contains(strings.ToLower(lbl), "image") {
+							res.MediaToolActive = true
+						}
+					}
+				}
+			}
+		}
+		if res.MediaToolActive {
+			answeredID = ""
+			answeredLabel = ""
+			res.AnsweredModelID = ""
+			res.AnsweredModelLabel = ""
+		}
+		if asyncRef, ok := jspbField(pj, 45).([]any); ok && len(asyncRef) > 0 {
+			if refCID, _ := asyncRef[0].(string); strings.HasPrefix(refCID, "c_") && res.AsyncVideoCID != "" {
+				res.AsyncVideoCID = refCID
+			}
+		}
+
 		if len(pj) > 4 {
 			if cands, ok := pj[4].([]any); ok {
 				for _, cAny := range cands {
@@ -556,61 +603,14 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 					if !ok {
 						continue
 					}
-					var rcid string
-					if len(c) > 0 {
-						rcid, _ = c[0].(string)
-					}
-					var text string
-					if len(c) > 1 {
-						if tArr, ok := c[1].([]any); ok && len(tArr) > 0 {
-							text, _ = tArr[0].(string)
+					if frame, ok := parseCandidateSlice(c, answeredID, answeredLabel); ok {
+						if len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0 {
+							res.MediaToolActive = true
+							res.AnsweredModelID = ""
+							res.AnsweredModelLabel = ""
 						}
+						res.Frames = append(res.Frames, frame)
 					}
-					if strings.HasPrefix(strings.TrimSpace(text), "http://googleusercontent.com/image_generation_content/") {
-						text = ""
-					}
-
-					var thoughts string
-					if tf, ok := jspbField(c, 37).([]any); ok && len(tf) > 0 {
-						if tf0, ok := tf[0].([]any); ok && len(tf0) > 0 {
-							thoughts, _ = tf0[0].(string)
-						}
-					}
-
-					done := false
-					if len(c) > 8 {
-						if stArr, ok := c[8].([]any); ok && len(stArr) > 0 {
-							if f, ok := stArr[0].(float64); ok && int(f) == 2 {
-								done = true
-							}
-						}
-					}
-
-					images := extractGeneratedImages(c)
-					text, thoughts = sanitizeCandidateTextAndThoughts(text, thoughts, done)
-					if strings.TrimSpace(text) == "" && len(images) > 0 {
-						var mdParts []string
-						for _, img := range images {
-							alt := img.Title
-							if alt == "" {
-								alt = img.Alt
-							}
-							if alt == "" {
-								alt = "Generated Image"
-							}
-							mdParts = append(mdParts, fmt.Sprintf("![%s](%s)", alt, img.URL))
-						}
-						text = strings.Join(mdParts, "\n\n")
-					}
-					res.Frames = append(res.Frames, Frame{
-						RCID:               rcid,
-						Text:               text,
-						Thoughts:           thoughts,
-						Done:               done,
-						AnsweredModelID:    answeredID,
-						AnsweredModelLabel: answeredLabel,
-						GeneratedImages:    images,
-					})
 				}
 			}
 		}
@@ -638,15 +638,179 @@ func isDigits(s string) bool {
 	return true
 }
 
+func jspbSubField(parent any, index int) any {
+	if parent == nil {
+		return nil
+	}
+	if arr, ok := parent.([]any); ok {
+		return jspbField(arr, index)
+	}
+	if m, ok := parent.(map[string]any); ok {
+		return m[strconv.Itoa(index+1)]
+	}
+	return nil
+}
+
+func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool) {
+	var rcid string
+	if len(c) > 0 {
+		rcid, _ = c[0].(string)
+	}
+	var text string
+	if len(c) > 1 {
+		if tArr, ok := c[1].([]any); ok && len(tArr) > 0 {
+			text, _ = tArr[0].(string)
+		}
+	}
+	if googleGenContentPlaceholderRe.MatchString(text) {
+		text = strings.TrimSpace(googleGenContentPlaceholderRe.ReplaceAllString(text, ""))
+	}
+
+	var thoughts string
+	if tf, ok := jspbField(c, 37).([]any); ok && len(tf) > 0 {
+		if tf0, ok := tf[0].([]any); ok && len(tf0) > 0 {
+			thoughts, _ = tf0[0].(string)
+		}
+	}
+
+	done := false
+	if len(c) > 8 {
+		if stArr, ok := c[8].([]any); ok && len(stArr) > 0 {
+			if f, ok := stArr[0].(float64); ok && int(f) == 2 {
+				done = true
+			}
+		}
+	}
+
+	images := extractGeneratedImages(c)
+	videos := extractGeneratedVideos(c)
+	if len(images) > 0 || len(videos) > 0 {
+		answeredID = ""
+		answeredLabel = ""
+	}
+	text, thoughts = sanitizeCandidateTextAndThoughts(text, thoughts, done)
+
+	var mdParts []string
+	for _, img := range images {
+		if strings.Contains(text, img.URL) {
+			continue
+		}
+		alt := img.Title
+		if alt == "" {
+			alt = img.Alt
+		}
+		if alt == "" {
+			alt = "Generated Image"
+		}
+		mdParts = append(mdParts, fmt.Sprintf("![%s](%s)", alt, img.URL))
+	}
+	for _, vid := range videos {
+		if strings.Contains(text, vid.URL) {
+			continue
+		}
+		title := vid.Title
+		if title == "" {
+			title = "Generated Video"
+		}
+		if vid.ThumbnailURL != "" {
+			mdParts = append(mdParts, fmt.Sprintf("[![%s](%s)](%s)\n\n[Download Video (%s)](%s)", title, vid.ThumbnailURL, vid.URL, title, vid.URL))
+		} else {
+			mdParts = append(mdParts, fmt.Sprintf("[Download Video (%s)](%s)", title, vid.URL))
+		}
+	}
+	if len(mdParts) > 0 {
+		joined := strings.Join(mdParts, "\n\n")
+		if strings.TrimSpace(text) == "" {
+			text = joined
+		} else {
+			text = strings.TrimSpace(text) + "\n\n" + joined
+		}
+	}
+
+	return Frame{
+		RCID:               rcid,
+		Text:               text,
+		Thoughts:           thoughts,
+		Done:               done,
+		AnsweredModelID:    answeredID,
+		AnsweredModelLabel: answeredLabel,
+		GeneratedImages:    images,
+		GeneratedVideos:    videos,
+	}, true
+}
+
+// ParseConversationPollResponse parses an hNvQHb batchexecute response payload
+// when polling for an asynchronous video generation turn.
+func ParseConversationPollResponse(body string) (*LineParseResult, error) {
+	for _, rawLine := range strings.Split(body, "\n") {
+		s := strings.TrimSpace(rawLine)
+		if !strings.HasPrefix(s, "[[") || !strings.Contains(s, "hNvQHb") {
+			continue
+		}
+		var outer []any
+		if err := json.Unmarshal([]byte(s), &outer); err != nil {
+			continue
+		}
+		for _, partAny := range outer {
+			part, ok := partAny.([]any)
+			if !ok || len(part) < 3 {
+				continue
+			}
+			tag, _ := part[0].(string)
+			rpcID, _ := part[1].(string)
+			if tag != "wrb.fr" || rpcID != "hNvQHb" {
+				continue
+			}
+			innerStr, ok := part[2].(string)
+			if !ok || innerStr == "" {
+				return nil, fmt.Errorf("conversation not found or empty in hNvQHb")
+			}
+			var inner []any
+			if err := json.Unmarshal([]byte(innerStr), &inner); err != nil || len(inner) == 0 {
+				continue
+			}
+			turns, ok := inner[0].([]any)
+			if !ok || len(turns) == 0 {
+				continue
+			}
+			turn, ok := turns[0].([]any)
+			if !ok || len(turn) <= 3 {
+				continue
+			}
+			res := &LineParseResult{}
+			if ids, ok := turn[0].([]any); ok {
+				if len(ids) > 0 {
+					res.CID, _ = ids[0].(string)
+				}
+				if len(ids) > 1 {
+					res.RID, _ = ids[1].(string)
+				}
+			}
+			if candWrap, ok := turn[3].([]any); ok && len(candWrap) > 0 {
+				if cands, ok := candWrap[0].([]any); ok {
+					for _, cAny := range cands {
+						if c, ok := cAny.([]any); ok {
+							if frame, ok := parseCandidateSlice(c, "", ""); ok {
+								res.Frames = append(res.Frames, frame)
+							}
+						}
+					}
+				}
+			}
+			if len(res.Frames) > 0 {
+				return res, nil
+			}
+		}
+	}
+	return nil, nil
+}
+
 func extractGeneratedImages(c []any) []GeneratedImage {
-	if len(c) <= 12 {
+	c12 := jspbField(c, 12)
+	if c12 == nil {
 		return nil
 	}
-	c12, ok := c[12].([]any)
-	if !ok || len(c12) <= 7 {
-		return nil
-	}
-	c12_7, ok := c12[7].([]any)
+	c12_7, ok := jspbSubField(c12, 7).([]any)
 	if !ok || len(c12_7) == 0 {
 		return nil
 	}
@@ -693,6 +857,67 @@ func extractGeneratedImages(c []any) []GeneratedImage {
 		})
 	}
 	return images
+}
+
+func extractGeneratedVideos(c []any) []GeneratedVideo {
+	c12 := jspbField(c, 12)
+	if c12 == nil {
+		return nil
+	}
+	v60 := jspbSubField(c12, 59)
+	if v60 == nil {
+		return nil
+	}
+	var videos []GeneratedVideo
+	seen := make(map[string]bool)
+	var walk func(node any)
+	walk = func(node any) {
+		arr, ok := node.([]any)
+		if !ok {
+			return
+		}
+		if len(arr) > 7 {
+			fname, _ := arr[2].(string)
+			mime := ""
+			if len(arr) > 11 {
+				mime, _ = arr[11].(string)
+			}
+			if urls, ok := arr[7].([]any); ok && len(urls) >= 2 && (strings.HasSuffix(fname, ".mp4") || strings.Contains(mime, "video/")) {
+				thumbURL, _ := urls[0].(string)
+				downloadURL, _ := urls[1].(string)
+				streamURL := ""
+				if len(urls) > 2 {
+					streamURL, _ = urls[2].(string)
+				}
+				primary := downloadURL
+				if primary == "" {
+					primary = streamURL
+				}
+				if primary != "" && !seen[primary] {
+					seen[primary] = true
+					if mime == "" {
+						mime = "video/mp4"
+					}
+					if thumbURL != "" && googleUserContentRe.MatchString(thumbURL) {
+						thumbURL = imageSizeSuffixRe.ReplaceAllString(thumbURL, "") + "=s1024"
+					}
+					videos = append(videos, GeneratedVideo{
+						URL:          primary,
+						StreamURL:    streamURL,
+						ThumbnailURL: thumbURL,
+						Title:        fname,
+						MimeType:     mime,
+					})
+					return
+				}
+			}
+		}
+		for _, child := range arr {
+			walk(child)
+		}
+	}
+	walk(v60)
+	return videos
 }
 
 func extractErrCode(entry []any) int {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,13 @@ import (
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	"github.com/google/uuid"
 )
+
+var videoPromptHintRe = regexp.MustCompile(`(?i)\b(video|videos|veo|mp4|clip|clips|animasi|animation|footage)\b`)
+
+// PromptRequestsVideo reports whether prompt likely asks Gemini Web to generate a video.
+func PromptRequestsVideo(prompt string) bool {
+	return videoPromptHintRe.MatchString(prompt)
+}
 
 // UploadedFile represents the [[uploadPath], safeName] tuple expected in inner[0][3].
 type UploadedFile struct {
@@ -261,7 +269,7 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 	inner[27] = 1 // return_request_routing_early
 	inner[30] = []int{4}
 	inner[41] = []int{1}
-	if opts.Temporary {
+	if opts.Temporary && (inner[11] != 0 || !PromptRequestsVideo(prompt)) {
 		inner[45] = 1
 	}
 	inner[53] = 0
@@ -394,6 +402,7 @@ func (ac *AccountClient) streamGenerateLocked(
 	var (
 		lineBuf         strings.Builder
 		cid, rid        string
+		asyncVideoCID   string
 		frameCount      int
 		sawDone         bool
 		sawContextToken bool
@@ -418,6 +427,9 @@ func (ac *AccountClient) streamGenerateLocked(
 		} else {
 			parsed.RID = rid
 		}
+		if parsed.AsyncVideoCID != "" {
+			asyncVideoCID = parsed.AsyncVideoCID
+		}
 		if parsed.ContextToken != "" {
 			sawContextToken = true
 		}
@@ -430,7 +442,7 @@ func (ac *AccountClient) streamGenerateLocked(
 			}
 		}
 		frameCount += len(parsed.Frames)
-		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.AnsweredModelID != "" || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
+		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.AnsweredModelID != "" || parsed.MediaToolActive || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
 			return onFrame(parsed)
 		}
 		return nil
@@ -495,6 +507,35 @@ func (ac *AccountClient) streamGenerateLocked(
 				}
 			}
 		}
+		if frameCount == 0 && asyncVideoCID != "" {
+			// If Temporary was enabled and inner[45] was 1, Google does not persist the conversation for hNvQHb polling.
+			// Re-run once with Temporary=false and clean up the conversation afterward.
+			usedTemp := opts.Temporary && !PromptRequestsVideo(prompt)
+			if usedTemp {
+				retryOpts := opts
+				retryOpts.Temporary = false
+				retryRes, retryErr := ac.streamGenerateLocked(ctx, sc, leasedCookie, prompt, retryOpts, onFrame)
+				if retryRes != nil && retryRes.CID != "" {
+					go ac.deleteConversationAsync(retryRes.CID)
+				}
+				return retryRes, retryErr
+			}
+			polled, pollErr := ac.pollAsyncVideoGenerationLocked(ctx, sc, cookie, at, bl, fSid, lang, asyncVideoCID)
+			if opts.Temporary {
+				go ac.deleteConversationAsync(asyncVideoCID)
+			}
+			if pollErr != nil {
+				return nil, pollErr
+			}
+			if polled != nil && len(polled.Frames) > 0 {
+				frameCount += len(polled.Frames)
+				if onFrame != nil {
+					if err := onFrame(polled); err != nil && !errors.Is(err, transport.ErrStopStreaming) {
+						return nil, err
+					}
+				}
+			}
+		}
 	}
 
 	return &StreamResponse{
@@ -505,4 +546,191 @@ func (ac *AccountClient) streamGenerateLocked(
 		RID:     rid,
 		Body:    res.Body,
 	}, nil
+}
+
+func (ac *AccountClient) pollAsyncVideoGenerationLocked(
+	ctx context.Context,
+	sc *transport.StealthClient,
+	cookie, at, bl, fSid, lang, cid string,
+) (*LineParseResult, error) {
+	pollCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+
+	payloadBytes, _ := json.Marshal([]any{cid, 10, nil, 1, []int{1}, []int{4}, nil, 1})
+	freqBytes, _ := json.Marshal([][][]any{{{"hNvQHb", string(payloadBytes), nil, "generic"}}})
+	shortID := strings.TrimPrefix(cid, "c_")
+
+	ticker := time.NewTicker(4 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-pollCtx.Done():
+			return nil, pollCtx.Err()
+		case <-ticker.C:
+			q := url.Values{}
+			q.Set("rpcids", "hNvQHb")
+			q.Set("source-path", "/app/"+shortID)
+			if bl != "" {
+				q.Set("bl", bl)
+			}
+			if fSid != "" {
+				q.Set("f.sid", fSid)
+			}
+			q.Set("hl", lang)
+			q.Set("_reqid", strconv.FormatInt(ac.nextReqID(), 10))
+			q.Set("rt", "c")
+
+			form := url.Values{}
+			form.Set("at", at)
+			form.Set("f.req", string(freqBytes))
+
+			res, err := sc.Do(pollCtx, transport.RequestOptions{
+				Method: "POST",
+				URL:    Origin + "/_/BardChatUi/data/batchexecute?" + q.Encode(),
+				Kind:   transport.ReqKindCORS,
+				Headers: map[string]string{
+					"content-type":  "application/x-www-form-urlencoded;charset=utf-8",
+					"x-same-domain": "1",
+					"cookie":        cookie,
+				},
+				Body:    []byte(form.Encode()),
+				Timeout: 20 * time.Second,
+			})
+			if err != nil || res.Status != 200 {
+				continue
+			}
+			ac.absorbAndPersistCookies(res.SetCookies)
+			parsed, parseErr := ParseConversationPollResponse(res.Body)
+			if parseErr != nil {
+				return nil, parseErr
+			}
+			if parsed != nil && len(parsed.Frames) > 0 {
+				f := parsed.Frames[0]
+				if len(f.GeneratedVideos) > 0 || (f.Done && strings.TrimSpace(f.Text) != "" && !strings.Contains(strings.ToLower(f.Text), "generating your video")) {
+					f.Done = true
+					parsed.Frames[0] = f
+					return parsed, nil
+				}
+			}
+		}
+	}
+}
+
+func (ac *AccountClient) deleteConversationAsync(cid string) {
+	if cid == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	sess, err := ac.acquireSession(ctx)
+	if err != nil {
+		return
+	}
+	ac.mu.RLock()
+	at := ac.at
+	bl := ac.bl
+	fSid := ac.fSid
+	cookie := ac.cookieHeader
+	lang := ac.locale
+	ac.mu.RUnlock()
+	if lang == "" {
+		lang = "en"
+	}
+	payloadBytes, _ := json.Marshal([]string{cid})
+	freqBytes, _ := json.Marshal([][][]any{{{"GzXR5e", string(payloadBytes), nil, "generic"}}})
+	q := url.Values{}
+	q.Set("rpcids", "GzXR5e")
+	q.Set("source-path", "/app")
+	if bl != "" {
+		q.Set("bl", bl)
+	}
+	if fSid != "" {
+		q.Set("f.sid", fSid)
+	}
+	q.Set("hl", lang)
+	q.Set("_reqid", strconv.FormatInt(ac.nextReqID(), 10))
+	q.Set("rt", "c")
+	form := url.Values{}
+	form.Set("at", at)
+	form.Set("f.req", string(freqBytes))
+	_, _ = sess.Client.Do(ctx, transport.RequestOptions{
+		Method: "POST",
+		URL:    Origin + "/_/BardChatUi/data/batchexecute?" + q.Encode(),
+		Kind:   transport.ReqKindCORS,
+		Headers: map[string]string{
+			"content-type":  "application/x-www-form-urlencoded;charset=utf-8",
+			"x-same-domain": "1",
+			"cookie":        cookie,
+		},
+		Body:    []byte(form.Encode()),
+		Timeout: 15 * time.Second,
+	})
+}
+
+// DownloadMedia downloads a generated image or video URL using the account's
+// authenticated session cookies, falling back to fallbackURL if provided.
+func (ac *AccountClient) DownloadMedia(ctx context.Context, rawURL, fallbackURL string) ([]byte, string, error) {
+	sess, err := ac.acquireSession(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	ac.mu.RLock()
+	cookie := ac.cookieHeader
+	ac.mu.RUnlock()
+
+	candidates := []string{rawURL}
+	if fallbackURL != "" && fallbackURL != rawURL {
+		candidates = append(candidates, fallbackURL)
+	}
+	var lastStatus int
+	for _, startURL := range candidates {
+		if startURL == "" {
+			continue
+		}
+		curURL := startURL
+		for hop := 0; hop < 6; hop++ {
+			ac.mu.RLock()
+			cookie = ac.cookieHeader
+			ac.mu.RUnlock()
+
+			res, doErr := sess.Client.Do(ctx, transport.RequestOptions{
+				Method: "GET",
+				URL:    curURL,
+				Kind:   transport.ReqKindNavigate,
+				Headers: map[string]string{
+					"cookie":  cookie,
+					"referer": Origin + "/",
+				},
+				Timeout: 60 * time.Second,
+			})
+			if doErr != nil {
+				break
+			}
+			ac.absorbAndPersistCookies(res.SetCookies)
+			lastStatus = res.Status
+			if res.Status == 301 || res.Status == 302 || res.Status == 303 || res.Status == 307 || res.Status == 308 {
+				loc := strings.TrimSpace(res.Headers["location"])
+				if loc == "" {
+					break
+				}
+				if strings.HasPrefix(loc, "/") {
+					if parsedBase, err := url.Parse(curURL); err == nil {
+						loc = parsedBase.Scheme + "://" + parsedBase.Host + loc
+					}
+				}
+				curURL = loc
+				continue
+			}
+			if res.Status == 200 && len(res.Body) > 0 {
+				ct := res.Headers["content-type"]
+				if ct == "" {
+					ct = "application/octet-stream"
+				}
+				return []byte(res.Body), ct, nil
+			}
+			break
+		}
+	}
+	return nil, "", fmt.Errorf("media download failed (HTTP %d)", lastStatus)
 }

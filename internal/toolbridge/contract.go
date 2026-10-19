@@ -12,6 +12,55 @@ import (
 
 var toolNameRe = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
 
+
+// BuiltinMediaToolName is the server-side tool injected into agent tool lists
+// so Gemini can invoke native Imagen / Nano Banana (image) and Veo (video)
+// generation during tool-enabled coding/agent sessions.
+const BuiltinMediaToolName = "generate_media"
+
+// AugmentToolsWithMediaGenerator appends the server-side generate_media tool
+// when tools are enabled in "auto" mode and the caller has not already defined
+// a tool with that name.
+func AugmentToolsWithMediaGenerator(tools any, toolChoice any) any {
+	contract, err := ValidateToolRequest(tools, toolChoice)
+	if err != nil || len(contract.Tools) == 0 || (contract.ChoiceMode != "auto" && contract.ChoiceMode != "") {
+		return tools
+	}
+	for _, t := range contract.Tools {
+		if t.Name == BuiltinMediaToolName {
+			return tools
+		}
+	}
+	mediaTool := map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        BuiltinMediaToolName,
+			"description": "Generate an image (Imagen / Nano Banana) or video with audio (Veo) using Gemini's native media generator whenever the user asks for an image/video or when visual/video assets are needed. Returns a direct downloadable HTTP URL (http://.../v1/media/...) that you can display in Markdown or download to a local file via curl/bash.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"media_type": map[string]any{
+						"type":        "string",
+						"enum":        []string{"image", "video"},
+						"description": "Type of media to generate: 'image' or 'video'.",
+					},
+					"prompt": map[string]any{
+						"type":        "string",
+						"description": "Detailed visual description of the image or video to generate.",
+					},
+				},
+				"required": []string{"media_type", "prompt"},
+			},
+		},
+	}
+	if rawSlice, ok := tools.([]any); ok {
+		out := make([]any, 0, len(rawSlice)+1)
+		out = append(out, rawSlice...)
+		out = append(out, mediaTool)
+		return out
+	}
+	return tools
+}
 // ToolDef is a normalized tool definition.
 type ToolDef struct {
 	Name        string         `json:"name"`

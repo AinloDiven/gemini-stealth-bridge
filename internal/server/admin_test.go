@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 )
 
 func TestWebUIDisabledByDefaultReturns404(t *testing.T) {
@@ -212,5 +214,84 @@ func TestAdminAccountLifecycleAndWriteOnlyCookies(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(cfg.AccountsDir, "ops-acct-1.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected ops-acct-1.json removed from disk")
+	}
+}
+
+func TestServerSideMediaGeneratorToolAndImageEndpoint(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+
+	callNum := 0
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			callNum++
+			switch callNum {
+			case 1:
+				// Turn 1: model decides to call built-in generate_media tool
+				_ = onFrame(&gemini.LineParseResult{
+					CID: "c_1",
+					RID: "r_1",
+					Frames: []gemini.Frame{
+						makeFrame("```json\n{\"tool_calls\":[{\"name\":\"generate_media\",\"arguments\":{\"media_type\":\"image\",\"prompt\":\"neon cyberpunk cat\"}}]}\n```", "", true, testModel.ModelID),
+					},
+				})
+			case 2:
+				// Turn 2: server-side media generation call (DisableTools=false)
+				if opts.DisableTools {
+					t.Fatalf("expected DisableTools=false during media generation, got true")
+				}
+				_ = onFrame(&gemini.LineParseResult{
+					CID:             "c_media",
+					RID:             "r_media",
+					MediaToolActive: true,
+					Frames: []gemini.Frame{
+						{
+							RCID: "rc_media",
+							Text: "![Generated Image](https://lh3.googleusercontent.com/gg-dl/test-cat=s2048)",
+							Done: true,
+							GeneratedImages: []gemini.GeneratedImage{
+								{URL: "https://lh3.googleusercontent.com/gg-dl/test-cat=s2048", Title: "Cyberpunk Cat"},
+							},
+						},
+					},
+				})
+			case 3:
+				// Turn 3: model receives the proxied /v1/media/<id>.jpg URL and calls client's bash tool to save it
+				if !strings.Contains(prompt, "/v1/media/") {
+					t.Fatalf("expected proxied /v1/media/ URL injected into continuation prompt, got: %s", prompt)
+				}
+				_ = onFrame(&gemini.LineParseResult{
+					CID: "c_2",
+					RID: "r_2",
+					Frames: []gemini.Frame{
+						makeFrame("```json\n{\"tool_calls\":[{\"name\":\"bash\",\"arguments\":{\"command\":\"curl -fsSL http://127.0.0.1:20133/v1/media/cat.jpg -o /tmp/cat.jpg\"}}]}\n```", "", true, testModel.ModelID),
+					},
+				})
+			}
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "bash",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"command": map[string]any{"type": "string"}},
+					"required":   []any{"command"},
+				},
+			},
+		},
+	}
+	rec := runChat(t, srv, acct, client, map[string]any{
+		"tools":       tools,
+		"tool_choice": "auto",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from agent generate_media + bash workflow, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"name":"bash"`) {
+		t.Fatalf("expected final client tool call to be bash, got: %s", rec.Body.String())
 	}
 }
