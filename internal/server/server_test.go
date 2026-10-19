@@ -869,6 +869,98 @@ func TestDefaultToolStreamingBuffersUntilFinalValidation(t *testing.T) {
 	}
 }
 
+func TestToolEnabledLiveProseAndPreambleReasoningStreaming(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "read_file",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"path": map[string]any{"type": "string"}},
+					"required":   []any{"path"},
+				},
+			},
+		},
+	}
+
+	// 1. Plain-text answer with tools present and KeepToolPreamble=false must stream incremental content before done=true.
+	chunk1 := strings.Repeat("Streaming plain prose answer while tools are declared in the request. ", 6) // 420 bytes
+	chunk2 := chunk1 + "Final concluding sentence."
+	var midStreamDeltas int
+	clientProse := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c1",
+				RID:             "r1",
+				AnsweredModelID: testModel.ModelID,
+				Frames:          []gemini.Frame{makeFrame(chunk1, "", false, testModel.ModelID)},
+			})
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c1",
+				RID:             "r1",
+				AnsweredModelID: testModel.ModelID,
+				Frames:          []gemini.Frame{makeFrame(chunk2, "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	recProse := runChat(t, srv, acct, clientProse, map[string]any{"stream": true, "tools": tools})
+	if recProse.Code != 200 {
+		t.Fatalf("expected 200 OK, got %d: %s", recProse.Code, recProse.Body.String())
+	}
+	var fullContent string
+	for _, ev := range parseSSEEvents(recProse.Body.String()) {
+		choices, _ := ev["choices"].([]any)
+		if len(choices) == 0 {
+			continue
+		}
+		c0, _ := choices[0].(map[string]any)
+		delta, _ := c0["delta"].(map[string]any)
+		if c, ok := delta["content"].(string); ok && c != "" {
+			midStreamDeltas++
+			fullContent += c
+		}
+	}
+	if midStreamDeltas < 2 || fullContent != chunk2 {
+		t.Fatalf("expected >=2 incremental content chunks totaling full prose, got chunks=%d content=%q", midStreamDeltas, fullContent)
+	}
+
+	// 2. Pre-tool preamble before ```json tool_calls streams live into reasoning_content on non-final frame.
+	preFrame := "Inspecting configuration before reading file.\n```json\n{\"tool_calls\":[{\"name\":\"read_file\""
+	finalToolFrame := "Inspecting configuration before reading file.\n```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/cfg\"}}]}\n```"
+	recTool := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
+		makeFrame(preFrame, "", false, testModel.ModelID),
+		makeFrame(finalToolFrame, "", true, testModel.ModelID),
+	}), map[string]any{"stream": true, "tools": tools})
+	if recTool.Code != 200 {
+		t.Fatalf("expected 200 OK, got %d: %s", recTool.Code, recTool.Body.String())
+	}
+	var reasoningBeforeTool string
+	sawTool := false
+	for _, ev := range parseSSEEvents(recTool.Body.String()) {
+		choices, _ := ev["choices"].([]any)
+		if len(choices) == 0 {
+			continue
+		}
+		c0, _ := choices[0].(map[string]any)
+		delta, _ := c0["delta"].(map[string]any)
+		if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+			sawTool = true
+		}
+		if r, ok := delta["reasoning_content"].(string); ok && r != "" && !sawTool {
+			reasoningBeforeTool += r
+		}
+		if c, ok := delta["content"].(string); ok && c != "" {
+			t.Fatalf("expected no content delta on pre-tool preamble turn, got %q", c)
+		}
+	}
+	if !sawTool || !strings.Contains(reasoningBeforeTool, "Inspecting configuration before reading file.") {
+		t.Fatalf("expected preamble streamed via reasoning_content before tool_calls, got reasoning=%q sawTool=%v", reasoningBeforeTool, sawTool)
+	}
+}
+
 func TestToolCallPreservedWhenFinalFrameOverwritesWithGeminiErrorReply(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 

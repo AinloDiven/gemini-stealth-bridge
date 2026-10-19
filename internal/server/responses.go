@@ -875,6 +875,11 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						}
 						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if identityVerified && s.Cfg.LiveThoughts {
+							if hasTools && !s.Cfg.KeepToolPreamble && sentText == "" {
+								if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
+									thoughts = appendPreambleToThoughts(thoughts, pre)
+								}
+							}
 							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 								emitReasoningDelta(thoughts[len(sentThought):])
 								sentThought = thoughts
@@ -887,7 +892,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
 								emitTextDelta(text[len(sentText):])
 								sentText = text
-							} else if hasTools && s.Cfg.KeepToolPreamble {
+							} else if hasTools && len(text) > 240 {
 								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
 									emitTextDelta(safePrefix[len(sentText):])
 									sentText = safePrefix
@@ -1186,7 +1191,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}
 		var contentStr string
 		if len(calls) > 0 {
-			if s.Cfg.KeepToolPreamble && interpreted.Text != "" {
+			if (s.Cfg.KeepToolPreamble || sentText != "") && interpreted.Text != "" {
 				contentStr = interpreted.Text
 			} else if s.Cfg.LiveThoughts && interpreted != nil && strings.TrimSpace(interpreted.Text) != "" {
 				thoughts = appendPreambleToThoughts(thoughts, interpreted.Text)

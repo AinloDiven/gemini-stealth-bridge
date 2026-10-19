@@ -461,6 +461,11 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 							startStream(false)
 						}
 						if identityVerified && s.Cfg.LiveThoughts {
+							if hasTools && !s.Cfg.KeepToolPreamble && sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) {
+								if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
+									thoughts = appendPreambleToThoughts(thoughts, pre)
+								}
+							}
 							if len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
 								startStream(false)
 								emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
@@ -486,7 +491,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
 								sentText = text
 								lastActiveKeepaliveAt = time.Now()
-							} else if hasTools && s.Cfg.KeepToolPreamble && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
+							} else if hasTools && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
 								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
 									startStream(false)
 									emit(sseDeltaContent{Content: safePrefix[len(sentText):]}, nil, nil)
@@ -791,7 +796,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		var content any = text
 		if len(calls) > 0 {
 			finish = "tool_calls"
-			if s.Cfg.KeepToolPreamble && interpreted.Text != "" {
+			if (s.Cfg.KeepToolPreamble || sentText != "") && interpreted.Text != "" {
 				content = interpreted.Text
 			} else {
 				if s.Cfg.LiveThoughts && interpreted != nil && strings.TrimSpace(interpreted.Text) != "" {
