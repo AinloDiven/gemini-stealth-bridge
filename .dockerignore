@@ -1,0 +1,15 @@
+.git
+.gitignore
+gsb
+*.exe
+*.test
+*.out
+*.db
+*.sqlite
+*.log
+accounts/
+data/
+web-credentials.json
+config.env
+PLAN_v0.3.0.md
+DESIGN.md

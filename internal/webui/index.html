@@ -1,0 +1,2109 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gsb · Gemini Stealth Bridge Control Plane</title>
+  <style>
+    :root,
+    [data-theme="light"] {
+      --bg: #F6F6F3;
+      --surface: #FFFFFF;
+      --surface-subtle: #F0EFEA;
+      --surface-hover: #E8E6DF;
+      --surface-track: #E2E0D8;
+      --text-primary: #141413;
+      --text-secondary: #575653;
+      --border: #E2E0D8;
+      --border-strong: #C7C4B8;
+      --accent: #047857;
+      --accent-bar: #059669;
+      --btn-primary-bg: #0F5338;
+      --btn-primary-fg: #FFFFFF;
+      --btn-primary-hover: #0B3E29;
+      --status-ok-bg: #ECFDF5;
+      --status-ok-fg: #047857;
+      --status-warn-bg: #FEF3C7;
+      --status-warn-fg: #B45309;
+      --status-err-bg: #FEE2E2;
+      --status-err-fg: #B91C1C;
+      --shadow-modal: 0 16px 40px rgba(20, 20, 19, 0.18);
+      --backdrop: rgba(20, 20, 19, 0.5);
+    }
+
+    [data-theme="dark"] {
+      --bg: #111110;
+      --surface: #181816;
+      --surface-subtle: #21211E;
+      --surface-hover: #292925;
+      --surface-track: #2E2E2A;
+      --text-primary: #EDEDEC;
+      --text-secondary: #9E9D99;
+      --border: #2A2A26;
+      --border-strong: #3D3D38;
+      --accent: #4ADE80;
+      --accent-bar: #10B981;
+      --btn-primary-bg: #0F5338;
+      --btn-primary-fg: #FFFFFF;
+      --btn-primary-hover: #146B48;
+      --status-ok-bg: rgba(20, 83, 45, 0.38);
+      --status-ok-fg: #4ADE80;
+      --status-warn-bg: rgba(120, 53, 15, 0.38);
+      --status-warn-fg: #FBBF24;
+      --status-err-bg: rgba(127, 29, 29, 0.38);
+      --status-err-fg: #F87171;
+      --shadow-modal: 0 16px 48px rgba(0, 0, 0, 0.65);
+      --backdrop: rgba(0, 0, 0, 0.72);
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    html {
+      font-size: 16px;
+      -webkit-text-size-adjust: 100%;
+    }
+
+    body {
+      margin: 0;
+      background-color: var(--bg);
+      color: var(--text-primary);
+      font-family: 'Noto Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      font-size: 0.875rem;
+      font-weight: 400;
+      line-height: 1.5;
+      min-height: 100dvh;
+      font-variant-numeric: tabular-nums;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button, input, select, textarea, strong, b, code, pre, .mono {
+      font-family: 'Noto Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      font-variant-numeric: tabular-nums;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    h1, h2, h3 {
+      font-family: 'Noto Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      margin: 0;
+      color: var(--text-primary);
+      letter-spacing: -0.01em;
+    }
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .skip-link {
+      position: absolute;
+      left: -9999px;
+      top: 8px;
+      z-index: 100;
+      background: var(--btn-primary-bg);
+      color: var(--btn-primary-fg);
+      padding: 8px 16px;
+      border-radius: 6px;
+      text-decoration: none;
+      font-weight: 600;
+    }
+
+    .skip-link:focus-visible {
+      left: 16px;
+    }
+
+    /* Top Navigation Bar */
+    .top-bar {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+    }
+
+    .top-bar-inner {
+      max-width: 1240px;
+      margin: 0 auto;
+      min-height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      padding: 8px 0;
+    }
+
+    .nav-left {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .brand-title {
+      font-size: 1.0625rem;
+      font-weight: 700;
+    }
+
+    .brand-meta {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+
+    /* Segmented View Tabs */
+    .view-tabs {
+      display: inline-flex;
+      background: var(--surface-subtle);
+      padding: 3px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      gap: 2px;
+    }
+
+    .view-tab {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--text-secondary);
+      font-family: inherit;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .view-tab:hover {
+      color: var(--text-primary);
+    }
+
+    .view-tab[aria-selected="true"] {
+      background: var(--surface);
+      color: var(--text-primary);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+    }
+
+    .tab-count {
+      font-size: 0.6875rem;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: var(--surface-subtle);
+      color: var(--text-secondary);
+    }
+
+    .nav-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 36px;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-family: inherit;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      line-height: 1.2;
+      cursor: pointer;
+      border: 1px solid transparent;
+      text-decoration: none;
+      text-align: center;
+      max-width: 100%;
+    }
+
+    .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      pointer-events: none;
+    }
+
+    .btn-primary {
+      background: var(--btn-primary-bg);
+      color: var(--btn-primary-fg);
+      border-color: rgba(255, 255, 255, 0.08);
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: var(--btn-primary-hover);
+    }
+
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text-primary);
+      border-color: var(--border-strong);
+    }
+
+    .btn-secondary:hover:not(:disabled) {
+      background: var(--surface-subtle);
+    }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--text-secondary);
+      border-color: transparent;
+    }
+
+    .btn-ghost:hover:not(:disabled) {
+      background: var(--surface-subtle);
+      color: var(--text-primary);
+    }
+
+    .btn-row {
+      min-height: 30px;
+      padding: 4px 10px;
+      font-size: 0.75rem;
+      border-radius: 5px;
+      background: var(--surface-subtle);
+      color: var(--text-primary);
+      border: 1px solid var(--border);
+    }
+
+    .btn-row:hover:not(:disabled) {
+      background: var(--surface-hover);
+      border-color: var(--border-strong);
+    }
+
+    .btn-row-danger {
+      background: transparent;
+      color: var(--text-secondary);
+      border-color: transparent;
+    }
+
+    .btn-row-danger:hover:not(:disabled),
+    .btn-row-danger[data-confirm="1"] {
+      background: var(--status-err-bg);
+      color: var(--status-err-fg);
+      border-color: var(--status-err-fg);
+    }
+
+    /* Main Container */
+    .shell {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 24px 24px 64px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .view-section[hidden] {
+      display: none;
+    }
+
+    /* Feedback Banner */
+    .status-banner {
+      padding: 10px 16px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 0.8125rem;
+    }
+
+    .status-banner[hidden] {
+      display: none;
+    }
+
+    .status-banner.ok {
+      background: var(--status-ok-bg);
+      color: var(--status-ok-fg);
+    }
+
+    .status-banner.warn {
+      background: var(--status-warn-bg);
+      color: var(--status-warn-fg);
+    }
+
+    .status-banner.err {
+      background: var(--status-err-bg);
+      color: var(--status-err-fg);
+    }
+
+    /* Summary & Filter Toolbar */
+    .pool-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 18px;
+    }
+
+    .filter-pills {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .filter-pill {
+      appearance: none;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text-secondary);
+      font-family: inherit;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      padding: 5px 11px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    .filter-pill:hover {
+      color: var(--text-primary);
+      background: var(--surface-subtle);
+    }
+
+    .filter-pill[aria-pressed="true"] {
+      background: var(--surface-subtle);
+      color: var(--text-primary);
+      border-color: var(--border-strong);
+      font-weight: 600;
+    }
+
+    .telemetry-bar {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      flex-wrap: wrap;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+
+    .telemetry-bar strong {
+      color: var(--text-primary);
+      font-weight: 500;
+    }
+
+    /* Account Pool Panel */
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    /* Connection Bar (Pool vs Individual) */
+    .conn-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 18px;
+      margin-bottom: 14px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .conn-col {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .conn-col + .conn-col {
+      border-left: 1px solid var(--border);
+      padding-left: 16px;
+    }
+
+    .conn-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .conn-desc {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+
+    .conn-pills {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 2px;
+    }
+
+    .copy-chip {
+      appearance: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 0.8125rem;
+      font-weight: 400;
+      letter-spacing: 0.01em;
+      padding: 4px 10px;
+      border-radius: 5px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .copy-chip:hover {
+      background: var(--surface-hover);
+      border-color: var(--border-strong);
+    }
+
+    .copy-chip span {
+      color: var(--text-secondary);
+      font-weight: 400;
+    }
+
+    .copy-chip strong,
+    .copy-chip .chip-val {
+      color: var(--text-primary);
+      font-weight: 400;
+    }
+
+    .acct-table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 0.8125rem;
+    }
+
+    .acct-table th {
+      background: var(--surface-subtle);
+      color: var(--text-secondary);
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    .acct-table th.col-actions {
+      text-align: right;
+    }
+
+    .acct-table td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+
+    .acct-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .acct-table tbody tr:hover {
+      background: var(--surface-subtle);
+    }
+
+    /* Column 1: Account Identity */
+    .acct-id-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 500;
+      color: var(--text-primary);
+      white-space: nowrap;
+    }
+
+    .cursor-badge {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: var(--status-ok-bg);
+      color: var(--status-ok-fg);
+    }
+
+    .acct-email {
+      color: var(--text-secondary);
+      font-size: 0.75rem;
+      margin-top: 2px;
+      max-width: 240px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Column 2: Status & Concise Reason */
+    .status-cell {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 3px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .badge-ok {
+      background: var(--status-ok-bg);
+      color: var(--status-ok-fg);
+    }
+
+    .badge-warn {
+      background: var(--status-warn-bg);
+      color: var(--status-warn-fg);
+    }
+
+    .badge-err {
+      background: var(--status-err-bg);
+      color: var(--status-err-fg);
+    }
+
+    .status-note {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+
+    /* Column 3: Quota Meter (Single-Line Clean Layout) */
+    .quota-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      min-width: 210px;
+      max-width: 270px;
+    }
+
+    .quota-item {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    .quota-top {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 0.75rem;
+      white-space: nowrap;
+    }
+
+    .quota-credits {
+      color: var(--text-primary);
+      font-weight: 400;
+    }
+
+    .quota-credits strong {
+      font-weight: 500;
+      color: var(--text-primary);
+    }
+
+    .quota-credits span {
+      color: var(--text-secondary);
+      font-weight: 400;
+    }
+
+    .quota-reset {
+      color: var(--text-secondary);
+      font-size: 0.75rem;
+    }
+
+    .quota-bar-bg {
+      height: 6px;
+      background: var(--surface-track);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+
+    .quota-bar-fill {
+      height: 100%;
+      background: var(--accent-bar);
+      border-radius: 3px;
+    }
+
+    .quota-bar-fill.warn {
+      background: var(--status-warn-fg);
+    }
+
+    .quota-bar-fill.err {
+      background: var(--status-err-fg);
+    }
+
+    /* Column 4: Traffic & Session */
+    .traffic-cell {
+      white-space: nowrap;
+      font-size: 0.75rem;
+    }
+
+    .traffic-primary {
+      color: var(--text-primary);
+      font-weight: 500;
+    }
+
+    .traffic-sub {
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    /* Column 5: Single-Row Actions */
+    .actions-cell {
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    .row-actions {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    /* Empty / Loading / Error Box */
+    .state-box {
+      padding: 40px 24px;
+      text-align: center;
+      color: var(--text-secondary);
+    }
+
+    .state-box strong {
+      display: block;
+      color: var(--text-primary);
+      font-size: 0.9375rem;
+      margin-bottom: 6px;
+    }
+
+    /* Configuration View (Horizontal Settings Rows) */
+    .settings-sheet {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .settings-group {
+      padding: 24px;
+      border-bottom: 1px solid var(--border);
+      display: grid;
+      grid-template-columns: minmax(220px, 4fr) minmax(0, 8fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    .settings-group:last-of-type {
+      border-bottom: none;
+    }
+
+    .settings-group-info h2 {
+      font-size: 0.9375rem;
+      font-weight: 600;
+    }
+
+    .settings-group-info p {
+      margin: 4px 0 0;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+    }
+
+    .form-grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .form-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .field-label-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .field label {
+      font-weight: 500;
+      color: var(--text-primary);
+      font-size: 0.8125rem;
+    }
+
+    .source-tag {
+      font-size: 0.6875rem;
+      color: var(--text-secondary);
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      padding: 1px 6px;
+      border-radius: 4px;
+    }
+
+    .input,
+    .select,
+    .textarea {
+      width: 100%;
+      min-height: 38px;
+      padding: 7px 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border-strong);
+      background: var(--surface-subtle);
+      color: var(--text-primary);
+      font-family: inherit;
+      font-size: 0.8125rem;
+    }
+
+    .textarea {
+      min-height: 110px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    .helper {
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+    }
+
+    .checkbox-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px 20px;
+    }
+
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 32px;
+      cursor: pointer;
+      font-size: 0.8125rem;
+      color: var(--text-primary);
+    }
+
+    .check-row input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--btn-primary-bg);
+      cursor: pointer;
+      margin: 0;
+    }
+
+    .settings-footer {
+      background: var(--surface-subtle);
+      padding: 14px 24px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .footer-buttons {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    /* Modals (Add Account & Auth Gate) */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: var(--backdrop);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      z-index: 50;
+    }
+
+    .modal-backdrop[hidden] {
+      display: none;
+    }
+
+    .modal-card {
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      box-shadow: var(--shadow-modal);
+      width: 100%;
+      max-width: 520px;
+      padding: 24px;
+    }
+
+    .modal-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .modal-title {
+      font-size: 1rem;
+      font-weight: 600;
+    }
+
+    .modal-subtitle {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+
+    .modal-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 1px solid var(--border);
+    }
+
+    /* Tablet Breakpoint */
+    @media (max-width: 960px) {
+      .settings-group,
+      .conn-card {
+        grid-template-columns: 1fr;
+        gap: 16px;
+      }
+
+      .conn-col + .conn-col {
+        border-left: none;
+        border-top: 1px solid var(--border);
+        padding-left: 0;
+        padding-top: 12px;
+      }
+    }
+
+    /* Mobile Breakpoint */
+    @media (max-width: 680px) {
+      .top-bar {
+        padding: 0 16px;
+      }
+
+      .shell {
+        padding: 16px 16px 48px;
+      }
+
+      .form-grid-2,
+      .checkbox-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .btn,
+      .btn-row,
+      .view-tab,
+      .filter-pill {
+        min-height: 44px;
+        padding: 10px 14px;
+        white-space: normal;
+      }
+
+      .check-row {
+        min-height: 44px;
+      }
+
+      .brand-meta,
+      .helper,
+      .telemetry-bar,
+      .status-note,
+      .acct-id-line,
+      .field label {
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+
+      .acct-table thead {
+        display: none;
+      }
+
+      .acct-table,
+      .acct-table tbody,
+      .acct-table tr,
+      .acct-table td {
+        display: block;
+        width: 100%;
+      }
+
+      .acct-table tr {
+        padding: 16px;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .acct-table td {
+        padding: 6px 0;
+        border: none;
+        text-align: left;
+      }
+
+      .acct-table td::before {
+        content: attr(data-label);
+        display: block;
+        font-size: 0.6875rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        color: var(--text-secondary);
+        margin-bottom: 3px;
+      }
+
+      .quota-stack {
+        min-width: 0;
+        max-width: 100%;
+      }
+
+      .row-actions {
+        justify-content: flex-start;
+        flex-wrap: wrap;
+      }
+    }
+  </style>
+</head>
+<body>
+  <a href="#main-content" class="skip-link">Skip to main content</a>
+
+  <header class="top-bar">
+    <div class="top-bar-inner">
+      <div class="nav-left">
+        <div class="brand">
+          <h1 class="brand-title">gsb</h1>
+          <span id="hdr-meta" class="brand-meta mono">v0.3.0 · connecting...</span>
+        </div>
+
+        <div class="view-tabs" role="tablist" aria-label="Control plane views">
+          <button type="button" id="tab-btn-accounts" class="view-tab" role="tab" aria-selected="true" aria-controls="view-accounts">
+            <span>Accounts</span>
+            <span id="tab-badge-accounts" class="tab-count mono">0</span>
+          </button>
+          <button type="button" id="tab-btn-config" class="view-tab" role="tab" aria-selected="false" aria-controls="view-config">
+            <span>Configuration</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="nav-right">
+        <button type="button" id="btn-open-import" class="btn btn-secondary">+ Add Account</button>
+        <button type="button" id="btn-refresh-live" class="btn btn-primary">Refresh All</button>
+        <button type="button" id="btn-auth-modal" class="btn btn-ghost" hidden>Access Key</button>
+        <button type="button" id="btn-theme-toggle" class="btn btn-ghost" aria-label="Switch color theme">Light Mode</button>
+      </div>
+    </div>
+  </header>
+
+  <main id="main-content" class="shell">
+    <div id="feedback-banner" class="status-banner" role="status" aria-live="polite" hidden>
+      <span id="feedback-text"></span>
+      <button type="button" id="feedback-close" class="btn btn-ghost">Dismiss</button>
+    </div>
+
+    <!-- VIEW 1: ACCOUNTS POOL -->
+    <section id="view-accounts" class="view-section" role="tabpanel" aria-labelledby="tab-btn-accounts">
+      <!-- Outbound Connection Reference: Pool vs Per-Account -->
+      <div class="conn-card" aria-label="Client connection settings">
+        <div class="conn-col">
+          <div class="conn-head">
+            <span>1. Pool Connection (All Accounts · Auto-Failover)</span>
+            <span class="badge badge-ok">Recommended for 9router / Harness</span>
+          </div>
+          <div class="conn-desc">Automatically rotates across all Ready accounts and fails over when a 5h quota window is spent.</div>
+          <div class="conn-pills mono">
+            <button type="button" class="copy-chip" data-copy-id="conn-base-url"><span>Base URL:</span> <span class="chip-val" id="conn-base-url">http://127.0.0.1:20133/v1</span></button>
+            <button type="button" class="copy-chip" data-copy-id="conn-pool-key"><span>API Key:</span> <span class="chip-val" id="conn-pool-key">gsb-pool</span></button>
+            <button type="button" class="copy-chip" data-copy-text="gemini-flash-lite,gemini-flash,gemini-pro,gemini-argon"><span>Models:</span> <span class="chip-val">gemini-flash-lite, gemini-flash, gemini-pro, gemini-argon</span></button>
+          </div>
+        </div>
+
+        <div class="conn-col">
+          <div class="conn-head">
+            <span>2. Individual Account Connection (Pin 1 Account)</span>
+            <span class="source-tag mono">No Failover</span>
+          </div>
+          <div class="conn-desc">Use the same Base URL, but set the API Key to <code class="mono">gsb-&lt;account&gt;</code> to isolate traffic to one specific Google account.</div>
+          <div class="conn-pills mono">
+            <span class="helper">Click any <code class="mono">Key: gsb-...</code> button in the Account column below to copy that account's dedicated key.</span>
+          </div>
+        </div>
+      </div>
+      <div class="pool-toolbar" style="margin-bottom: 14px;">
+        <div class="filter-pills" role="group" aria-label="Filter accounts by status">
+          <button type="button" class="filter-pill" data-filter="all" aria-pressed="true">All (<span id="cnt-all" class="mono">0</span>)</button>
+          <button type="button" class="filter-pill" data-filter="ok" aria-pressed="false">Ready (<span id="cnt-ok" class="mono">0</span>)</button>
+          <button type="button" class="filter-pill" data-filter="exhausted" aria-pressed="false">Exhausted (<span id="cnt-exhausted" class="mono">0</span>)</button>
+          <button type="button" class="filter-pill" data-filter="issue" aria-pressed="false">Attention (<span id="cnt-issue" class="mono">0</span>)</button>
+        </div>
+
+        <div class="telemetry-bar mono">
+          <span>Strategy: <strong id="stat-strategy">rotate</strong></span>
+          <span>Cursor: <strong id="stat-cursor">auto</strong></span>
+          <span>H2 Sessions: <strong id="stat-sessions">0</strong></span>
+          <span>Cache Hits: <strong id="stat-cache">0 / 0</strong></span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div id="accounts-state" class="state-box" aria-live="polite">
+          <strong>Loading account pool...</strong>
+          <span>Reading account states from the local bridge daemon.</span>
+        </div>
+
+        <div id="accounts-table-wrap" class="table-wrap" hidden>
+          <table class="acct-table">
+            <thead>
+              <tr>
+                <th scope="col">Account</th>
+                <th scope="col">Status</th>
+                <th scope="col">Active Quota Window (5h / Weekly)</th>
+                <th scope="col">Traffic &amp; Session</th>
+                <th scope="col" class="col-actions">Order &amp; Actions</th>
+              </tr>
+            </thead>
+            <tbody id="accounts-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- VIEW 2: RUNTIME CONFIGURATION -->
+    <section id="view-config" class="view-section" role="tabpanel" aria-labelledby="tab-btn-config" hidden>
+      <form id="form-config" class="settings-sheet" novalidate>
+        <div class="settings-group">
+          <div class="settings-group-info">
+            <h2>Pool Routing &amp; Failover</h2>
+            <p>Controls how the pool API key selects accounts and checks quota before sending a turn.</p>
+          </div>
+          <div class="form-stack">
+            <div class="form-grid-2">
+              <div class="field">
+                <div class="field-label-row">
+                  <label for="cfg-strategy">Pool Routing Strategy</label>
+                  <span id="src-accountStrategy" class="source-tag mono">default</span>
+                </div>
+                <select id="cfg-strategy" class="select">
+                  <option value="rotate">rotate (Sticky until exhausted)</option>
+                  <option value="lru">lru (Least recently used)</option>
+                  <option value="fill-first">fill-first (Fixed priority order)</option>
+                </select>
+              </div>
+
+              <div class="field">
+                <div class="field-label-row">
+                  <label for="cfg-preflight">Quota Preflight Mode</label>
+                  <span id="src-quotaPreflight" class="source-tag mono">default</span>
+                </div>
+                <select id="cfg-preflight" class="select">
+                  <option value="strict">strict (Skip exhausted accounts)</option>
+                  <option value="advisory">advisory (Prefer available)</option>
+                  <option value="off">off (Disable preflight check)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="field-label-row">
+                <label for="cfg-priority">Account Priority Order (for fill-first)</label>
+                <span id="src-accountPriority" class="source-tag mono">default</span>
+              </div>
+              <input id="cfg-priority" type="text" class="input mono" placeholder="acct1,acct2,acct3" autocomplete="off">
+              <span class="helper">Comma-separated account IDs drained in order when strategy is set to fill-first.</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <div class="settings-group-info">
+            <h2>Thinking &amp; Rate Limits</h2>
+            <p>Per-account concurrency and request-per-minute caps to prevent upstream throttling.</p>
+          </div>
+          <div class="form-grid-2">
+            <div class="field">
+              <div class="field-label-row">
+                <label for="cfg-thinking">Default Thinking Effort</label>
+                <span id="src-defaultThinking" class="source-tag mono">default</span>
+              </div>
+              <select id="cfg-thinking" class="select">
+                <option value="low">low (Standard / Fast)</option>
+                <option value="medium">medium (Balanced)</option>
+                <option value="high">high (Extended Thinking)</option>
+              </select>
+            </div>
+
+            <div class="field">
+              <div class="field-label-row">
+                <label for="cfg-max-rpm">Max RPM per Account</label>
+                <span id="src-maxRpmPerAccount" class="source-tag mono">default</span>
+              </div>
+              <input id="cfg-max-rpm" type="number" min="0" max="600" class="input mono" value="24">
+            </div>
+
+            <div class="field">
+              <div class="field-label-row">
+                <label for="cfg-max-conc">Max Concurrent Streams</label>
+                <span id="src-maxConcurrentPerAccount" class="source-tag mono">default</span>
+              </div>
+              <input id="cfg-max-conc" type="number" min="0" max="64" class="input mono" value="2">
+            </div>
+          </div>
+        </div>
+
+        <div class="settings-group">
+          <div class="settings-group-info">
+            <h2>Streaming &amp; Protocol Guards</h2>
+            <p>Controls downgrade protection, live reasoning deltas, and long-context attachment offload.</p>
+          </div>
+          <div class="form-stack">
+            <label class="check-row">
+              <input type="checkbox" id="cfg-reject-downgrade" checked>
+              <span><strong>Reject silent model downgrades</strong> <span class="helper">(Fail over to next account if Google silently switches Pro/Argon down to Flash)</span></span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfg-live-thoughts" checked>
+              <span><strong>Stream reasoning_content live</strong> <span class="helper">(Send thinking process tokens in real time as the model reasons)</span></span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfg-live-tools">
+              <span><strong>Stream tool_calls deltas live</strong> <span class="helper">(Emit partial tool arguments early before the JSON block finishes)</span></span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfg-tool-preamble">
+              <span><strong>Keep pre-tool preamble in content</strong> <span class="helper">(Include introductory text before a tool call in the main assistant message)</span></span>
+            </label>
+            <label class="check-row">
+              <input type="checkbox" id="cfg-history-offload" checked>
+              <span><strong>Offload long history as file attachment</strong> <span class="helper">(Upload oversized multi-turn transcripts as a file when starting a new session)</span></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="settings-footer">
+          <span class="helper">Persisting writes to <code id="lbl-env-file">$BRIDGE_HOME/config.env</code> (mode 0600).</span>
+          <div class="footer-buttons">
+            <button type="button" id="btn-cfg-memory" class="btn btn-secondary">Apply In-Memory Only</button>
+            <button type="submit" id="btn-cfg-persist" class="btn btn-primary">Save to config.env</button>
+          </div>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <!-- MODAL 1: ADD / IMPORT ACCOUNT -->
+  <div id="import-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="import-modal-title" hidden>
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="import-modal-title" class="modal-title">Add Google Account</h2>
+          <p class="modal-subtitle">Choose an isolated sign-in method so your main Chrome browser and gsb never fight over cookie rotation.</p>
+        </div>
+        <button type="button" id="btn-import-close" class="btn btn-ghost">Close</button>
+      </div>
+
+      <div style="background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 0.78rem; line-height: 1.45;">
+        <div style="color: var(--status-warn-fg); font-weight: 500; margin-bottom: 4px;">Why sessions expire if copied from your main Chrome:</div>
+        <div style="color: var(--text-secondary);">Copying cookies from an active daily Chrome tab makes Chrome and <code class="mono">gsb</code> share the same Google session (<code class="mono">SID</code>). When one rotates <code class="mono">__Secure-1PSIDTS</code>, the other expires. Always use one of the two isolated methods below:</div>
+      </div>
+
+      <div style="background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 220px;">
+          <div style="font-weight: 500; color: var(--text-primary); font-size: 0.8125rem;">Option 2: Isolated Popup Window (Auto-Capture)</div>
+          <div class="helper">Opens a disposable browser profile, captures cookies automatically on login, and closes the window so only <code class="mono">gsb</code> owns the session. (Or run <code class="mono">gsb --login &lt;name&gt;</code> on your desktop).</div>
+        </div>
+        <button type="button" id="btn-isolated-login" class="btn btn-secondary">Launch Isolated Browser</button>
+      </div>
+
+      <form id="form-import" class="form-stack" novalidate>
+        <div class="field">
+          <div class="field-label-row">
+            <label for="inp-acct-cookie">Option 1: Paste Cookies from an Incognito Window (Ctrl+Shift+N)</label>
+            <span class="source-tag mono">Works Everywhere (Local &amp; Remote SSH)</span>
+          </div>
+          <div class="helper" style="margin-bottom: 4px;">1. Open a <strong>New Incognito Window (Ctrl+Shift+N)</strong> &amp; sign in to <code class="mono">gemini.google.com/app</code>.<br>2. Copy cookies via Cookie-Editor &amp; paste below.<br>3. <strong>Immediately close the Incognito window (X)</strong> <em>without clicking Sign Out</em> so Chrome stops rotating that session.</div>
+          <textarea id="inp-acct-cookie" name="cookie" class="textarea mono" placeholder="Paste exported JSON array from Cookie-Editor or raw Cookie header..." spellcheck="false" autocomplete="off" required></textarea>
+        </div>
+        <div class="field">
+          <label for="inp-acct-id">Custom Account Name (Optional)</label>
+          <input id="inp-acct-id" name="id" type="text" class="input mono" placeholder="Leave blank to auto-name from email (e.g. bacotsih4)" pattern="[A-Za-z0-9._-]{1,64}" autocomplete="off">
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" id="btn-import-cancel" class="btn btn-secondary">Cancel</button>
+          <button type="submit" id="btn-import-submit" class="btn btn-primary">Verify &amp; Add Account</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL 2: AUTHENTICATION KEY -->
+  <div id="auth-modal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="auth-modal-title" hidden>
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2 id="auth-modal-title" class="modal-title">Control Plane Access Key</h2>
+          <p class="modal-subtitle" id="auth-modal-desc">Enter BRIDGE_ADMIN_KEY or BRIDGE_API_KEY to authenticate requests.</p>
+        </div>
+        <button type="button" id="btn-auth-cancel" class="btn btn-ghost">Close</button>
+      </div>
+
+      <form id="form-auth" class="form-stack">
+        <div class="field">
+          <label for="inp-admin-token">Access Key</label>
+          <input id="inp-admin-token" type="password" class="input mono" placeholder="Enter admin or pool key" autocomplete="current-password">
+          <span class="helper">Kept in this tab's sessionStorage only.</span>
+        </div>
+        <div class="modal-actions">
+          <button type="submit" class="btn btn-primary">Save Key &amp; Connect</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const THEME_KEY = 'gsb_ui_theme';
+      const TOKEN_KEY = 'gsb_admin_token';
+
+      const rootEl = document.documentElement;
+      const btnTheme = document.getElementById('btn-theme-toggle');
+      const btnRefreshCached = document.getElementById('btn-refresh-cached');
+      const btnRefreshLive = document.getElementById('btn-refresh-live');
+      const btnOpenImport = document.getElementById('btn-open-import');
+      const btnAuthModal = document.getElementById('btn-auth-modal');
+      const hdrMeta = document.getElementById('hdr-meta');
+
+      const tabBtnAccounts = document.getElementById('tab-btn-accounts');
+      const tabBtnConfig = document.getElementById('tab-btn-config');
+      const viewAccounts = document.getElementById('view-accounts');
+      const viewConfig = document.getElementById('view-config');
+
+      const bannerEl = document.getElementById('feedback-banner');
+      const bannerText = document.getElementById('feedback-text');
+      const bannerClose = document.getElementById('feedback-close');
+
+      const stateEl = document.getElementById('accounts-state');
+      const tableWrap = document.getElementById('accounts-table-wrap');
+      const tbodyEl = document.getElementById('accounts-tbody');
+
+      const importModal = document.getElementById('import-modal');
+      const authModal = document.getElementById('auth-modal');
+      const formAuth = document.getElementById('form-auth');
+      const inpAdminToken = document.getElementById('inp-admin-token');
+
+      let currentRotateCursor = '';
+      let allAccountsCache = [];
+      let currentFilter = 'all';
+
+      function initTheme() {
+        const saved = localStorage.getItem(THEME_KEY);
+        let theme = saved;
+        if (theme !== 'light' && theme !== 'dark') {
+          theme = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        }
+        applyTheme(theme);
+      }
+
+      function applyTheme(theme) {
+        rootEl.setAttribute('data-theme', theme);
+        btnTheme.textContent = theme === 'dark' ? 'Light Mode' : 'Dark Mode';
+      }
+
+      btnTheme.addEventListener('click', function () {
+        const next = rootEl.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+        localStorage.setItem(THEME_KEY, next);
+        applyTheme(next);
+      });
+
+      function switchView(target) {
+        const isAccts = target === 'accounts';
+        tabBtnAccounts.setAttribute('aria-selected', isAccts ? 'true' : 'false');
+        tabBtnConfig.setAttribute('aria-selected', isAccts ? 'false' : 'true');
+        viewAccounts.hidden = !isAccts;
+        viewConfig.hidden = isAccts;
+      }
+
+      tabBtnAccounts.addEventListener('click', function () { switchView('accounts'); });
+      tabBtnConfig.addEventListener('click', function () { switchView('config'); });
+
+      document.querySelectorAll('.filter-pill').forEach(function (pill) {
+        pill.addEventListener('click', function () {
+          currentFilter = pill.getAttribute('data-filter') || 'all';
+          document.querySelectorAll('.filter-pill').forEach(function (p) {
+            p.setAttribute('aria-pressed', p === pill ? 'true' : 'false');
+          });
+          renderAccounts(allAccountsCache);
+        });
+      });
+
+      function showBanner(kind, message) {
+        bannerEl.className = 'status-banner ' + kind;
+        bannerText.textContent = message;
+        bannerEl.hidden = false;
+      }
+
+      bannerClose.addEventListener('click', function () {
+        bannerEl.hidden = true;
+      });
+
+      function getToken() {
+        return sessionStorage.getItem(TOKEN_KEY) || '';
+      }
+
+      function openImportModal() {
+        importModal.hidden = false;
+        document.getElementById('inp-acct-cookie').focus();
+      }
+
+      function closeImportModal() {
+        importModal.hidden = true;
+      }
+
+      btnOpenImport.addEventListener('click', openImportModal);
+      document.getElementById('btn-import-close').addEventListener('click', closeImportModal);
+      document.getElementById('btn-import-cancel').addEventListener('click', closeImportModal);
+
+      function openAuthModal(message) {
+        if (message) {
+          document.getElementById('auth-modal-desc').textContent = message;
+        }
+        inpAdminToken.value = getToken();
+        authModal.hidden = false;
+        inpAdminToken.focus();
+      }
+
+      function closeAuthModal() {
+        authModal.hidden = true;
+      }
+
+      btnAuthModal.addEventListener('click', function () {
+        openAuthModal('Enter BRIDGE_ADMIN_KEY or BRIDGE_API_KEY to authenticate requests.');
+      });
+      document.getElementById('btn-auth-cancel').addEventListener('click', closeAuthModal);
+
+      document.addEventListener('keydown', function (ev) {
+        if (ev.key === 'Escape') {
+          if (!importModal.hidden) closeImportModal();
+          if (!authModal.hidden) closeAuthModal();
+        }
+      });
+
+      formAuth.addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        sessionStorage.setItem(TOKEN_KEY, inpAdminToken.value.trim());
+        closeAuthModal();
+        loadAll(false);
+      });
+
+      async function apiRequest(path, options) {
+        const opts = Object.assign({ method: 'GET', headers: {} }, options || {});
+        const tok = getToken();
+        if (tok) {
+          opts.headers['Authorization'] = 'Bearer ' + tok;
+          opts.headers['X-GSB-Admin-Key'] = tok;
+        }
+        if (opts.body && typeof opts.body === 'object') {
+          opts.headers['Content-Type'] = 'application/json';
+          opts.body = JSON.stringify(opts.body);
+        }
+        const res = await fetch(path, opts);
+        let data = {};
+        try {
+          data = await res.json();
+        } catch (_) {}
+        if (res.status === 401) {
+          const msg = (data.error && data.error.message) || 'Authentication required for this daemon.';
+          openAuthModal(msg);
+          throw new Error(msg);
+        }
+        if (!res.ok) {
+          const errMsg = (data.error && data.error.message) || ('HTTP ' + res.status);
+          throw new Error(errMsg);
+        }
+        return data;
+      }
+
+      function formatDuration(sec) {
+        const s = Math.max(0, Number(sec) || 0);
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        if (h > 0) return h + 'h ' + m + 'm';
+        if (m > 0) return m + 'm ' + (s % 60) + 's';
+        return s + 's';
+      }
+
+      function formatRelativeTime(iso) {
+        if (!iso) return 'n/a';
+        const target = Date.parse(iso);
+        if (Number.isNaN(target)) return iso;
+        const diffSec = Math.round((target - Date.now()) / 1000);
+        if (diffSec > 0) {
+          const d = Math.floor(diffSec / 86400);
+          const h = Math.floor((diffSec % 86400) / 3600);
+          const m = Math.max(1, Math.floor((diffSec % 3600) / 60));
+          if (d > 0) return 'in ' + d + 'd ' + h + 'h';
+          return 'in ' + (h > 0 ? h + 'h ' + m + 'm' : m + 'm');
+        }
+        const ago = Math.abs(diffSec);
+        if (ago < 60) return ago + 's ago';
+        if (ago < 3600) return Math.floor(ago / 60) + 'm ago';
+        return Math.floor(ago / 3600) + 'h ago';
+      }
+
+      function formatResetDateShort(iso) {
+        if (!iso) return '';
+        const d = new Date(iso);
+        if (Number.isNaN(d.getTime())) return '';
+        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const hh = String(d.getHours()).padStart(2, '0');
+        const mm = String(d.getMinutes()).padStart(2, '0');
+        return d.getDate() + ' ' + months[d.getMonth()] + ' ' + hh + ':' + mm;
+      }
+
+      function humanizeStatusReason(status, rawReason) {
+        if (!rawReason) {
+          return status === 'ok' ? 'Session verified' : '';
+        }
+        const m = rawReason.match(/quota spent until\s+(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/i);
+        if (m) {
+          return 'Resets ' + formatRelativeTime(m[1]);
+        }
+        return rawReason.replace(/until\s+(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/i, function (_, iso) {
+          return '(' + formatRelativeTime(iso) + ')';
+        });
+      }
+
+      function statusBadgeInfo(status) {
+        switch (status) {
+          case 'ok':
+            return { label: 'Ready', cls: 'badge badge-ok' };
+          case 'disabled':
+            return { label: 'Paused', cls: 'badge badge-warn' };
+          case 'exhausted':
+            return { label: 'Exhausted', cls: 'badge badge-warn' };
+          case 'cooling':
+            return { label: 'Cooling', cls: 'badge badge-warn' };
+          case 'degraded':
+            return { label: 'Degraded', cls: 'badge badge-warn' };
+          case 'quarantined':
+            return { label: 'Quarantined', cls: 'badge badge-err' };
+          case 'expired':
+            return { label: 'Expired', cls: 'badge badge-err' };
+          default:
+            return { label: 'Unprobed', cls: 'badge badge-warn' };
+        }
+      }
+
+      function extractTwoQuotaBars(quotaList) {
+        const real = (quotaList || []).filter(function (q) {
+          return q && !q.synthetic && String(q.id || '').indexOf('sub:') !== 0;
+        });
+        let q5h = null;
+        let qWeekly = null;
+        real.forEach(function (q) {
+          if (q.total > 5000 || q.id === 'weekly') {
+            if (!qWeekly) qWeekly = q;
+          } else if (q.total > 0 || q.id === '5h') {
+            if (!q5h) q5h = q;
+          }
+        });
+        if (qWeekly && !q5h) {
+          q5h = {
+            label: '5h Window',
+            total: 2400,
+            remaining: Math.min(2400, qWeekly.remaining),
+            resetAt: qWeekly.resetAt
+          };
+        }
+        return { q5h: q5h, qWeekly: qWeekly };
+      }
+
+      function buildSingleQuotaBar(title, remaining, total, rightNote, stateKind) {
+        const item = document.createElement('div');
+        item.className = 'quota-item';
+
+        const top = document.createElement('div');
+        top.className = 'quota-top';
+
+        const credits = document.createElement('span');
+        credits.className = 'quota-credits';
+        const lblPart = document.createElement('span');
+        lblPart.textContent = title + ': ';
+        const strongPart = document.createElement('strong');
+        strongPart.textContent = remaining != null ? Number(remaining).toLocaleString() : '—';
+        const subPart = document.createElement('span');
+        subPart.textContent = ' / ' + Number(total).toLocaleString();
+        credits.appendChild(lblPart);
+        credits.appendChild(strongPart);
+        credits.appendChild(subPart);
+
+        const resetSpan = document.createElement('span');
+        resetSpan.className = 'quota-reset';
+        resetSpan.textContent = rightNote || '';
+
+        top.appendChild(credits);
+        top.appendChild(resetSpan);
+        item.appendChild(top);
+
+        const track = document.createElement('div');
+        track.className = 'quota-bar-bg';
+        const fill = document.createElement('div');
+        const pct = (remaining != null && total > 0) ? Math.max(0, Math.min(100, Math.round((remaining / total) * 100))) : 0;
+        const visualPct = (remaining != null && remaining > 0) ? Math.max(5, pct) : 0;
+        fill.className = 'quota-bar-fill' + (stateKind ? (' ' + stateKind) : '');
+        fill.style.width = visualPct + '%';
+        track.appendChild(fill);
+        item.appendChild(track);
+        return item;
+      }
+
+      function renderQuotaCell(quotaList) {
+        const wrap = document.createElement('div');
+        wrap.className = 'quota-stack';
+        const pair = extractTwoQuotaBars(quotaList);
+        if (!pair.q5h && !pair.qWeekly) {
+          const span = document.createElement('span');
+          span.className = 'helper';
+          span.textContent = 'Not checked yet. Click Refresh to load quota.';
+          wrap.appendChild(span);
+          return wrap;
+        }
+
+        // Bar 1 (Top): 5h Window (2,400 max)
+        if (pair.q5h) {
+          const rem5 = pair.q5h.remaining;
+          const tot5 = pair.q5h.total || 2400;
+          const note5 = pair.q5h.resetAt ? formatRelativeTime(pair.q5h.resetAt) : '';
+          const kind5 = rem5 === 0 ? 'err' : (rem5 < 200 ? 'warn' : '');
+          wrap.appendChild(buildSingleQuotaBar('5h', rem5, tot5, note5, kind5));
+        }
+
+        // Bar 2 (Bottom): Weekly Pool (48,384 max)
+        if (pair.qWeekly) {
+          const remW = pair.qWeekly.remaining;
+          const totW = pair.qWeekly.total || 48384;
+          const kindW = remW === 0 ? 'err' : (remW < 1000 ? 'warn' : '');
+          const relW = pair.qWeekly.resetAt ? formatRelativeTime(pair.qWeekly.resetAt) : '';
+          const dateW = pair.qWeekly.resetAt ? formatResetDateShort(pair.qWeekly.resetAt) : '';
+          const noteW = (dateW && relW) ? (dateW + ' (' + relW + ')') : (relW || '7d window');
+          wrap.appendChild(buildSingleQuotaBar('Weekly', remW, totW, noteW, kindW));
+        } else {
+          wrap.appendChild(buildSingleQuotaBar('Weekly', null, 48384, '7d window', ''));
+        }
+        return wrap;
+      }
+
+      function updateFilterCounts(accounts) {
+        const list = Array.isArray(accounts) ? accounts : [];
+        let okCnt = 0;
+        let exhCnt = 0;
+        let issCnt = 0;
+        list.forEach(function (a) {
+          if (a.status === 'ok') okCnt++;
+          else if (a.status === 'exhausted') exhCnt++;
+          else issCnt++;
+        });
+        document.getElementById('tab-badge-accounts').textContent = String(list.length);
+        document.getElementById('cnt-all').textContent = String(list.length);
+        document.getElementById('cnt-ok').textContent = String(okCnt);
+        document.getElementById('cnt-exhausted').textContent = String(exhCnt);
+        document.getElementById('cnt-issue').textContent = String(issCnt);
+      }
+
+      function filterAccounts(accounts) {
+        if (currentFilter === 'all') return accounts;
+        return accounts.filter(function (a) {
+          if (currentFilter === 'ok') return a.status === 'ok';
+          if (currentFilter === 'exhausted') return a.status === 'exhausted';
+          return a.status !== 'ok' && a.status !== 'exhausted';
+        });
+      }
+
+      function renderAccounts(accounts) {
+        updateFilterCounts(accounts);
+        tbodyEl.textContent = '';
+
+        if (!Array.isArray(accounts) || accounts.length === 0) {
+          tableWrap.hidden = true;
+          stateEl.hidden = false;
+          stateEl.innerHTML = '';
+          const title = document.createElement('strong');
+          title.textContent = 'No Google accounts loaded in the pool.';
+          const sub = document.createElement('span');
+          sub.textContent = 'Click "+ Add Account" in the top bar or run gsb --login <name> in your terminal.';
+          stateEl.appendChild(title);
+          stateEl.appendChild(sub);
+          return;
+        }
+
+        const filtered = filterAccounts(accounts);
+        if (filtered.length === 0) {
+          tableWrap.hidden = true;
+          stateEl.hidden = false;
+          stateEl.innerHTML = '';
+          const title = document.createElement('strong');
+          title.textContent = 'No accounts match the selected filter (' + currentFilter + ').';
+          const sub = document.createElement('span');
+          sub.textContent = 'Select "All" above to view all ' + accounts.length + ' loaded accounts.';
+          stateEl.appendChild(title);
+          stateEl.appendChild(sub);
+          return;
+        }
+
+        stateEl.hidden = true;
+        tableWrap.hidden = false;
+
+        filtered.forEach(function (acct, idx) {
+          const tr = document.createElement('tr');
+
+          // 1. Account
+          const tdId = document.createElement('td');
+          tdId.setAttribute('data-label', 'Account');
+          const idLine = document.createElement('div');
+          idLine.className = 'acct-id-line mono';
+          const idSpan = document.createElement('span');
+          idSpan.textContent = (idx + 1) + '. ' + acct.id;
+          idLine.appendChild(idSpan);
+          if (currentRotateCursor && currentRotateCursor === acct.id) {
+            const cur = document.createElement('span');
+            cur.className = 'cursor-badge';
+            cur.textContent = 'Active';
+            idLine.appendChild(cur);
+          }
+          tdId.appendChild(idLine);
+
+          const emailDiv = document.createElement('div');
+          emailDiv.className = 'acct-email mono';
+          emailDiv.title = acct.email || '';
+          emailDiv.textContent = acct.email || 'unverified email';
+          tdId.appendChild(emailDiv);
+
+          const keyBtn = document.createElement('button');
+          keyBtn.type = 'button';
+          keyBtn.className = 'copy-chip mono';
+          keyBtn.style.marginTop = '5px';
+          keyBtn.innerHTML = '<span>Key:</span> <span class="chip-val">gsb-' + acct.id + '</span>';
+          keyBtn.title = 'Click to copy dedicated API key for ' + acct.id;
+          keyBtn.addEventListener('click', function () {
+            copyToClipboard('gsb-' + acct.id, 'Copied individual API key "gsb-' + acct.id + '" (use with Base URL ' + document.getElementById('conn-base-url').textContent + ').');
+          });
+          tdId.appendChild(keyBtn);
+          tr.appendChild(tdId);
+
+          // 2. Status
+          const tdStatus = document.createElement('td');
+          tdStatus.setAttribute('data-label', 'Status');
+          const stWrap = document.createElement('div');
+          stWrap.className = 'status-cell';
+          const bInfo = statusBadgeInfo(acct.status);
+          const badge = document.createElement('span');
+          badge.className = bInfo.cls;
+          badge.textContent = bInfo.label;
+          stWrap.appendChild(badge);
+
+          const noteText = humanizeStatusReason(acct.status, acct.statusReason);
+          if (noteText) {
+            const note = document.createElement('span');
+            note.className = 'status-note';
+            note.textContent = noteText;
+            stWrap.appendChild(note);
+          }
+          tdStatus.appendChild(stWrap);
+          tr.appendChild(tdStatus);
+
+          // 3. Rolling 5h Credit Pool
+          const tdQuota = document.createElement('td');
+          tdQuota.setAttribute('data-label', 'Rolling 5h Credit Pool');
+          tdQuota.appendChild(renderQuotaCell(acct.quota));
+          tr.appendChild(tdQuota);
+
+          // 4. Traffic & Session
+          const tdTraffic = document.createElement('td');
+          tdTraffic.setAttribute('data-label', 'Traffic & Session');
+          tdTraffic.className = 'traffic-cell mono';
+          const l1 = document.createElement('div');
+          l1.className = 'traffic-primary';
+          l1.textContent = (acct.recentRpm || 0) + ' RPM · ' + (acct.totalRequests || 0) + ' reqs';
+          const l2 = document.createElement('div');
+          l2.className = 'traffic-sub';
+          l2.textContent = ((acct.models && acct.models.length) || 0) + ' models · rot ' + formatRelativeTime(acct.rotatedAt);
+          tdTraffic.appendChild(l1);
+          tdTraffic.appendChild(l2);
+          tr.appendChild(tdTraffic);
+
+          // 5. Order & Actions (Single Non-Wrapping Row)
+          const tdAct = document.createElement('td');
+          tdAct.setAttribute('data-label', 'Order & Actions');
+          tdAct.className = 'actions-cell';
+          const actRow = document.createElement('div');
+          actRow.className = 'row-actions';
+
+          const btnUp = document.createElement('button');
+          btnUp.type = 'button';
+          btnUp.className = 'btn btn-row mono';
+          btnUp.textContent = '↑';
+          btnUp.title = 'Move account higher in priority order';
+          btnUp.setAttribute('aria-label', 'Move ' + acct.id + ' up');
+          btnUp.disabled = idx === 0;
+          btnUp.addEventListener('click', function () {
+            moveAccount(acct.id, 'up', btnUp);
+          });
+          actRow.appendChild(btnUp);
+
+          const btnDown = document.createElement('button');
+          btnDown.type = 'button';
+          btnDown.className = 'btn btn-row mono';
+          btnDown.textContent = '↓';
+          btnDown.title = 'Move account lower in priority order';
+          btnDown.setAttribute('aria-label', 'Move ' + acct.id + ' down');
+          btnDown.disabled = idx === filtered.length - 1;
+          btnDown.addEventListener('click', function () {
+            moveAccount(acct.id, 'down', btnDown);
+          });
+          actRow.appendChild(btnDown);
+
+          const btnProbe = document.createElement('button');
+          btnProbe.type = 'button';
+          btnProbe.className = 'btn btn-row';
+          btnProbe.textContent = 'Refresh';
+          btnProbe.addEventListener('click', function () {
+            runAccountAction(acct.id, 'probe', btnProbe);
+          });
+          actRow.appendChild(btnProbe);
+
+          const btnToggle = document.createElement('button');
+          btnToggle.type = 'button';
+          btnToggle.className = 'btn btn-row';
+          btnToggle.textContent = acct.disabled ? 'Resume' : 'Pause';
+          btnToggle.addEventListener('click', function () {
+            runAccountAction(acct.id, 'toggle', btnToggle);
+          });
+          actRow.appendChild(btnToggle);
+
+          if (acct.quarantined || acct.fails > 0) {
+            const btnUnq = document.createElement('button');
+            btnUnq.type = 'button';
+            btnUnq.className = 'btn btn-row';
+            btnUnq.textContent = acct.quarantined ? 'Unquarantine' : 'Reset Fails';
+            btnUnq.addEventListener('click', function () {
+              runAccountAction(acct.id, 'unquarantine', btnUnq);
+            });
+            actRow.appendChild(btnUnq);
+          }
+
+          const btnDel = document.createElement('button');
+          btnDel.type = 'button';
+          btnDel.className = 'btn btn-row btn-row-danger';
+          btnDel.textContent = 'Remove';
+          btnDel.addEventListener('click', function () {
+            deleteAccount(acct.id, btnDel);
+          });
+          actRow.appendChild(btnDel);
+
+          tdAct.appendChild(actRow);
+          tr.appendChild(tdAct);
+          tbodyEl.appendChild(tr);
+        });
+      }
+
+      function copyToClipboard(text, msg) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(function () {
+            showBanner('ok', msg || ('Copied "' + text + '" to clipboard.'));
+          }).catch(function () {
+            showBanner('ok', text);
+          });
+        } else {
+          showBanner('ok', text);
+        }
+      }
+
+      document.querySelectorAll('[data-copy-id]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          const target = document.getElementById(btn.getAttribute('data-copy-id'));
+          if (target) copyToClipboard(target.textContent, 'Copied "' + target.textContent + '" to clipboard.');
+        });
+      });
+
+      document.querySelectorAll('[data-copy-text]').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+          const txt = btn.getAttribute('data-copy-text');
+          if (txt) copyToClipboard(txt, 'Copied "' + txt + '" to clipboard.');
+        });
+      });
+
+      function populateConfigForm(adm) {
+        currentRotateCursor = adm.rotateCursor || '';
+        hdrMeta.textContent = 'v' + (adm.version || '0.3.0') + ' · ' + adm.host + ':' + adm.port + ' · up ' + formatDuration(adm.uptimeSec);
+        document.getElementById('lbl-env-file').textContent = adm.envFile || '$BRIDGE_HOME/config.env';
+        document.getElementById('conn-base-url').textContent = window.location.origin + '/v1';
+        document.getElementById('conn-pool-key').textContent = adm.poolKey || 'gsb-pool';
+        btnAuthModal.hidden = (adm.authMode === 'local_public');
+        const cfg = adm.config || {};
+        const metrics = adm.metrics || {};
+        document.getElementById('stat-strategy').textContent = cfg.accountStrategy || 'rotate';
+        document.getElementById('stat-cursor').textContent = currentRotateCursor || 'auto';
+        document.getElementById('stat-sessions').textContent = String(metrics.activeSessions || 0);
+        document.getElementById('stat-cache').textContent = (metrics.cacheHits || 0) + ' / ' + (metrics.cacheMisses || 0);
+        document.getElementById('cfg-thinking').value = cfg.defaultThinking || 'low';
+        document.getElementById('cfg-strategy').value = cfg.accountStrategy || 'rotate';
+        document.getElementById('cfg-preflight').value = cfg.quotaPreflight || 'strict';
+        document.getElementById('cfg-priority').value = Array.isArray(cfg.accountPriority) ? cfg.accountPriority.join(',') : '';
+        document.getElementById('cfg-max-rpm').value = cfg.maxRpmPerAccount != null ? cfg.maxRpmPerAccount : 24;
+        document.getElementById('cfg-max-conc').value = cfg.maxConcurrentPerAccount != null ? cfg.maxConcurrentPerAccount : 2;
+
+        document.getElementById('cfg-reject-downgrade').checked = Boolean(cfg.rejectDowngrade);
+        document.getElementById('cfg-live-thoughts').checked = Boolean(cfg.liveThoughts);
+        document.getElementById('cfg-live-tools').checked = Boolean(cfg.liveToolCalls);
+        document.getElementById('cfg-tool-preamble').checked = Boolean(cfg.keepToolPreamble);
+        document.getElementById('cfg-history-offload').checked = Boolean(cfg.historyOffload);
+
+        const sources = adm.sources || {};
+        ['defaultThinking', 'accountStrategy', 'quotaPreflight', 'accountPriority', 'maxRpmPerAccount', 'maxConcurrentPerAccount'].forEach(function (k) {
+          const el = document.getElementById('src-' + k);
+          if (el) el.textContent = sources[k] || 'default';
+        });
+      }
+
+      async function loadAll(live) {
+        try {
+          if (live) {
+            btnRefreshLive.disabled = true;
+            btnRefreshLive.textContent = 'Refreshing...';
+          }
+          const adm = await apiRequest('/v1/admin/config');
+          populateConfigForm(adm);
+          const acctsResp = await apiRequest('/v1/accounts' + (live ? '?live=1' : ''));
+          allAccountsCache = acctsResp.accounts || [];
+          renderAccounts(allAccountsCache);
+          if (live) {
+            showBanner('ok', 'Live upstream quota refreshed for ' + allAccountsCache.length + ' account(s).');
+          }
+        } catch (err) {
+          tableWrap.hidden = true;
+          stateEl.hidden = false;
+          stateEl.innerHTML = '';
+          const title = document.createElement('strong');
+          title.textContent = 'Unable to load control plane state.';
+          const sub = document.createElement('span');
+          sub.textContent = err.message;
+          stateEl.appendChild(title);
+          stateEl.appendChild(sub);
+          showBanner('err', err.message);
+        } finally {
+          btnRefreshLive.disabled = false;
+          btnRefreshLive.textContent = 'Refresh All';
+        }
+      }
+
+      async function moveAccount(id, direction, btn) {
+        btn.disabled = true;
+        try {
+          await apiRequest('/v1/admin/accounts/' + encodeURIComponent(id) + '/move', {
+            method: 'POST',
+            body: { direction: direction }
+          });
+          await loadAll(false);
+        } catch (err) {
+          showBanner('err', 'Failed to reorder account ' + id + ': ' + err.message);
+          btn.disabled = false;
+        }
+      }
+
+      async function runAccountAction(id, action, btn) {
+        const orig = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '...';
+        try {
+          const res = await apiRequest('/v1/admin/accounts/' + encodeURIComponent(id) + '/' + action, { method: 'POST', body: {} });
+          if (res.status === 'error' && res.probeError) {
+            showBanner('warn', 'Account ' + id + ' check returned an error: ' + res.probeError);
+          } else if (action === 'toggle') {
+            showBanner('ok', 'Account ' + id + (res.disabled ? ' paused (disabled from pool).' : ' resumed (active in pool).'));
+          } else {
+            showBanner('ok', 'Completed ' + action + ' for ' + id + '.');
+          }
+          await loadAll(false);
+        } catch (err) {
+          showBanner('err', 'Account ' + id + ' ' + action + ' failed: ' + err.message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = orig;
+        }
+      }
+
+      async function deleteAccount(id, btn) {
+        if (btn.getAttribute('data-confirm') !== '1') {
+          btn.setAttribute('data-confirm', '1');
+          btn.textContent = 'Confirm?';
+          setTimeout(function () {
+            if (btn.isConnected) {
+              btn.removeAttribute('data-confirm');
+              btn.textContent = 'Remove';
+            }
+          }, 4000);
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = '...';
+        try {
+          await apiRequest('/v1/admin/accounts/' + encodeURIComponent(id), { method: 'DELETE' });
+          showBanner('ok', 'Removed account ' + id + ' from the pool.');
+          await loadAll(false);
+        } catch (err) {
+          showBanner('err', 'Failed to remove account ' + id + ': ' + err.message);
+          btn.disabled = false;
+          btn.textContent = 'Remove';
+        }
+      }
+
+      document.getElementById('btn-isolated-login').addEventListener('click', async function () {
+        const btn = document.getElementById('btn-isolated-login');
+        const id = document.getElementById('inp-acct-id').value.trim();
+        btn.disabled = true;
+        btn.textContent = 'Waiting for login...';
+        try {
+          let res = null;
+          try {
+            res = await apiRequest('/v1/admin/accounts/browser-login', {
+              method: 'POST',
+              body: { id: id }
+            });
+          } catch (serverErr) {
+            // If the gsb server is on a headless VPS without Chrome, try the local desktop login helper on 127.0.0.1:20134
+            if (/no Chromium|no GUI display/i.test(serverErr.message)) {
+              const helperResp = await fetch('http://127.0.0.1:20134/browser-login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: id })
+              });
+              const helperData = await helperResp.json();
+              if (!helperResp.ok || !helperData.cookie) {
+                throw new Error((helperData.error && helperData.error.message) || 'Local browser login failed.');
+              }
+              res = await apiRequest('/v1/admin/accounts/import', {
+                method: 'POST',
+                body: { id: id, cookie: helperData.cookie }
+              });
+            } else {
+              throw serverErr;
+            }
+          }
+          document.getElementById('inp-acct-id').value = '';
+          closeImportModal();
+          const addedId = (res.account && res.account.id) || id || 'account';
+          showBanner('ok', 'Captured isolated session for ' + addedId + ' (' + ((res.account && res.account.email) || 'session active') + ').');
+          await loadAll(false);
+        } catch (err) {
+          showBanner('err', err.message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Launch Isolated Browser';
+        }
+      });
+
+      document.getElementById('form-import').addEventListener('submit', async function (ev) {
+        ev.preventDefault();
+        const id = document.getElementById('inp-acct-id').value.trim();
+        const cookieEl = document.getElementById('inp-acct-cookie');
+        const cookie = cookieEl.value.trim();
+        if (!cookie) {
+          showBanner('err', 'Please paste a Cookie header or Cookie-Editor JSON array.');
+          return;
+        }
+        const btn = document.getElementById('btn-import-submit');
+        btn.disabled = true;
+        btn.textContent = 'Verifying...';
+        try {
+          const res = await apiRequest('/v1/admin/accounts/import', {
+            method: 'POST',
+            body: { id: id, cookie: cookie }
+          });
+          cookieEl.value = '';
+          document.getElementById('inp-acct-id').value = '';
+          closeImportModal();
+          const addedId = (res.account && res.account.id) || id || 'account';
+          showBanner('ok', 'Verified and added account ' + addedId + ' (' + ((res.account && res.account.email) || 'session active') + ').');
+          await loadAll(false);
+        } catch (err) {
+          showBanner('err', 'Import failed: ' + err.message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = 'Verify & Add Account';
+        }
+      });
+
+      async function submitConfig(persist) {
+        const payload = {
+          defaultThinking: document.getElementById('cfg-thinking').value,
+          accountStrategy: document.getElementById('cfg-strategy').value,
+          quotaPreflight: document.getElementById('cfg-preflight').value,
+          accountPriority: document.getElementById('cfg-priority').value,
+          maxRpmPerAccount: Number(document.getElementById('cfg-max-rpm').value),
+          maxConcurrentPerAccount: Number(document.getElementById('cfg-max-conc').value),
+          rejectDowngrade: document.getElementById('cfg-reject-downgrade').checked,
+          liveThoughts: document.getElementById('cfg-live-thoughts').checked,
+          liveToolCalls: document.getElementById('cfg-live-tools').checked,
+          keepToolPreamble: document.getElementById('cfg-tool-preamble').checked,
+          historyOffload: document.getElementById('cfg-history-offload').checked,
+          persist: Boolean(persist)
+        };
+        try {
+          const adm = await apiRequest('/v1/admin/config', { method: 'PATCH', body: payload });
+          populateConfigForm(adm);
+          showBanner('ok', persist ? 'Saved runtime configuration to ' + adm.envFile + '.' : 'Applied runtime configuration in memory.');
+        } catch (err) {
+          showBanner('err', 'Configuration update failed: ' + err.message);
+        }
+      }
+
+      document.getElementById('btn-cfg-memory').addEventListener('click', function () {
+        submitConfig(false);
+      });
+
+      document.getElementById('form-config').addEventListener('submit', function (ev) {
+        ev.preventDefault();
+        submitConfig(true);
+      });
+
+      if (btnRefreshCached) btnRefreshCached.addEventListener('click', function () { loadAll(false); });
+      btnRefreshLive.addEventListener('click', function () { loadAll(true); });
+
+      initTheme();
+      loadAll(false);
+    })();
+  </script>
+</body>
+</html>

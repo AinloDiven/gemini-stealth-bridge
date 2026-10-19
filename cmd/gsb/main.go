@@ -65,6 +65,9 @@ func main() {
 		captureRef       = flag.Bool("capture-reference", false, "Capture reference headers from local Chrome login profile via CDP or dump instructions")
 		listAccounts     = flag.Bool("accounts", false, "Print a status table for every loaded account and exit")
 		accountsLive     = flag.Bool("accounts-live", false, "With --accounts, query upstream for fresh models and quota before printing")
+		enableWebUI      = flag.Bool("web", false, "Enable the opt-in web configuration UI at /ui and /v1/admin/* (or set BRIDGE_WEB_UI=1)")
+		runHealthcheck   = flag.Bool("healthcheck", false, "Probe local /health endpoint and exit 0 if healthy (for container healthchecks)")
+		loginHelper      = flag.Bool("login-helper", false, "Run local desktop isolated-browser login helper on 127.0.0.1:20134 for remote VPS Web UI")
 	)
 	flag.Parse()
 
@@ -76,6 +79,29 @@ func main() {
 	cfg := config.Load()
 	for _, w := range cfg.Warnings {
 		log.Printf("[config] WARNING: %s", w)
+	}
+	if *enableWebUI {
+		cfg.WebUI = true
+	}
+
+	if *runHealthcheck {
+		hcHost := cfg.Host
+		if hcHost == "" || hcHost == "0.0.0.0" || hcHost == "::" {
+			hcHost = "127.0.0.1"
+		}
+		hcURL := fmt.Sprintf("http://%s/health", net.JoinHostPort(hcHost, strconv.Itoa(cfg.Port)))
+		hcClient := &http.Client{Timeout: 3 * time.Second}
+		resp, err := hcClient.Get(hcURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "healthcheck failed: %v\n", err)
+			os.Exit(1)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "healthcheck HTTP %d\n", resp.StatusCode)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if *checkConfig {
@@ -113,6 +139,12 @@ func main() {
 
 	if *modelsJSON {
 		runModelsJSON(cfg)
+		return
+	}
+	if *loginHelper {
+		if err := runLocalLoginHelper(); err != nil {
+			log.Fatalf("[login-helper] failed: %v", err)
+		}
 		return
 	}
 
@@ -218,6 +250,12 @@ func main() {
 		log.Printf("  transport: browserless Chrome uTLS + HTTP/2 (%s)", cfg.ImpersonateProfile)
 		log.Printf("  data:      %s (%d account(s) loaded)", cfg.HomeDir, loaded)
 		log.Printf("  models:    http://%s/v1/models", addr)
+		if cfg.WebUI {
+			log.Printf("  web ui:    http://%s/ui (opt-in control plane enabled)", addr)
+			if !config.IsLoopbackHost(cfg.Host) && cfg.APIKey == "public" && cfg.AdminKey == "" {
+				log.Printf("  WARNING:   remote access to /ui and /v1/admin/* is locked until BRIDGE_ADMIN_KEY or a non-public BRIDGE_API_KEY is configured")
+			}
+		}
 		if loaded > 0 {
 			poolDesc := cfg.APIKey
 			if cfg.APIKey == "public" {
@@ -346,17 +384,27 @@ func runInteractiveLogin(cfg config.Config, acctName, explicitDB string) error {
 	}
 	targetURL := "https://gemini.google.com/app"
 	browser, profileDir := cookies.ParseProfileHint(explicitDB)
+	if explicitDB == "" {
+		if bin := findBrowserBinary(browser); bin != "" && (runtime.GOOS != "linux" || os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "") {
+			fmt.Printf("Launching isolated %s login window for %s (prevents cookie rotation conflicts with your main browser)...\n", filepath.Base(bin), acctName)
+			fmt.Println("Sign in to Google Gemini in the popup window. It will close automatically as soon as sign-in completes.")
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			res, err := cookies.RunIsolatedBrowserLogin(ctx, bin)
+			cancel()
+			if err == nil && res != nil && res.CookieHeader != "" {
+				return runImportCookie(cfg, acctName, res.CookieHeader, "")
+			}
+			fmt.Printf("Isolated auto-capture fallback (%v); continuing with manual prompt.\n", err)
+		}
+	}
 	if explicitDB != "" {
 		fmt.Printf("Opening %s in your browser (target profile: %s)...\n", targetURL, explicitDB)
 	} else {
 		fmt.Printf("Opening %s in your default browser...\n", targetURL)
-		fmt.Println("Note: No --chrome-profile specified; auto-import reads from the Default profile.")
-		fmt.Println("      On multi-profile setups, pass --chrome-profile \"<Profile Name or Path>\" (e.g. \"Profile 4\").")
 	}
 	openBrowserURL(targetURL, browser, profileDir)
-	fmt.Println("1. Sign in to Google Gemini in your browser.")
-	fmt.Println("2. Press Enter to auto-import cookies from your local browser profile,")
-	fmt.Println("   or paste a raw Cookie header / Cookie-Editor JSON line and press Enter:")
+	fmt.Println("1. Sign in to Google Gemini in an Incognito window (Ctrl+Shift+N) so it does not share a session with your daily Chrome.")
+	fmt.Println("2. Paste the raw Cookie header / Cookie-Editor JSON line and press Enter (then close the Incognito window):")
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
@@ -364,6 +412,43 @@ func runInteractiveLogin(cfg config.Config, acctName, explicitDB string) error {
 		return runImportCookie(cfg, acctName, line, "")
 	}
 	return runImportChrome(cfg, acctName, explicitDB)
+}
+
+func runLocalLoginHelper() error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/browser-login", func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		ctx, cancel := context.WithTimeout(r.Context(), 4*time.Minute)
+		defer cancel()
+		res, err := cookies.RunIsolatedBrowserLogin(ctx, "")
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{"message": err.Error()},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"cookie":    res.CookieHeader,
+			"userAgent": res.UserAgent,
+		})
+	})
+	log.Printf("[login-helper] listening on http://127.0.0.1:20134 for isolated desktop browser login")
+	return http.ListenAndServe("127.0.0.1:20134", mux)
 }
 
 func findBrowserBinary(browser string) string {

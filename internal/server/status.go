@@ -32,6 +32,8 @@ const (
 	// health it has not verified is exactly the confusion this status is meant to
 	// remove.
 	StatusUnknown = "unknown"
+	// StatusDisabled means the operator paused this account in the control plane.
+	StatusDisabled = "disabled"
 )
 
 // AccountStatus derives the status and a short human reason for one account.
@@ -50,6 +52,7 @@ func AccountStatus(a *AccountState, now time.Time) (status string, reason string
 	a.mu.RLock()
 	quarantined := a.Quarantined
 	qReason := a.QuarantineReason
+	disabled := a.Disabled
 	lastError := a.LastError
 	lastFail := a.LastFail
 	fails := a.Fails
@@ -61,6 +64,9 @@ func AccountStatus(a *AccountState, now time.Time) (status string, reason string
 	modelsError := a.ModelsError
 	a.mu.RUnlock()
 
+	if disabled {
+		return StatusDisabled, "paused by operator"
+	}
 	if quarantined {
 		if strings.TrimSpace(qReason) == "" {
 			return StatusQuarantined, "restricted upstream"

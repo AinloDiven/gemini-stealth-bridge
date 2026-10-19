@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -55,6 +56,7 @@ type AccountState struct {
 	ProxyURL         string
 	Quarantined      bool
 	QuarantineReason string
+	Disabled         bool
 	Surfaces         map[string]string
 	NextRotateAt     time.Time
 	NextModelRefAt   time.Time
@@ -127,6 +129,9 @@ type Server struct {
 	// rotateMu guards the sticky rotation cursor used by the "rotate" strategy.
 	rotateMu     sync.Mutex
 	rotateCursor string
+
+	adminAuthMu    sync.Mutex
+	adminAuthFails map[string][]time.Time
 }
 
 // New constructs a new Server from cfg.
@@ -212,8 +217,15 @@ func extractRequestToken(r *http.Request) string {
 // ResolveAuthScope resolves the caller's API key into an AuthScope.
 func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 	token := extractRequestToken(r)
+	if token == "" {
+		token = strings.TrimSpace(r.Header.Get("X-GSB-Admin-Key"))
+	}
 
 	s.mu.RLock()
+	if s.Cfg.AdminKey != "" && token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.Cfg.AdminKey)) == 1 {
+		s.mu.RUnlock()
+		return AuthScope{OK: true, Admin: true}
+	}
 	if acctID, ok := s.tokenToAcct[token]; ok && token != "" {
 		s.mu.RUnlock()
 		return AuthScope{OK: true, AccountID: acctID}
@@ -221,9 +233,9 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 	explicitTokens := len(s.Cfg.AccountTokens) > 0
 	s.mu.RUnlock()
 
-	isPoolKey := (s.Cfg.APIKey == "public" && (token == "" || token == "public")) ||
+	defPoolTok := s.defaultPoolToken()
+	isPoolKey := (s.Cfg.APIKey == "public" && (token == "" || token == "public" || token == defPoolTok)) ||
 		(s.Cfg.APIKey != "public" && token == s.Cfg.APIKey)
-
 	// Hot-load newly added account files on the fly when an unknown account token
 	// arrives and explicit token lock is not enabled, rate-limited to once per 2s
 	// to avoid disk scans on repeated invalid tokens or pool-key requests.
@@ -251,7 +263,7 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 		if s.Cfg.APIKey != "public" && token == s.Cfg.APIKey {
 			return AuthScope{OK: true, Admin: true}
 		}
-		if s.Cfg.APIKey == "public" && (token == "" || token == "public") {
+		if s.Cfg.APIKey == "public" && (token == "" || token == "public" || token == defPoolTok) {
 			if len(s.accounts) == 1 {
 				return AuthScope{OK: true, AccountID: s.accounts[0].ID}
 			}
@@ -260,7 +272,7 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 		return AuthScope{OK: false}
 	}
 
-	if s.Cfg.APIKey == "public" {
+	if s.Cfg.APIKey == "public" && (token == "" || token == "public" || token == defPoolTok) {
 		if len(s.accounts) == 1 {
 			return AuthScope{OK: true, AccountID: s.accounts[0].ID}
 		}
@@ -275,12 +287,25 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 	return AuthScope{OK: false}
 }
 
+func (s *Server) defaultPoolToken() string {
+	seed := strings.TrimSpace(s.Cfg.HomeDir)
+	if seed == "" {
+		seed = "gemini-stealth-bridge"
+	}
+	sum := sha256.Sum256([]byte("gsb-pool:" + seed))
+	return "gsb-pool-" + hex.EncodeToString(sum[:5])
+}
+
 // ServeHTTP implements http.Handler for all bridge endpoints.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	ctx := r.Context()
 
 	switch {
+	case s.Cfg.WebUI && r.Method == http.MethodGet && (p == "/" || p == "/ui" || p == "/ui/" || p == "/dashboard"):
+		s.HandleWebUI(w, r)
+		return
+
 	case r.Method == http.MethodGet && (p == "/health" || p == "/"):
 		accts := s.Accounts()
 		models := len(s.allModels())
@@ -369,85 +394,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
 			return
 		}
-		s.EnsureModels(ctx, false)
+		liveReq := r.URL.Query().Get("live") == "1" || r.URL.Query().Get("fresh") == "1"
+		s.EnsureModels(ctx, liveReq)
 		pool := s.scopedAccounts(scope)
 		list := make([]map[string]any, 0, len(pool))
 		now := s.now()
-		rpmCutoff := now.Add(-60 * time.Second)
 		for _, a := range pool {
-			a.mu.RLock()
-			mNames := make([]string, 0, len(a.Models))
-			for _, m := range a.Models {
-				mNames = append(mNames, m.ModelName)
-			}
-			var capAtStr, rotAtStr, modAtStr, qAtStr, lastUsedStr string
-			if !a.CapturedAt.IsZero() {
-				capAtStr = a.CapturedAt.UTC().Format(time.RFC3339)
-			}
-			if !a.RotatedAt.IsZero() {
-				rotAtStr = a.RotatedAt.UTC().Format(time.RFC3339)
-			}
-			if !a.ModelsAt.IsZero() {
-				modAtStr = a.ModelsAt.UTC().Format(time.RFC3339)
-			}
-			if !a.QuotaAt.IsZero() {
-				qAtStr = a.QuotaAt.UTC().Format(time.RFC3339)
-			}
-			if !a.LastUsed.IsZero() {
-				lastUsedStr = a.LastUsed.UTC().Format(time.RFC3339)
-			}
-			recentRPM := 0
-			for _, ts := range a.reqTimestamps {
-				if ts.After(rpmCutoff) {
-					recentRPM++
-				}
-			}
-			surfCopy := make(map[string]string, len(a.Surfaces))
-			for k, v := range a.Surfaces {
-				surfCopy[k] = v
-			}
-			status, statusReason := AccountStatus(a, now)
-			quotaCopy := append([]gemini.QuotaBucket(nil), a.Quota...)
-			var lastFailStr string
-			if !a.LastFail.IsZero() {
-				lastFailStr = a.LastFail.UTC().Format(time.RFC3339)
-			}
-			lastError := a.LastError
-			list = append(list, map[string]any{
-				"id":               a.ID,
-				"email":            a.Email,
-				"status":           status,
-				"statusReason":     statusReason,
-				"capacity":         a.Capacity,
-				"fails":            a.Fails,
-				"lastError":        lastError,
-				"lastFailAt":       lastFailStr,
-				"models":           mNames,
-				"quota":            quotaCopy,
-				"quotaWindow":      quotaWindowInfo(quotaCopy, now),
-				"capturedAt":       capAtStr,
-				"rotatedAt":        rotAtStr,
-				"modelsAt":         modAtStr,
-				"quotaAt":          qAtStr,
-				"lastUsedAt":       lastUsedStr,
-				"quarantined":      a.Quarantined,
-				"quarantineReason": a.QuarantineReason,
-				"accountGroup":     a.AccountGroup,
-				"importedFrom":     a.ImportedFrom,
-				"profileId":        a.ProfileID,
-				"proxyConfigured":  a.ProxyURL != "" || s.Cfg.ProxyURL != "",
-				"activeStreams":    a.activeStreams,
-				"recentRpm":        recentRPM,
-				"peakRpm":          a.peakRPM,
-				"totalRequests":    a.totalRequests,
-				"offloadRequests":  a.offloadRequests,
-				"surfaces":         surfCopy,
-			})
-			a.mu.RUnlock()
+			list = append(list, s.accountStatusMap(a, now))
 		}
 		sendJSON(w, 200, map[string]any{"accounts": list}, nil)
 		return
-
 	case r.Method == http.MethodGet && (p == "/v1/quota" || p == "/quota"):
 		scope := s.ResolveAuthScope(r)
 		if !scope.OK {
@@ -632,6 +588,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}, nil)
 		return
 
+	case s.Cfg.WebUI && strings.HasPrefix(p, "/v1/admin/"):
+		s.HandleAdmin(ctx, w, r)
+		return
+
 	default:
 		sendJSON(w, 404, map[string]any{
 			"error": map[string]any{
@@ -639,6 +599,80 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"type":    "invalid_request_error",
 			},
 		}, nil)
+	}
+}
+
+func (s *Server) accountStatusMap(a *AccountState, now time.Time) map[string]any {
+	rpmCutoff := now.Add(-60 * time.Second)
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	mNames := make([]string, 0, len(a.Models))
+	for _, m := range a.Models {
+		mNames = append(mNames, m.ModelName)
+	}
+	var capAtStr, rotAtStr, modAtStr, qAtStr, lastUsedStr string
+	if !a.CapturedAt.IsZero() {
+		capAtStr = a.CapturedAt.UTC().Format(time.RFC3339)
+	}
+	if !a.RotatedAt.IsZero() {
+		rotAtStr = a.RotatedAt.UTC().Format(time.RFC3339)
+	}
+	if !a.ModelsAt.IsZero() {
+		modAtStr = a.ModelsAt.UTC().Format(time.RFC3339)
+	}
+	if !a.QuotaAt.IsZero() {
+		qAtStr = a.QuotaAt.UTC().Format(time.RFC3339)
+	}
+	if !a.LastUsed.IsZero() {
+		lastUsedStr = a.LastUsed.UTC().Format(time.RFC3339)
+	}
+	recentRPM := 0
+	for _, ts := range a.reqTimestamps {
+		if ts.After(rpmCutoff) {
+			recentRPM++
+		}
+	}
+	surfCopy := make(map[string]string, len(a.Surfaces))
+	for k, v := range a.Surfaces {
+		surfCopy[k] = v
+	}
+	status, statusReason := AccountStatus(a, now)
+	quotaCopy := append([]gemini.QuotaBucket(nil), a.Quota...)
+	var lastFailStr string
+	if !a.LastFail.IsZero() {
+		lastFailStr = a.LastFail.UTC().Format(time.RFC3339)
+	}
+	lastError := a.LastError
+	return map[string]any{
+		"id":               a.ID,
+		"email":            a.Email,
+		"status":           status,
+		"statusReason":     statusReason,
+		"capacity":         a.Capacity,
+		"fails":            a.Fails,
+		"lastError":        lastError,
+		"lastFailAt":       lastFailStr,
+		"models":           mNames,
+		"quota":            quotaCopy,
+		"quotaWindow":      quotaWindowInfo(quotaCopy, now),
+		"capturedAt":       capAtStr,
+		"rotatedAt":        rotAtStr,
+		"modelsAt":         modAtStr,
+		"quotaAt":          qAtStr,
+		"lastUsedAt":       lastUsedStr,
+		"quarantined":      a.Quarantined,
+		"quarantineReason": a.QuarantineReason,
+		"disabled":         a.Disabled,
+		"accountGroup":     a.AccountGroup,
+		"importedFrom":     a.ImportedFrom,
+		"profileId":        a.ProfileID,
+		"proxyConfigured":  a.ProxyURL != "" || s.Cfg.ProxyURL != "",
+		"activeStreams":    a.activeStreams,
+		"recentRpm":        recentRPM,
+		"peakRpm":          a.peakRPM,
+		"totalRequests":    a.totalRequests,
+		"offloadRequests":  a.offloadRequests,
+		"surfaces":         surfCopy,
 	}
 }
 

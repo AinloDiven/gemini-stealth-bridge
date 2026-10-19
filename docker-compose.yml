@@ -1,0 +1,25 @@
+services:
+  gsb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gemini-stealth-bridge:latest
+    container_name: gemini-stealth-bridge
+    restart: unless-stopped
+    # Bound to 127.0.0.1 by default so Docker never exposes port 20133 to the public internet
+    # bypassing host firewalls (UFW/iptables). Access via localhost or SSH tunnel, or set
+    # BRIDGE_API_KEY / BRIDGE_ADMIN_KEY before binding to a public interface.
+    ports:
+      - "${BRIDGE_BIND_IP:-127.0.0.1}:${BRIDGE_PORT:-20133}:20133"
+    environment:
+      BRIDGE_HOME: /data
+      BRIDGE_HOST: 0.0.0.0
+      BRIDGE_PORT: 20133
+      BRIDGE_API_KEY: ${BRIDGE_API_KEY:-public}
+      BRIDGE_ADMIN_KEY: ${BRIDGE_ADMIN_KEY:-}
+      BRIDGE_WEB_UI: ${BRIDGE_WEB_UI:-1}
+      BRIDGE_DEFAULT_THINKING: ${BRIDGE_DEFAULT_THINKING:-low}
+      BRIDGE_ACCOUNT_STRATEGY: ${BRIDGE_ACCOUNT_STRATEGY:-rotate}
+      BRIDGE_REJECT_DOWNGRADE: ${BRIDGE_REJECT_DOWNGRADE:-1}
+    volumes:
+      - ${BRIDGE_DATA_DIR:-./data}:/data

@@ -13,3 +13,6 @@ session-cache.json
 # Personal backlog & internal update plans, not part of the published repo
 /ROADMAP.md
 /PLAN_UPDATE_v0.2.0.md
+/PLAN_*.md
+/DEVELOPMENT.md
+/DESIGN.md

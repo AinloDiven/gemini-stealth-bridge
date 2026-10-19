@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -80,6 +81,10 @@ type Config struct {
 	HistoryOffload          bool
 	PersonalContext         string
 	EgressPerAccount        map[string]string
+	WebUI                   bool
+	AdminKey                string
+	EnvFile                 string
+	FieldSources            map[string]string
 	Warnings                []string
 }
 
@@ -100,14 +105,111 @@ func FromEnv() *Config {
 	var warnings []string
 	home, _ := os.UserHomeDir()
 	bridgeHome := envStr("BRIDGE_HOME", filepath.Join(home, ".gemini-stealth-bridge"))
-	credFile := envStr("WEB_CRED_FILE", filepath.Join(bridgeHome, "web-credentials.json"))
+	envFilePath := filepath.Join(bridgeHome, "config.env")
+	fileEnv := LoadEnvFile(envFilePath)
+	sources := make(map[string]string)
+
+	lookup := func(key string) string {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			sources[key] = "env"
+			return v
+		}
+		if v := strings.TrimSpace(fileEnv[key]); v != "" {
+			sources[key] = "file"
+			return v
+		}
+		sources[key] = "default"
+		return ""
+	}
+	lookupStr := func(key, fallback string) string {
+		if v := lookup(key); v != "" {
+			return v
+		}
+		return fallback
+	}
+	lookupBool := func(key string, fallback bool) bool {
+		v := strings.ToLower(lookup(key))
+		if v == "" {
+			return fallback
+		}
+		switch v {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		default:
+			return fallback
+		}
+	}
+	lookupPositiveInt := func(key string, fallback, minVal int) int {
+		v := lookup(key)
+		if v == "" {
+			return fallback
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			warnings = append(warnings, fmt.Sprintf("invalid %s=%q; falling back to %d", key, v, fallback))
+			return fallback
+		}
+		if n < minVal {
+			warnings = append(warnings, fmt.Sprintf("%s=%d below minimum %d; clamping to %d", key, n, minVal, minVal))
+			return minVal
+		}
+		return n
+	}
+	lookupNonNegInt := func(key string, fallback int) int {
+		v := lookup(key)
+		if v == "" {
+			return fallback
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			warnings = append(warnings, fmt.Sprintf("invalid %s=%q; falling back to %d", key, v, fallback))
+			return fallback
+		}
+		return n
+	}
+	lookupClampInt := func(key string, fallback, minVal, maxVal int) int {
+		v := lookup(key)
+		if v == "" {
+			return fallback
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			warnings = append(warnings, fmt.Sprintf("invalid %s=%q; falling back to %d", key, v, fallback))
+			return fallback
+		}
+		if n < minVal {
+			return minVal
+		}
+		if n > maxVal {
+			return maxVal
+		}
+		return n
+	}
+	lookupEnum := func(key, fallback string, allowed []string) string {
+		raw := lookup(key)
+		if raw == "" {
+			return fallback
+		}
+		low := strings.ToLower(raw)
+		for _, a := range allowed {
+			if low == a {
+				return low
+			}
+		}
+		warnings = append(warnings, fmt.Sprintf("invalid %s=%q; falling back to %q", key, raw, fallback))
+		return fallback
+	}
+
+	credFile := lookupStr("WEB_CRED_FILE", filepath.Join(bridgeHome, "web-credentials.json"))
 	accountsDir := filepath.Join(bridgeHome, "accounts")
 
-	tokens := parseKeyValMap(os.Getenv("BRIDGE_ACCOUNT_TOKENS"))
-	accountGroups := parseKeyValMap(os.Getenv("BRIDGE_ACCOUNT_GROUP"))
-	egressPerAccount := parseKeyValMap(os.Getenv("BRIDGE_EGRESS_PER_ACCOUNT"))
+	tokens := parseKeyValMap(lookup("BRIDGE_ACCOUNT_TOKENS"))
+	accountGroups := parseKeyValMap(lookup("BRIDGE_ACCOUNT_GROUP"))
+	egressPerAccount := parseKeyValMap(lookup("BRIDGE_EGRESS_PER_ACCOUNT"))
 
-	rawThink := strings.TrimSpace(os.Getenv("BRIDGE_DEFAULT_THINKING"))
+	rawThink := lookup("BRIDGE_DEFAULT_THINKING")
 	defThinkKey := strings.ToLower(rawThink)
 	if defThinkKey == "" {
 		defThinkKey = "low"
@@ -118,8 +220,8 @@ func FromEnv() *Config {
 		defThink = 1
 	}
 
-	impersonate := envStr("BRIDGE_IMPERSONATE", "chrome_150_psk")
-	rawUAOS := strings.TrimSpace(os.Getenv("BRIDGE_UA_OS"))
+	impersonate := lookupStr("BRIDGE_IMPERSONATE", "chrome_150_psk")
+	rawUAOS := lookup("BRIDGE_UA_OS")
 	targetOS := runtime.GOOS
 	normalizedUAOS := ""
 	if rawUAOS != "" {
@@ -139,98 +241,111 @@ func FromEnv() *Config {
 	}
 	ua, chUA, platform := browserHeadersForOS(targetOS, impersonate)
 
-	tokenEstimator := envEnum("BRIDGE_TOKEN_ESTIMATOR", "script", []string{"script", "bytes4"}, &warnings)
-	streamBuffer := envEnum("BRIDGE_STREAM_BUFFER", "verified", []string{"verified", "eager"}, &warnings)
-	quotaPreflight := envEnum("BRIDGE_QUOTA_PREFLIGHT", "strict", []string{"strict", "advisory", "off"}, &warnings)
-	tlsExtOrder := envEnum("BRIDGE_TLS_EXT_ORDER", "fixed", []string{"fixed", "random"}, &warnings)
-	protocolMode := envEnum("BRIDGE_PROTOCOL_MODE", "bridge", []string{"bridge", "web"}, &warnings)
-	personalContext := envEnum("BRIDGE_PERSONAL_CONTEXT", "auto", []string{"auto", "off", "on"}, &warnings)
-	accountStrategy := envEnum("BRIDGE_ACCOUNT_STRATEGY", "rotate", []string{"rotate", "lru", "fill-first"}, &warnings)
-	accountPriority := parseCSVList(os.Getenv("BRIDGE_ACCOUNT_PRIORITY"))
+	tokenEstimator := lookupEnum("BRIDGE_TOKEN_ESTIMATOR", "script", []string{"script", "bytes4"})
+	streamBuffer := lookupEnum("BRIDGE_STREAM_BUFFER", "verified", []string{"verified", "eager"})
+	quotaPreflight := lookupEnum("BRIDGE_QUOTA_PREFLIGHT", "strict", []string{"strict", "advisory", "off"})
+	tlsExtOrder := lookupEnum("BRIDGE_TLS_EXT_ORDER", "fixed", []string{"fixed", "random"})
+	protocolMode := lookupEnum("BRIDGE_PROTOCOL_MODE", "bridge", []string{"bridge", "web"})
+	personalContext := lookupEnum("BRIDGE_PERSONAL_CONTEXT", "auto", []string{"auto", "off", "on"})
+	accountStrategy := lookupEnum("BRIDGE_ACCOUNT_STRATEGY", "rotate", []string{"rotate", "lru", "fill-first"})
+	accountPriority := parseCSVList(lookup("BRIDGE_ACCOUNT_PRIORITY"))
 	if accountStrategy == "rotate" && len(accountPriority) > 0 {
 		warnings = append(warnings, "BRIDGE_ACCOUNT_PRIORITY is ignored when BRIDGE_ACCOUNT_STRATEGY=rotate")
 	}
 
 	ipv6Default := "auto"
-	if strings.TrimSpace(os.Getenv("BRIDGE_DISABLE_IPV6")) == "1" {
+	if lookup("BRIDGE_DISABLE_IPV6") == "1" {
 		ipv6Default = "off"
 	}
-	ipv6Mode := envEnum("BRIDGE_IPV6", ipv6Default, []string{"auto", "off", "on"}, &warnings)
+	ipv6Mode := lookupEnum("BRIDGE_IPV6", ipv6Default, []string{"auto", "off", "on"})
 
-	locale := envStr("BRIDGE_LOCALE", "en")
+	locale := lookupStr("BRIDGE_LOCALE", "en")
 	acceptLang := deriveAcceptLanguage(locale)
 
-	maxAttempts := envClampInt("BRIDGE_MAX_ATTEMPTS", 3, 1, 10, &warnings)
-	maxUpstream := envClampInt("BRIDGE_MAX_UPSTREAM_ATTEMPTS", 3, 1, 10, &warnings)
+	maxAttempts := lookupClampInt("BRIDGE_MAX_ATTEMPTS", 3, 1, 10)
+	maxUpstream := lookupClampInt("BRIDGE_MAX_UPSTREAM_ATTEMPTS", 3, 1, 10)
 
-	quietHours := strings.TrimSpace(os.Getenv("BRIDGE_QUIET_HOURS"))
+	quietHours := lookup("BRIDGE_QUIET_HOURS")
 	if quietHours != "" && !isValidQuietHours(quietHours) {
 		warnings = append(warnings, fmt.Sprintf("invalid BRIDGE_QUIET_HOURS=%q; expected HH:MM-HH:MM", quietHours))
 	}
 
+	hostVal := lookup("BRIDGE_HOST")
+	if hostVal == "" {
+		hostVal = lookupStr("HOST", "127.0.0.1")
+	}
+	portVal := lookupPositiveInt("BRIDGE_PORT", 0, 1)
+	if portVal <= 0 {
+		portVal = lookupPositiveInt("PORT", 20133, 1)
+	}
+
 	return &Config{
-		Host:                    envStr("HOST", "127.0.0.1"),
-		Port:                    envPositiveInt("PORT", 20133, 1, &warnings),
+		Host:                    hostVal,
+		Port:                    portVal,
 		HomeDir:                 bridgeHome,
 		CredFile:                credFile,
 		AccountsDir:             accountsDir,
-		CookieDB:                strings.TrimSpace(os.Getenv("CHROME_COOKIES")),
-		APIKey:                  envStr("BRIDGE_API_KEY", "public"),
+		CookieDB:                lookup("CHROME_COOKIES"),
+		APIKey:                  lookupStr("BRIDGE_API_KEY", "public"),
 		AccountTokens:           tokens,
-		Temporary:               envBool("BRIDGE_TEMPORARY", false),
-		RejectDowngrade:         envBool("BRIDGE_REJECT_DOWNGRADE", true),
-		LiveThoughts:            envBool("BRIDGE_LIVE_THOUGHTS", true),
-		SessionCache:            envBool("BRIDGE_SESSION_CACHE", true),
-		KeepToolPreamble:        envBool("BRIDGE_TOOL_PREAMBLE", false),
-		LiveToolCalls:           envBool("BRIDGE_LIVE_TOOL_CALLS", false),
-		MaxPromptChars:          envPositiveInt("BRIDGE_MAX_PROMPT_CHARS", 850000, 1024, &warnings),
-		MaxOldToolChars:         envPositiveInt("BRIDGE_MAX_OLD_TOOL_CHARS", 32000, 256, &warnings),
-		RotateCookiesEvery:      time.Duration(envPositiveInt("BRIDGE_ROTATE_COOKIES_MS", 540000, 1000, &warnings)) * time.Millisecond,
-		ModelRefreshEvery:       time.Duration(envPositiveInt("BRIDGE_MODEL_REFRESH_MS", 1800000, 1000, &warnings)) * time.Millisecond,
-		StreamTimeout:           time.Duration(envPositiveInt("BRIDGE_STREAM_TIMEOUT_MS", 600000, 1000, &warnings)) * time.Millisecond,
-		FirstByteTimeout:        time.Duration(envPositiveInt("BRIDGE_FIRST_BYTE_TIMEOUT_MS", 60000, 1000, &warnings)) * time.Millisecond,
-		StallTimeout:            time.Duration(envPositiveInt("BRIDGE_STALL_TIMEOUT_MS", 90000, 1000, &warnings)) * time.Millisecond,
-		IdleSessionTimeout:      time.Duration(envPositiveInt("BRIDGE_IDLE_SESSION_MS", 180000, 1000, &warnings)) * time.Millisecond,
-		MaxSessions:             envPositiveInt("BRIDGE_MAX_SESSIONS", 16, 1, &warnings),
-		MaxQueueDepth:           envPositiveInt("BRIDGE_MAX_QUEUE", 4, 1, &warnings),
-		SessionWaitTimeout:      time.Duration(envPositiveInt("BRIDGE_SESSION_WAIT_MS", 10000, 100, &warnings)) * time.Millisecond,
-		ProxyURL:                strings.TrimSpace(os.Getenv("BRIDGE_PROXY_SERVER")),
+		Temporary:               lookupBool("BRIDGE_TEMPORARY", false),
+		RejectDowngrade:         lookupBool("BRIDGE_REJECT_DOWNGRADE", true),
+		LiveThoughts:            lookupBool("BRIDGE_LIVE_THOUGHTS", true),
+		SessionCache:            lookupBool("BRIDGE_SESSION_CACHE", true),
+		KeepToolPreamble:        lookupBool("BRIDGE_TOOL_PREAMBLE", false),
+		LiveToolCalls:           lookupBool("BRIDGE_LIVE_TOOL_CALLS", false),
+		MaxPromptChars:          lookupPositiveInt("BRIDGE_MAX_PROMPT_CHARS", 850000, 1024),
+		MaxOldToolChars:         lookupPositiveInt("BRIDGE_MAX_OLD_TOOL_CHARS", 32000, 256),
+		RotateCookiesEvery:      time.Duration(lookupPositiveInt("BRIDGE_ROTATE_COOKIES_MS", 540000, 1000)) * time.Millisecond,
+		ModelRefreshEvery:       time.Duration(lookupPositiveInt("BRIDGE_MODEL_REFRESH_MS", 1800000, 1000)) * time.Millisecond,
+		StreamTimeout:           time.Duration(lookupPositiveInt("BRIDGE_STREAM_TIMEOUT_MS", 600000, 1000)) * time.Millisecond,
+		FirstByteTimeout:        time.Duration(lookupPositiveInt("BRIDGE_FIRST_BYTE_TIMEOUT_MS", 60000, 1000)) * time.Millisecond,
+		StallTimeout:            time.Duration(lookupPositiveInt("BRIDGE_STALL_TIMEOUT_MS", 90000, 1000)) * time.Millisecond,
+		IdleSessionTimeout:      time.Duration(lookupPositiveInt("BRIDGE_IDLE_SESSION_MS", 180000, 1000)) * time.Millisecond,
+		MaxSessions:             lookupPositiveInt("BRIDGE_MAX_SESSIONS", 16, 1),
+		MaxQueueDepth:           lookupPositiveInt("BRIDGE_MAX_QUEUE", 4, 1),
+		SessionWaitTimeout:      time.Duration(lookupPositiveInt("BRIDGE_SESSION_WAIT_MS", 10000, 100)) * time.Millisecond,
+		ProxyURL:                lookup("BRIDGE_PROXY_SERVER"),
 		ImpersonateProfile:      impersonate,
 		DefaultThinking:         defThink,
 		UserAgent:               ua,
 		SecCHUA:                 chUA,
 		SecCHUAPlatform:         platform,
-		ContextWindow:           envPositiveInt("BRIDGE_CONTEXT_WINDOW", 1048576, 4096, &warnings),
-		MaxOutputTokens:         envPositiveInt("BRIDGE_MAX_OUTPUT_TOKENS", 65536, 256, &warnings),
+		ContextWindow:           lookupPositiveInt("BRIDGE_CONTEXT_WINDOW", 1048576, 4096),
+		MaxOutputTokens:         lookupPositiveInt("BRIDGE_MAX_OUTPUT_TOKENS", 65536, 256),
 		TokenEstimator:          tokenEstimator,
-		EarlySSE:                envBool("BRIDGE_EARLY_SSE", false),
-		EarlySSEGrace:           time.Duration(envNonNegInt("BRIDGE_EARLY_SSE_GRACE_MS", 20000, &warnings)) * time.Millisecond,
+		EarlySSE:                lookupBool("BRIDGE_EARLY_SSE", false),
+		EarlySSEGrace:           time.Duration(lookupNonNegInt("BRIDGE_EARLY_SSE_GRACE_MS", 20000)) * time.Millisecond,
 		StreamBufferMode:        streamBuffer,
 		MaxAttempts:             maxAttempts,
 		MaxUpstreamAttempts:     maxUpstream,
-		RetryBudget:             time.Duration(envNonNegInt("BRIDGE_RETRY_BUDGET_MS", 150000, &warnings)) * time.Millisecond,
-		ToolSchemaCompact:       envBool("BRIDGE_TOOL_SCHEMA_COMPACT", true),
-		ToolDescMaxChars:        envPositiveInt("BRIDGE_TOOL_DESC_MAX_CHARS", 400, 64, &warnings),
+		RetryBudget:             time.Duration(lookupNonNegInt("BRIDGE_RETRY_BUDGET_MS", 150000)) * time.Millisecond,
+		ToolSchemaCompact:       lookupBool("BRIDGE_TOOL_SCHEMA_COMPACT", true),
+		ToolDescMaxChars:        lookupPositiveInt("BRIDGE_TOOL_DESC_MAX_CHARS", 400, 64),
 		QuotaPreflight:          quotaPreflight,
-		LogRequests:             envBool("BRIDGE_LOG_REQUESTS", false),
-		DumpRequestDir:          strings.TrimSpace(os.Getenv("BRIDGE_DUMP_REQUEST")),
+		LogRequests:             lookupBool("BRIDGE_LOG_REQUESTS", false),
+		DumpRequestDir:          lookup("BRIDGE_DUMP_REQUEST"),
 		TLSExtOrder:             tlsExtOrder,
-		FollowRedirects:         envBool("BRIDGE_FOLLOW_REDIRECTS", true),
+		FollowRedirects:         lookupBool("BRIDGE_FOLLOW_REDIRECTS", true),
 		IPv6Mode:                ipv6Mode,
 		UAOS:                    normalizedUAOS,
 		ProtocolMode:            protocolMode,
-		BLOverride:              strings.TrimSpace(os.Getenv("BRIDGE_BL_OVERRIDE")),
+		BLOverride:              lookup("BRIDGE_BL_OVERRIDE"),
 		Locale:                  locale,
 		AcceptLanguage:          acceptLang,
-		MaxRPMPerAccount:        envNonNegInt("BRIDGE_MAX_RPM_PER_ACCOUNT", 24, &warnings),
-		MaxConcurrentPerAccount: envNonNegInt("BRIDGE_MAX_CONCURRENT_PER_ACCOUNT", 2, &warnings),
-		HistoryOffload:          envBool("BRIDGE_HISTORY_OFFLOAD", true),
+		MaxRPMPerAccount:        lookupNonNegInt("BRIDGE_MAX_RPM_PER_ACCOUNT", 24),
+		MaxConcurrentPerAccount: lookupNonNegInt("BRIDGE_MAX_CONCURRENT_PER_ACCOUNT", 2),
+		HistoryOffload:          lookupBool("BRIDGE_HISTORY_OFFLOAD", true),
 		PersonalContext:         personalContext,
 		QuietHours:              quietHours,
 		AccountGroups:           accountGroups,
 		AccountStrategy:         accountStrategy,
 		AccountPriority:         accountPriority,
 		EgressPerAccount:        egressPerAccount,
+		WebUI:                   lookupBool("BRIDGE_WEB_UI", false),
+		AdminKey:                lookup("BRIDGE_ADMIN_KEY"),
+		EnvFile:                 envFilePath,
+		FieldSources:            sources,
 		Warnings:                warnings,
 	}
 }
@@ -476,4 +591,77 @@ func isValidHHMM(s string) bool {
 		return false
 	}
 	return h >= 0 && h <= 23 && m >= 0 && m <= 59
+}
+
+// LoadEnvFile reads KEY=VALUE pairs from a dotenv-style configuration file.
+// Missing files return an empty map without error.
+func LoadEnvFile(path string) map[string]string {
+	out := make(map[string]string)
+	if strings.TrimSpace(path) == "" {
+		return out
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "export ") {
+			trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "export "))
+		}
+		idx := strings.IndexByte(trimmed, '=')
+		if idx <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(trimmed[:idx])
+		v := strings.TrimSpace(trimmed[idx+1:])
+		if len(v) >= 2 && ((v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'')) {
+			v = v[1 : len(v)-1]
+		}
+		if k != "" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// SaveEnvFile merges updates into path atomically with 0600 permissions.
+func SaveEnvFile(path string, updates map[string]string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("empty config.env path")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	merged := LoadEnvFile(path)
+	for k, v := range updates {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		merged[k] = strings.TrimSpace(v)
+	}
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString("# Gemini Stealth Bridge runtime configuration (managed by gsb)\n")
+	for _, k := range keys {
+		val := strings.ReplaceAll(merged[k], "\n", " ")
+		val = strings.ReplaceAll(val, "\r", " ")
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(val)
+		b.WriteByte('\n')
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(b.String()), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }

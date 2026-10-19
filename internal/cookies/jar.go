@@ -49,6 +49,7 @@ type CredentialFile struct {
 	LastReqID        int64             `json:"lastReqId,omitempty"`
 	Quarantined      bool              `json:"quarantined,omitempty"`
 	QuarantineReason string            `json:"quarantineReason,omitempty"`
+	Disabled         bool              `json:"disabled,omitempty"`
 	AccountGroup     string            `json:"accountGroup,omitempty"`
 	ProxyURL         string            `json:"proxyUrl,omitempty"`
 	Surfaces         map[string]string `json:"surfaces,omitempty"`

@@ -136,6 +136,7 @@ func (s *Server) LoadCredentials() int {
 		prev.ProxyURL = st.ProxyURL
 		prev.Quarantined = st.Quarantined
 		prev.QuarantineReason = st.QuarantineReason
+		prev.Disabled = st.Disabled
 		if len(st.Surfaces) > 0 {
 			if prev.Surfaces == nil {
 				prev.Surfaces = make(map[string]string, len(st.Surfaces))
@@ -158,8 +159,13 @@ func (s *Server) LoadCredentials() int {
 		}
 		deduped[i] = prev
 	}
+	if len(s.Cfg.AccountPriority) > 0 {
+		ranks := s.accountRanks(deduped)
+		sort.SliceStable(deduped, func(i, j int) bool {
+			return ranks[deduped[i].ID] < ranks[deduped[j].ID]
+		})
+	}
 	s.accounts = deduped
-	// Auto-populate gsb-<id> (and raw <id>) so 9router and direct harnesses work out of the box.
 	byEmail := make(map[string]string, len(deduped))
 	for _, a := range deduped {
 		s.registerAccountTokensLocked(a.ID, a.ID)
@@ -185,7 +191,7 @@ func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error
 	rec, _, _ := cookies.LoadAccountFile(path)
 	var capAt, rotAt time.Time
 	var importedFrom, profileID, acctGroup, qReason string
-	var quarantined bool
+	var quarantined, disabled bool
 	surfaces := make(map[string]string)
 	if rec != nil {
 		if rec.CapturedAt != "" {
@@ -199,6 +205,7 @@ func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error
 		acctGroup = rec.AccountGroup
 		quarantined = rec.Quarantined
 		qReason = rec.QuarantineReason
+		disabled = rec.Disabled
 		for k, v := range rec.Surfaces {
 			surfaces[k] = v
 		}
@@ -226,6 +233,7 @@ func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error
 		ProxyURL:         proxyURL,
 		Quarantined:      quarantined,
 		QuarantineReason: qReason,
+		Disabled:         disabled,
 		Surfaces:         surfaces,
 		subStrikes:       make(map[string]int),
 		Client:           ac,
@@ -494,6 +502,10 @@ func (s *Server) checkPreFlightQuotaInternal(a *AccountState, model gemini.Model
 	}
 	var related []gemini.QuotaBucket
 	for _, q := range spent {
+		if q.ID == "5h" || q.ID == "weekly" {
+			related = append(related, q)
+			continue
+		}
 		lbl := strings.ToLower(q.Label)
 		for _, tok := range family {
 			if strings.Contains(lbl, tok) {
@@ -879,14 +891,28 @@ func (s *Server) mergeAccountQuota(a *AccountState, fresh []gemini.QuotaBucket) 
 	now := s.now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	merged := make([]gemini.QuotaBucket, 0, len(fresh)+2)
+	merged := make([]gemini.QuotaBucket, 0, len(fresh)+4)
 	merged = append(merged, fresh...)
+	hasWeekly := false
+	for _, q := range fresh {
+		if !q.Synthetic && (q.ID == "weekly" || q.Total > 5000) {
+			hasWeekly = true
+			break
+		}
+	}
 	for _, old := range a.Quota {
 		if (old.Synthetic || strings.HasPrefix(old.ID, "sub:")) && old.ResetAt != "" {
 			if t, err := time.Parse(time.RFC3339, old.ResetAt); err == nil && t.After(now) {
 				old.Synthetic = true
 				merged = append(merged, old)
 			}
+			continue
+		}
+		if !hasWeekly && (old.ID == "weekly" || old.Total > 5000) && !old.Synthetic {
+			old.ID = "weekly"
+			old.Label = "Weekly Pool"
+			merged = append(merged, old)
+			hasWeekly = true
 		}
 	}
 	a.Quota = merged
@@ -963,7 +989,7 @@ func (s *Server) pickFallbackAccount(accts []*AccountState, tried map[string]boo
 			continue
 		}
 		cand.mu.RLock()
-		qState := cand.Quarantined
+		qState := cand.Quarantined || cand.Disabled
 		cGroup := cand.AccountGroup
 		cand.mu.RUnlock()
 		if qState {
@@ -1203,7 +1229,7 @@ func (s *Server) accountReady(a *AccountState, requested string) (*gemini.ModelI
 		return nil, false
 	}
 	a.mu.RLock()
-	qState := a.Quarantined
+	qState := a.Quarantined || a.Disabled
 	a.mu.RUnlock()
 	if qState {
 		return nil, false
@@ -1261,10 +1287,10 @@ func (s *Server) resolveRotateAccount(accts []*AccountState, requested string, h
 
 	// Nothing is ready. Prefer an account that can at least serve the model so the
 	// caller receives an accurate quota error rather than model_not_found.
-	for i := 0; i < len(accts); i++ {
+	for i := range len(accts) {
 		a := at(i)
 		a.mu.RLock()
-		qState := a.Quarantined
+		qState := a.Quarantined || a.Disabled
 		a.mu.RUnlock()
 		if qState {
 			continue
@@ -1273,10 +1299,10 @@ func (s *Server) resolveRotateAccount(accts []*AccountState, requested string, h
 			return a
 		}
 	}
-	for i := 0; i < len(accts); i++ {
+	for i := range len(accts) {
 		a := at(i)
 		a.mu.RLock()
-		qState := a.Quarantined
+		qState := a.Quarantined || a.Disabled
 		a.mu.RUnlock()
 		if !qState {
 			return a
@@ -1350,7 +1376,7 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 	}
 	for _, a := range accts {
 		a.mu.RLock()
-		qState := a.Quarantined
+		qState := a.Quarantined || a.Disabled
 		a.mu.RUnlock()
 		if qState {
 			continue
@@ -1468,9 +1494,11 @@ func (s *Server) refreshQuotaAsync(a *AccountState, c UpstreamClient) {
 	}
 	lowQuota := false
 	for _, q := range a.Quota {
-		if !q.Synthetic && !strings.HasPrefix(q.ID, "sub:") && !q.Unlimited && q.Total > 0 && q.Remaining <= 2 {
-			lowQuota = true
-			break
+		if !q.Synthetic && !strings.HasPrefix(q.ID, "sub:") && !q.Unlimited && q.Total > 0 {
+			if q.Remaining <= 200 || (q.Total >= 1000 && q.Remaining*20 <= q.Total) {
+				lowQuota = true
+				break
+			}
 		}
 	}
 	if !lowQuota && !a.QuotaAt.IsZero() && now.Sub(a.QuotaAt) < quotaRefreshCooldown {

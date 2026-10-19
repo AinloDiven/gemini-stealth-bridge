@@ -7,6 +7,7 @@ import (
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	"log"
+	"math"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -97,6 +98,7 @@ type AccountClient struct {
 	fromDiskAT       bool
 	quarantined      bool
 	quarantineReason string
+	disabled         bool
 	accountGroup     string
 	proxyURL         string
 	surfaces         map[string]string
@@ -147,6 +149,7 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 	ac.tokenSource = rec.TokenSource
 	ac.quarantined = rec.Quarantined
 	ac.quarantineReason = rec.QuarantineReason
+	ac.disabled = rec.Disabled
 	ac.accountGroup = rec.AccountGroup
 	ac.proxyURL = rec.ProxyURL
 	if len(rec.Surfaces) > 0 {
@@ -221,6 +224,14 @@ func (ac *AccountClient) SetQuarantined(quarantined bool, reason string) {
 	} else {
 		ac.surfaces["geminiWeb"] = "ok"
 	}
+	ac.mu.Unlock()
+	ac.persistState()
+}
+
+// SetDisabled updates the operator-disabled flag and persists it to disk.
+func (ac *AccountClient) SetDisabled(disabled bool) {
+	ac.mu.Lock()
+	ac.disabled = disabled
 	ac.mu.Unlock()
 	ac.persistState()
 }
@@ -405,6 +416,7 @@ func (ac *AccountClient) persistState() {
 		LastReqID:        ac.reqCounter.Load(),
 		Quarantined:      ac.quarantined,
 		QuarantineReason: ac.quarantineReason,
+		Disabled:         ac.disabled,
 		AccountGroup:     ac.accountGroup,
 		ProxyURL:         ac.proxyURL,
 		Surfaces:         surfCopy,
@@ -982,7 +994,149 @@ func (ac *AccountClient) GetQuota(ctx context.Context) []QuotaBucket {
 			})
 		}
 	}
-	return out
+	return ac.enrichWithGraphqlUsagePools(ctx, sess.Client, out)
+}
+
+const (
+	graphqlUsageQuerySig  = "2/eV2urSc0npZclHCYNGf6nOVD14WHCs52VfsJoHiZgEs="
+	graphqlUsageVariables = `{"g1Request":{"entrypoints":["GEMINI_USAGE_SETTINGS_UPGRADE_BANNER","GEMINI_USAGE_SETTINGS_AI_CREDITS_UPSELL_CARD","GEMINI_USAGE_SETTINGS_UPGRADE_AND_CREDITS_BANNER"]},"workspaceRequest":{"surface":"GEMINI_CHAT_USAGE_LIMITS_UPSELL"}}`
+)
+
+type graphqlUsagePool struct {
+	PoolType       string  `json:"poolType"`
+	PercentageUsed float64 `json:"percentageUsed"`
+	Gxu            struct {
+		WindowRefreshesAt string `json:"windowRefreshesAt"`
+	} `json:"gxu"`
+}
+
+func (ac *AccountClient) enrichWithGraphqlUsagePools(ctx context.Context, sc *transport.StealthClient, base []QuotaBucket) []QuotaBucket {
+	if sc == nil {
+		return base
+	}
+	q := url.Values{}
+	q.Set("query_signature", graphqlUsageQuerySig)
+	q.Set("variables", graphqlUsageVariables)
+	u := Origin + "/_/BardChatUi/graphql/schemas/GEMINI_WEB_GRAPHQL/executeQuery?" + q.Encode()
+	res, err := sc.Do(ctx, transport.RequestOptions{
+		Method: "GET",
+		URL:    u,
+		Kind:   transport.ReqKindCORS,
+		Headers: map[string]string{
+			"cookie": ac.CookieHeader(),
+			"accept": "application/json",
+		},
+		Timeout: 10 * time.Second,
+	})
+	if err != nil || res == nil || res.Status != 200 {
+		return base
+	}
+	ac.absorbAndPersistCookies(res.SetCookies)
+
+	body := strings.TrimSpace(res.Body)
+	if strings.HasPrefix(body, ")]}'") {
+		body = strings.TrimSpace(body[4:])
+	}
+	var chunks []struct {
+		Data struct {
+			Viewer struct {
+				Rpcs struct {
+					GetUsageInfo struct {
+						Pools []graphqlUsagePool `json:"pools"`
+					} `json:"getUsageInfo"`
+				} `json:"rpcs"`
+			} `json:"viewer"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &chunks); err != nil || len(chunks) == 0 {
+		return base
+	}
+	var pool5h, poolWeekly *graphqlUsagePool
+	for _, ch := range chunks {
+		for i := range ch.Data.Viewer.Rpcs.GetUsageInfo.Pools {
+			p := &ch.Data.Viewer.Rpcs.GetUsageInfo.Pools[i]
+			switch p.PoolType {
+			case "GXU_FIVE_HOURLY":
+				pool5h = p
+			case "GXU_WEEKLY":
+				poolWeekly = p
+			}
+		}
+	}
+	if pool5h == nil && poolWeekly == nil {
+		return base
+	}
+
+	exact5hRem, exact5hTot := -1, 2400
+	exactWeeklyRem, exactWeeklyTot := -1, 48384
+	for _, b := range base {
+		if b.Total > 5000 {
+			exactWeeklyTot = b.Total
+			exactWeeklyRem = b.Remaining
+		} else if b.Total > 0 {
+			exact5hTot = b.Total
+			exact5hRem = b.Remaining
+		}
+	}
+
+	var enriched []QuotaBucket
+	if pool5h != nil {
+		pct := math.Round(pool5h.PercentageUsed * 100)
+		rem := exact5hRem
+		if rem < 0 {
+			rem = int(math.Round(float64(exact5hTot) * (1.0 - pool5h.PercentageUsed)))
+			if rem < 0 {
+				rem = 0
+			}
+		}
+		resetAt := normalizeRFC3339(pool5h.Gxu.WindowRefreshesAt)
+		enriched = append(enriched, QuotaBucket{
+			ID:              "5h",
+			Label:           "5h Window",
+			UsagePercentage: &pct,
+			Total:           exact5hTot,
+			Remaining:       rem,
+			ResetAt:         resetAt,
+		})
+	}
+	if poolWeekly != nil {
+		pct := math.Round(poolWeekly.PercentageUsed * 100)
+		rem := exactWeeklyRem
+		if rem < 0 {
+			rem = int(math.Round(float64(exactWeeklyTot) * (1.0 - poolWeekly.PercentageUsed)))
+			if rem < 0 {
+				rem = 0
+			}
+		}
+		resetAt := normalizeRFC3339(poolWeekly.Gxu.WindowRefreshesAt)
+		enriched = append(enriched, QuotaBucket{
+			ID:              "weekly",
+			Label:           "Weekly Pool",
+			UsagePercentage: &pct,
+			Total:           exactWeeklyTot,
+			Remaining:       rem,
+			ResetAt:         resetAt,
+		})
+	}
+	if len(enriched) == 2 && enriched[1].Remaining < enriched[0].Remaining {
+		enriched[0].Remaining = enriched[1].Remaining
+	}
+	enriched = append(enriched, base...)
+	return enriched
+}
+
+func normalizeRFC3339(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if t, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return t.UTC().Format(time.RFC3339)
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t.UTC().Format(time.RFC3339)
+	}
+	return raw
 }
 
 func (ac *AccountClient) nextReqID() int64 {
