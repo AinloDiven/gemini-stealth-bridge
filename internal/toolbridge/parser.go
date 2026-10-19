@@ -10,7 +10,7 @@ import (
 
 var (
 	fencedBlockRe         = regexp.MustCompile("(?is)(?:```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*([\\s\\S]*?)```|<(?:tool_call|tool_calls|function_call|function_calls)>\\s*([\\s\\S]*?)</(?:tool_call|tool_calls|function_call|function_calls)>)")
-	standaloneAfterRe     = regexp.MustCompile("(?is)^(?:</(?:tool_call|tool_calls|function_call|function_calls)>|```)\\s*$")
+	standaloneAfterRe     = regexp.MustCompile("(?is)^[}\\]\\s]*(?:(?:</(?:tool_call|tool_calls|function_call|function_calls)>|```)[}\\]\\s]*)?$")
 	standaloneBeforeRe    = regexp.MustCompile("(?is)(?:^|\\n)\\s*(?:<(?:tool_call|tool_calls|function_call|function_calls)>|```(?:json|tool_call|tool_calls|function_call|function_calls)?)\\s*$")
 	exampleIntroRe        = regexp.MustCompile(`(?is)(?:\bdo\s+not\s+execute\b|\bdon't\s+execute\b|\bfor\s+example\b|\be\.g\.\b|\bexample\s*(?:json|call|payload|envelope|output|response|format)?\s*:\s*|\bformat\s+is\s*:\s*)\s*$`)
 	potentialToolMarkerRe = regexp.MustCompile("(?is)(?:\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls)\\s*\"|<(?:tool_call|tool_calls|function_call|function_calls)\\b|```\\s*(?:json|tool_call|tool_calls|function_call|function_calls)\\b|\\{\\s*\"\\s*(?:name|tool|tool_name|function|tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls)\\s*\"\\s*:|\\[\\s*\\{\\s*\"\\s*(?:name|tool|tool_name|function)\\s*\"\\s*:)")
@@ -38,11 +38,43 @@ type candidateSpan struct {
 func hasUnbalancedToolEnvelopeOpener(s string) bool {
 	openerRe := regexp.MustCompile(`(?is)\{\s*"\s*(?:tool_calls|toolCalls|tool_call|function_call|function_calls|functionCalls)\s*"\s*:`)
 	for _, loc := range openerRe.FindAllStringIndex(s, -1) {
-		if len(findBalancedObjects(s[loc[0]:])) == 0 {
+		objs := findBalancedObjects(s[loc[0]:])
+		if len(objs) == 0 || objs[0][0] != 0 || !hasBalancedBracketsOutsideStrings(s[loc[0]:loc[0]+objs[0][1]]) {
 			return true
 		}
 	}
 	return false
+}
+
+func hasBalancedBracketsOutsideStrings(s string) bool {
+	depth := 0
+	inStr := false
+	esc := false
+	for i := range len(s) {
+		ch := s[i]
+		if inStr {
+			if esc {
+				esc = false
+			} else if ch == '\\' {
+				esc = true
+			} else if ch == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inStr = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth == 0
 }
 
 func findBalancedObjects(s string) [][2]int {
@@ -92,6 +124,7 @@ func repairJSONStringEscapes(s string) string {
 	var out strings.Builder
 	out.Grow(len(s) + 16)
 	inStr := false
+	var stack []byte
 	for i := 0; i < len(s); i++ {
 		ch := s[i]
 		if !inStr {
@@ -99,6 +132,34 @@ func repairJSONStringEscapes(s string) string {
 				inStr = true
 				out.WriteByte(ch)
 				continue
+			}
+			if ch == '{' {
+				stack = append(stack, '}')
+				out.WriteByte(ch)
+				continue
+			}
+			if ch == '[' {
+				stack = append(stack, ']')
+				out.WriteByte(ch)
+				continue
+			}
+			if ch == '}' || ch == ']' {
+				if len(stack) == 0 {
+					continue
+				}
+				expected := stack[len(stack)-1]
+				if ch == expected {
+					stack = stack[:len(stack)-1]
+					out.WriteByte(ch)
+					continue
+				}
+				j := i + 1
+				for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n' || s[j] == ch) {
+					j++
+				}
+				if j < len(s) && s[j] == expected {
+					continue
+				}
 			}
 			// Strip trailing commas before '}' or ']' outside string literals.
 			if ch == ',' {

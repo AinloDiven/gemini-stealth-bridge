@@ -18,6 +18,20 @@ func sampleReproTools() any {
 				},
 			},
 		},
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "bash",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"command": map[string]any{"type": "string"},
+						"i":       map[string]any{"type": "string"},
+					},
+					"required": []any{"command", "i"},
+				},
+			},
+		},
 	}
 }
 
@@ -60,6 +74,7 @@ func TestRealTruncatedEnvelopeStillErrors(t *testing.T) {
 		{"noarrayclose", `{"tool_calls":[{"name":"read_file","arguments":{"path":"/tmp/a"}}`},
 		{"fencedopencut", "```json\n{\"tool_calls\":[{\"name\":\"read_file\""},
 		{"argcut", "```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"pa"},
+		{"missingbracketbeforebrace", "```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/a\"}}}\n```"},
 	}
 	for _, tc := range cases {
 		_, err := InterpretReply(tc.reply, sampleReproTools(), "auto")
@@ -67,6 +82,39 @@ func TestRealTruncatedEnvelopeStillErrors(t *testing.T) {
 			t.Errorf("case %q: expected error, got nil", tc.name)
 		} else if !strings.Contains(err.Error(), "malformed or truncated") {
 			t.Errorf("case %q: unexpected error %v", tc.name, err)
+		}
+	}
+}
+
+func TestRedundantClosingBracesInToolEnvelope(t *testing.T) {
+	cases := []struct {
+		name  string
+		reply string
+		tool  string
+	}{
+		{
+			name:  "extra_trailing_brace_fenced",
+			reply: "```json\n{\"tool_calls\":[{\"name\":\"bash\",\"arguments\":{\"command\":\"python3 -c \\\"import sqlite3; conn = sqlite3.connect('transpadang-tracker/data/tracker_202610.db'); print(conn.execute('SELECT name FROM sqlite_master WHERE type=\\\\'table\\\\'').fetchall())\\\"\",\"i\":\"Inspect database tables\"}}]}}\n```",
+			tool:  "bash",
+		},
+		{
+			name:  "extra_brace_before_array_close",
+			reply: "```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/a\"}}}]}\n```",
+			tool:  "read_file",
+		},
+		{
+			name:  "extra_bracket_before_envelope_close",
+			reply: "```json\n{\"tool_calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/a\"}}]]}\n```",
+			tool:  "read_file",
+		},
+	}
+	for _, tc := range cases {
+		res, err := InterpretReply(tc.reply, sampleReproTools(), "auto")
+		if err != nil {
+			t.Fatalf("case %q: unexpected error: %v", tc.name, err)
+		}
+		if res == nil || len(res.Calls) != 1 || res.Calls[0].Name != tc.tool {
+			t.Fatalf("case %q: expected 1 %q call, got %+v", tc.name, tc.tool, res)
 		}
 	}
 }
