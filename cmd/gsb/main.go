@@ -34,14 +34,16 @@ var reSafeAccountName = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 func init() {
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
-		fmt.Fprint(out, "gsb — OpenAI-compatible bridge to Gemini Web\n\n")
-		fmt.Fprint(out, "First run (recommended):\n")
-		fmt.Fprint(out, "  gsb --login <name>   sign in to Gemini in a browser, then capture that session\n")
-		fmt.Fprint(out, "  gsb --probe          verify the captured account can reach Gemini\n")
-		fmt.Fprint(out, "  gsb --accounts       show which accounts are usable, limited, or expired\n")
-		fmt.Fprint(out, "  gsb                  start the daemon on 127.0.0.1:20133\n\n")
-		fmt.Fprint(out, "Reuse browser cookies only when that profile is already signed in to Gemini.\n")
-		fmt.Fprint(out, "Cookies copied from a profile that never signed in expire within minutes.\n\n")
+		fmt.Fprint(out, "gsb — OpenAI-compatible bridge to Gemini Web (v"+config.Version+")\n\n")
+		fmt.Fprint(out, "Quick start:\n")
+		fmt.Fprint(out, "  gsb --login <name>                  launch isolated browser sign-in and save account\n")
+		fmt.Fprint(out, "  gsb --probe                         verify accounts, models, and 5h/weekly quota\n")
+		fmt.Fprint(out, "  gsb --accounts --accounts-live      print live status table (5h + weekly quota)\n")
+		fmt.Fprint(out, "  gsb --web                           start daemon + Web Control Plane at http://127.0.0.1:20133/ui\n")
+		fmt.Fprint(out, "  ./start.sh                          build (if needed) and start daemon with Web UI enabled\n\n")
+		fmt.Fprint(out, "Remote VPS / Headless login:\n")
+		fmt.Fprint(out, "  On laptop: ssh -L 20133:127.0.0.1:20133 user@vps  (and optionally `gsb --login-helper`)\n")
+		fmt.Fprint(out, "  Open http://127.0.0.1:20133/ui -> '+ Add Account' -> paste Incognito cookies or launch isolated browser.\n\n")
 		fmt.Fprint(out, "Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -265,7 +267,11 @@ func main() {
 			log.Printf("             account keys gsb-<name> pin a single account")
 		}
 		if loaded == 0 {
-			log.Printf("  WARNING:   no credentials found — run `gsb --login <name>` to sign in and capture a session, or place account files in %s", cfg.AccountsDir)
+			if cfg.WebUI {
+				log.Printf("  onboarding: no accounts yet — open http://%s/ui and click '+ Add Account', or run `gsb --login <name>`", addr)
+			} else {
+				log.Printf("  WARNING:   no credentials found — run `gsb --login <name>` to sign in and capture a session, or start with `gsb --web`")
+			}
 		}
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[fatal] listen %s: %v", addr, err)
@@ -385,7 +391,7 @@ func runInteractiveLogin(cfg config.Config, acctName, explicitDB string) error {
 	targetURL := "https://gemini.google.com/app"
 	browser, profileDir := cookies.ParseProfileHint(explicitDB)
 	if explicitDB == "" {
-		if bin := findBrowserBinary(browser); bin != "" && (runtime.GOOS != "linux" || os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "") {
+		if bin := cookies.FindBrowserBinary(browser); bin != "" && (runtime.GOOS != "linux" || os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != "") {
 			fmt.Printf("Launching isolated %s login window for %s (prevents cookie rotation conflicts with your main browser)...\n", filepath.Base(bin), acctName)
 			fmt.Println("Sign in to Google Gemini in the popup window. It will close automatically as soon as sign-in completes.")
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -451,78 +457,9 @@ func runLocalLoginHelper() error {
 	return http.ListenAndServe("127.0.0.1:20134", mux)
 }
 
+// findBrowserBinary delegates to cookies.FindBrowserBinary.
 func findBrowserBinary(browser string) string {
-	b := strings.ToLower(strings.TrimSpace(browser))
-	if b == "" {
-		b = "chrome"
-	}
-	switch runtime.GOOS {
-	case "windows":
-		roots := []string{
-			os.Getenv("ProgramFiles"),
-			os.Getenv("ProgramFiles(x86)"),
-			os.Getenv("LOCALAPPDATA"),
-		}
-		var rels []string
-		switch b {
-		case "brave":
-			rels = []string{`BraveSoftware\Brave-Browser\Application\brave.exe`}
-		case "edge":
-			rels = []string{`Microsoft\Edge\Application\msedge.exe`}
-		case "vivaldi":
-			rels = []string{`Vivaldi\Application\vivaldi.exe`}
-		case "chromium":
-			rels = []string{`Chromium\Application\chrome.exe`}
-		case "arc":
-			// Arc ships as an MSIX package; the executable lives under a
-			// versioned package directory.
-			for _, root := range roots {
-				if root == "" {
-					continue
-				}
-				matches, _ := filepath.Glob(filepath.Join(root, "Packages", "TheBrowserCompany.Arc_*", "LocalCache", "Local", "Arc", "Arc.exe"))
-				if len(matches) > 0 {
-					return matches[0]
-				}
-			}
-			rels = nil
-		default:
-			rels = []string{`Google\Chrome\Application\chrome.exe`}
-		}
-		for _, r := range roots {
-			if r == "" {
-				continue
-			}
-			for _, rel := range rels {
-				cand := filepath.Join(r, rel)
-				if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-					return cand
-				}
-			}
-		}
-	default:
-		var names []string
-		switch b {
-		case "brave":
-			names = []string{"brave-browser", "brave"}
-		case "edge":
-			names = []string{"microsoft-edge", "microsoft-edge-stable"}
-		case "vivaldi":
-			names = []string{"vivaldi", "vivaldi-stable"}
-		case "chromium":
-			names = []string{"chromium", "chromium-browser"}
-		case "arc":
-			names = []string{"arc", "arc-browser"}
-		default:
-			names = []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser"}
-		}
-		for _, n := range names {
-			if p, err := exec.LookPath(n); err == nil {
-				return p
-			}
-		}
-	}
-	return ""
+	return cookies.FindBrowserBinary(browser)
 }
 
 func openBrowserURL(url, browser, profileDir string) {
@@ -691,28 +628,51 @@ func runAccountsTable(cfg config.Config, live bool) {
 	idW, emailW := len("ACCOUNT"), len("EMAIL")
 	type row struct {
 		id, email, status, reason string
-		remaining, total          int
+		quota5h, quotaWeekly      string
 		resetAt                   string
 	}
 	rows := make([]row, 0, len(accts))
+	hasWeeklyCol := false
 	for _, a := range accts {
 		email, quota := server.AccountSnapshot(a)
 		status, reason := server.AccountStatus(a, now)
 
-		remaining, total := 0, 0
+		rem5h, tot5h := 0, 0
+		q5hStr, qWeeklyStr := "-", "-"
 		resetAt := "-"
+		sawExplicit5h := false
 		for _, q := range quota {
 			if q.Synthetic || q.Unlimited || q.Total <= 0 {
 				continue
 			}
-			remaining += q.Remaining
-			total += q.Total
-			if q.ResetAt != "" && resetAt == "-" {
-				resetAt = q.ResetAt
+			if q.ID == "weekly" {
+				qWeeklyStr = fmt.Sprintf("%d/%d", q.Remaining, q.Total)
+				hasWeeklyCol = true
+				continue
+			}
+			if q.ID == "5h" {
+				q5hStr = fmt.Sprintf("%d/%d", q.Remaining, q.Total)
+				sawExplicit5h = true
+				if q.ResetAt != "" {
+					resetAt = q.ResetAt
+				}
+				continue
+			}
+			if !sawExplicit5h && q.Total <= 5000 {
+				rem5h += q.Remaining
+				tot5h += q.Total
+				if q.ResetAt != "" && resetAt == "-" {
+					resetAt = q.ResetAt
+				}
 			}
 		}
-		rows = append(rows, row{id: a.ID, email: email, status: status, reason: reason,
-			remaining: remaining, total: total, resetAt: resetAt})
+		if !sawExplicit5h && tot5h > 0 {
+			q5hStr = fmt.Sprintf("%d/%d", rem5h, tot5h)
+		}
+		rows = append(rows, row{
+			id: a.ID, email: email, status: status, reason: reason,
+			quota5h: q5hStr, quotaWeekly: qWeeklyStr, resetAt: resetAt,
+		})
 		if len(a.ID) > idW {
 			idW = len(a.ID)
 		}
@@ -721,24 +681,22 @@ func runAccountsTable(cfg config.Config, live bool) {
 		}
 	}
 
-	fmt.Printf("%-*s  %-*s  %-12s  %-12s  %s\n", idW, "ACCOUNT", emailW, "EMAIL", "STATUS", "5H QUOTA", "DETAIL")
+	if hasWeeklyCol {
+		fmt.Printf("%-*s  %-*s  %-12s  %-12s  %-14s  %s\n", idW, "ACCOUNT", emailW, "EMAIL", "STATUS", "5H QUOTA", "WEEKLY QUOTA", "DETAIL")
+	} else {
+		fmt.Printf("%-*s  %-*s  %-12s  %-12s  %s\n", idW, "ACCOUNT", emailW, "EMAIL", "STATUS", "5H QUOTA", "DETAIL")
+	}
 	for _, r := range rows {
-		quota := "-"
-		if r.total > 0 {
-			quota = fmt.Sprintf("%d/%d", r.remaining, r.total)
-		}
 		detail := r.reason
 		if detail == "" && r.resetAt != "-" {
 			detail = "resets " + r.resetAt
 		}
-		fmt.Printf("%-*s  %-*s  %-12s  %-12s  %s\n", idW, r.id, emailW, r.email, r.status, quota, detail)
+		if hasWeeklyCol {
+			fmt.Printf("%-*s  %-*s  %-12s  %-12s  %-14s  %s\n", idW, r.id, emailW, r.email, r.status, r.quota5h, r.quotaWeekly, detail)
+		} else {
+			fmt.Printf("%-*s  %-*s  %-12s  %-12s  %s\n", idW, r.id, emailW, r.email, r.status, r.quota5h, detail)
+		}
 	}
-
-	fmt.Println()
-	fmt.Println("Note: the 5H QUOTA column is the rolling ~5-hour window only. Gemini also")
-	fmt.Println("enforces a weekly cap that the upstream RPC does not expose, so a nonzero")
-	fmt.Println("quota does not prove the account can serve traffic. An account stuck at")
-	fmt.Println("\"still exhausted after N retries\" is the weekly cap; it recovers on its own.")
 }
 
 func runCaptureReference(cfg config.Config, explicitProfile string) error {

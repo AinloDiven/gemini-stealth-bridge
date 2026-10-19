@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -26,25 +27,97 @@ type IsolatedLoginResult struct {
 	UserAgent    string
 }
 
+// FindBrowserBinary locates an installed Chromium-family browser executable on
+// Windows, macOS, or Linux. When browser is empty, it defaults to Chrome/Chromium.
 func FindBrowserBinary(browser string) string {
 	b := strings.ToLower(strings.TrimSpace(browser))
 	if b == "" {
 		b = "chrome"
 	}
-	if runtime.GOOS == "darwin" {
-		cands := []string{
-			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-			"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+	switch runtime.GOOS {
+	case "windows":
+		roots := []string{
+			os.Getenv("ProgramFiles"),
+			os.Getenv("ProgramFiles(x86)"),
+			os.Getenv("LOCALAPPDATA"),
 		}
-		for _, c := range cands {
+		var rels []string
+		switch b {
+		case "brave":
+			rels = []string{`BraveSoftware\Brave-Browser\Application\brave.exe`}
+		case "edge":
+			rels = []string{`Microsoft\Edge\Application\msedge.exe`}
+		case "vivaldi":
+			rels = []string{`Vivaldi\Application\vivaldi.exe`}
+		case "chromium":
+			rels = []string{`Chromium\Application\chrome.exe`}
+		case "arc":
+			for _, root := range roots {
+				if root == "" {
+					continue
+				}
+				matches, _ := filepath.Glob(filepath.Join(root, "Packages", "TheBrowserCompany.Arc_*", "LocalCache", "Local", "Arc", "Arc.exe"))
+				if len(matches) > 0 {
+					return matches[0]
+				}
+			}
+		default:
+			rels = []string{`Google\Chrome\Application\chrome.exe`}
+		}
+		for _, r := range roots {
+			if r == "" {
+				continue
+			}
+			for _, rel := range rels {
+				cand := filepath.Join(r, rel)
+				if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+					return cand
+				}
+			}
+		}
+	case "darwin":
+		var appBins []string
+		switch b {
+		case "brave":
+			appBins = []string{"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"}
+		case "edge":
+			appBins = []string{"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"}
+		case "vivaldi":
+			appBins = []string{"/Applications/Vivaldi.app/Contents/MacOS/Vivaldi"}
+		case "chromium":
+			appBins = []string{"/Applications/Chromium.app/Contents/MacOS/Chromium"}
+		case "arc":
+			appBins = []string{"/Applications/Arc.app/Contents/MacOS/Arc"}
+		default:
+			appBins = []string{
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+				"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+				"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			}
+		}
+		for _, c := range appBins {
 			if st, err := os.Stat(c); err == nil && !st.IsDir() {
 				return c
 			}
 		}
 	}
-	for _, n := range []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "brave-browser", "brave", "microsoft-edge", "microsoft-edge-stable"} {
+	var names []string
+	switch b {
+	case "brave":
+		names = []string{"brave-browser", "brave"}
+	case "edge":
+		names = []string{"microsoft-edge", "microsoft-edge-stable"}
+	case "vivaldi":
+		names = []string{"vivaldi", "vivaldi-stable"}
+	case "chromium":
+		names = []string{"chromium", "chromium-browser"}
+	case "arc":
+		names = []string{"arc", "arc-browser"}
+	default:
+		names = []string{"google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "brave-browser", "microsoft-edge"}
+	}
+	for _, n := range names {
 		if p, err := exec.LookPath(n); err == nil {
 			return p
 		}

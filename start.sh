@@ -10,7 +10,7 @@ ACCOUNTS_DIR="$DIR/accounts"
 mkdir -p "$ACCOUNTS_DIR"
 export BRIDGE_HOME="$DIR"
 export PORT="${PORT:-20133}"
-
+export BRIDGE_WEB_UI="${BRIDGE_WEB_UI:-1}"
 needs_build=0
 if [ ! -x "./gsb" ]; then
   needs_build=1
@@ -36,5 +36,5 @@ if [ "$needs_build" = "1" ]; then
   fi
 fi
 
-echo "starting gemini-stealth-bridge (gsb) on :$PORT (data: $DIR)"
+echo "starting gemini-stealth-bridge (gsb) on :$PORT (data: $DIR, web ui: http://127.0.0.1:$PORT/ui)"
 exec ./gsb "$@"

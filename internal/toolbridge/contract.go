@@ -12,7 +12,6 @@ import (
 
 var toolNameRe = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,128}$`)
 
-
 // BuiltinMediaToolName is the server-side tool injected into agent tool lists
 // so Gemini can invoke native Imagen / Nano Banana (image) and Veo (video)
 // generation during tool-enabled coding/agent sessions.
@@ -35,7 +34,7 @@ func AugmentToolsWithMediaGenerator(tools any, toolChoice any) any {
 		"type": "function",
 		"function": map[string]any{
 			"name":        BuiltinMediaToolName,
-			"description": "Generate an image (Imagen / Nano Banana) or video with audio (Veo) using Gemini's native media generator whenever the user asks for an image/video or when visual/video assets are needed. Returns a direct downloadable HTTP URL (http://.../v1/media/...) that you can display in Markdown or download to a local file via curl/bash.",
+			"description": "Generate a real high-definition image (Imagen / Nano Banana JPEG) or video with audio (Veo MP4, ~8-10 seconds per clip) using Gemini's native media generator. ALWAYS call this tool directly whenever the user asks to create, make, or revise any video or image—NEVER inspect or run ffmpeg, ffprobe, espeak, or python scripts unless the user explicitly asks to edit/concatenate media with ffmpeg. Returns a local downloadable HTTP URL (http://.../v1/media/...) and a curl command to save it to the workspace.",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -61,6 +60,7 @@ func AugmentToolsWithMediaGenerator(tools any, toolChoice any) any {
 	}
 	return tools
 }
+
 // ToolDef is a normalized tool definition.
 type ToolDef struct {
 	Name        string         `json:"name"`

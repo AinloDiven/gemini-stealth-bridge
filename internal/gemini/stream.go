@@ -521,19 +521,25 @@ func (ac *AccountClient) streamGenerateLocked(
 				return retryRes, retryErr
 			}
 			polled, pollErr := ac.pollAsyncVideoGenerationLocked(ctx, sc, cookie, at, bl, fSid, lang, asyncVideoCID)
-			if opts.Temporary {
-				go ac.deleteConversationAsync(asyncVideoCID)
-			}
 			if pollErr != nil {
+				if opts.Temporary {
+					go ac.deleteConversationAsync(asyncVideoCID)
+				}
 				return nil, pollErr
 			}
 			if polled != nil && len(polled.Frames) > 0 {
 				frameCount += len(polled.Frames)
 				if onFrame != nil {
 					if err := onFrame(polled); err != nil && !errors.Is(err, transport.ErrStopStreaming) {
+						if opts.Temporary {
+							go ac.deleteConversationAsync(asyncVideoCID)
+						}
 						return nil, err
 					}
 				}
+			}
+			if opts.Temporary {
+				go ac.deleteConversationAsync(asyncVideoCID)
 			}
 		}
 	}
@@ -621,6 +627,10 @@ func (ac *AccountClient) deleteConversationAsync(cid string) {
 	if cid == "" {
 		return
 	}
+	// Wait 90s before deleting temporary video conversations so any lazy /v1/media/
+	// proxy download from contribution.usercontent.google.com completes before
+	// Google invalidates the conversation's media attachments.
+	time.Sleep(90 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	sess, err := ac.acquireSession(ctx)

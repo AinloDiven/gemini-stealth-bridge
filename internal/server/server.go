@@ -263,26 +263,7 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if len(s.tokenToAcct) > 0 || explicitTokens {
-		if s.Cfg.APIKey != "public" && token == s.Cfg.APIKey {
-			return AuthScope{OK: true, Admin: true}
-		}
-		if s.Cfg.APIKey == "public" && (token == "" || token == "public" || token == defPoolTok) {
-			if len(s.accounts) == 1 {
-				return AuthScope{OK: true, AccountID: s.accounts[0].ID}
-			}
-			return AuthScope{OK: true, Admin: true}
-		}
-		return AuthScope{OK: false}
-	}
-
-	if s.Cfg.APIKey == "public" && (token == "" || token == "public" || token == defPoolTok) {
-		if len(s.accounts) == 1 {
-			return AuthScope{OK: true, AccountID: s.accounts[0].ID}
-		}
-		return AuthScope{OK: true, Admin: true}
-	}
-	if token == s.Cfg.APIKey {
+	if isPoolKey {
 		if len(s.accounts) == 1 {
 			return AuthScope{OK: true, AccountID: s.accounts[0].ID}
 		}
@@ -300,13 +281,34 @@ func (s *Server) defaultPoolToken() string {
 	return "gsb-pool-" + hex.EncodeToString(sum[:5])
 }
 
+func (s *Server) requireAuthScope(w http.ResponseWriter, r *http.Request) (AuthScope, bool) {
+	scope := s.ResolveAuthScope(r)
+	if !scope.OK {
+		sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
+		return AuthScope{}, false
+	}
+	return scope, true
+}
+
+func (s *Server) requireAuthAndJSONBody(w http.ResponseWriter, r *http.Request) (AuthScope, map[string]any, bool) {
+	scope, ok := s.requireAuthScope(w, r)
+	if !ok {
+		return AuthScope{}, nil, false
+	}
+	body, ok := readJSONBody(w, r)
+	if !ok {
+		return AuthScope{}, nil, false
+	}
+	return scope, body, true
+}
+
 // ServeHTTP implements http.Handler for all bridge endpoints.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	ctx := withRequestBaseURL(r.Context(), r, s.Cfg.Port)
 
 	switch {
-	case r.Method == http.MethodGet && (strings.HasPrefix(p, "/v1/media/") || strings.HasPrefix(p, "/media/")):
+	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && (strings.HasPrefix(p, "/v1/media/") || strings.HasPrefix(p, "/media/")):
 		s.HandleGetMedia(w, r)
 		return
 	case s.Cfg.WebUI && r.Method == http.MethodGet && (p == "/" || p == "/ui" || p == "/ui/" || p == "/dashboard"):
@@ -380,9 +382,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case r.Method == http.MethodGet && (p == "/v1/sessions" || p == "/sessions"):
-		scope := s.ResolveAuthScope(r)
-		if !scope.OK {
-			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
+		if _, ok := s.requireAuthScope(w, r); !ok {
 			return
 		}
 		sendJSON(w, 200, map[string]any{
@@ -396,9 +396,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case r.Method == http.MethodGet && (p == "/v1/accounts" || p == "/accounts"):
-		scope := s.ResolveAuthScope(r)
-		if !scope.OK {
-			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
+		scope, ok := s.requireAuthScope(w, r)
+		if !ok {
 			return
 		}
 		liveReq := r.URL.Query().Get("live") == "1" || r.URL.Query().Get("fresh") == "1"
@@ -412,9 +411,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, 200, map[string]any{"accounts": list}, nil)
 		return
 	case r.Method == http.MethodGet && (p == "/v1/quota" || p == "/quota"):
-		scope := s.ResolveAuthScope(r)
-		if !scope.OK {
-			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
+		scope, ok := s.requireAuthScope(w, r)
+		if !ok {
 			return
 		}
 		freshReq := r.URL.Query().Get("fresh") == "1"
@@ -470,9 +468,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case r.Method == http.MethodGet && (p == "/v1/models" || p == "/models"):
-		scope := s.ResolveAuthScope(r)
-		if !scope.OK {
-			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
+		scope, ok := s.requireAuthScope(w, r)
+		if !ok {
 			return
 		}
 		accts := s.Accounts()
@@ -552,64 +549,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sendJSON(w, 200, payload, nil)
 		return
 	case r.Method == http.MethodPost && (p == "/v1/chat/completions" || p == "/chat/completions"):
-		scope := s.ResolveAuthScope(r)
-		if !scope.OK {
-			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
-			return
+		if scope, body, ok := s.requireAuthAndJSONBody(w, r); ok {
+			s.HandleChat(ctx, w, body, scope)
 		}
-		body, ok := readJSONBody(w, r)
-		if !ok {
-			return
-		}
-		s.HandleChat(ctx, w, body, scope)
 		return
 
 	case r.Method == http.MethodPost && (p == "/v1/responses" || p == "/responses"):
-		scope := s.ResolveAuthScope(r)
-		if !scope.OK {
-			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
-			return
+		if scope, body, ok := s.requireAuthAndJSONBody(w, r); ok {
+			s.HandleResponses(ctx, w, body, scope)
 		}
-		body, ok := readJSONBody(w, r)
-		if !ok {
-			return
-		}
-		s.HandleResponses(ctx, w, body, scope)
 		return
 
 	case r.Method == http.MethodPost && (p == "/v1/images/generations" || p == "/images/generations"):
-		scope := s.ResolveAuthScope(r)
-		if !scope.OK {
-			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
-			return
+		if scope, body, ok := s.requireAuthAndJSONBody(w, r); ok {
+			s.HandleImageGeneration(ctx, w, body, scope)
 		}
-		body, ok := readJSONBody(w, r)
-		if !ok {
-			return
-		}
-		s.HandleImageGeneration(ctx, w, body, scope)
 		return
 
 	case r.Method == http.MethodPost && (p == "/v1/videos/generations" || p == "/videos/generations"):
-		scope := s.ResolveAuthScope(r)
-		if !scope.OK {
-			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
-			return
+		if scope, body, ok := s.requireAuthAndJSONBody(w, r); ok {
+			s.HandleVideoGeneration(ctx, w, body, scope)
 		}
-		body, ok := readJSONBody(w, r)
-		if !ok {
-			return
-		}
-		s.HandleVideoGeneration(ctx, w, body, scope)
 		return
+
 	case r.Method == http.MethodPost && (p == "/v1/refresh" || p == "/refresh"):
 		if r.Header.Get("Origin") != "" {
 			sendJSON(w, 403, map[string]any{"error": map[string]any{"message": "origin not allowed", "type": "authentication_error"}}, nil)
 			return
 		}
-		scope := s.ResolveAuthScope(r)
-		if !scope.OK {
-			sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
+		if _, ok := s.requireAuthScope(w, r); !ok {
 			return
 		}
 		s.LoadCredentials()
@@ -882,16 +850,23 @@ func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
 // remaining count imply the account is fully available.
 func quotaWindowInfo(quota []gemini.QuotaBucket, now time.Time) map[string]any {
 	info := map[string]any{
-		"scope": "rolling",
-		"label": "5h",
-		// The short window is bounded by the weekly cap, so a healthy value here
-		// does not prove the account can serve traffic.
+		"scope":             "rolling",
+		"label":             "5h",
 		"nestedUnderWeekly": true,
 		"weeklyExposed":     false,
 		"note":              "gsb only receives the rolling ~5h window; the weekly cap is not exposed by the upstream RPC, so a nonzero remaining count does not guarantee the account is usable",
 	}
 	soonest := time.Time{}
 	for _, q := range quota {
+		if q.ID == "weekly" && q.Total > 0 {
+			info["weeklyExposed"] = true
+			info["weeklyRemaining"] = q.Remaining
+			info["weeklyTotal"] = q.Total
+			if q.ResetAt != "" {
+				info["weeklyResetAt"] = q.ResetAt
+			}
+			info["note"] = "both rolling 5h and 7d weekly credit windows are exposed; the 5h window is nested under the weekly allowance"
+		}
 		if q.Synthetic || q.Unlimited || q.ResetAt == "" {
 			continue
 		}

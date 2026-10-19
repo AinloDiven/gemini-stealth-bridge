@@ -766,6 +766,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			sentText, sentThought string
 			servedID, servedLabel string
 			identityConflict      bool
+			mediaToolUsed         bool
 			lastCID, lastRID      string
 			lastContextToken      string
 			attemptStateMu        sync.Mutex
@@ -809,6 +810,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
 				attemptStateMu.Lock()
 				if update.MediaToolActive {
+					mediaToolUsed = true
+				}
+				if mediaToolUsed {
 					servedID = model.ModelID
 					servedLabel = model.ModelName
 					identityConflict = false
@@ -818,7 +822,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				if servedID != "" {
 					markPhase(&identityMs)
 				}
-				earlyMismatch := !update.MediaToolActive && s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
+				earlyMismatch := !mediaToolUsed && s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
 					return transport.ErrStopStreaming
@@ -843,11 +847,15 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					}
 					attemptStateMu.Lock()
 					s.rewriteFrameMedia(ctx, account.ID, &frame)
-					observeIdentity(frame.AnsweredModelID, frame.AnsweredModelLabel)
 					if len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0 {
+						mediaToolUsed = true
+					}
+					if mediaToolUsed {
 						servedID = model.ModelID
 						servedLabel = model.ModelName
 						identityConflict = false
+					} else {
+						observeIdentity(frame.AnsweredModelID, frame.AnsweredModelLabel)
 					}
 					if servedID != "" {
 						markPhase(&identityMs)
@@ -983,7 +991,18 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			inStreamRetryable := (errCode == "tool_call_error" ||
 				errCode == "upstream_error_reply" ||
 				errCode == "empty_upstream_response" ||
-				errCode == "incomplete_upstream_response") && !payloadCommitted()
+				errCode == "incomplete_upstream_response" ||
+				(scope.AccountID == "" && (errCode == "model_substitution" ||
+					errStatus == 429 ||
+					errCode == "rate_limit_error" ||
+					errCode == "session_busy" ||
+					errCode == "upstream_auth_error" ||
+					errCode == "auth_redirect" ||
+					errCode == "upstream_connect_timeout" ||
+					errCode == "upstream_stalled" ||
+					errCode == "upstream_timeout" ||
+					errCode == "model_identity_unknown" ||
+					errCode == "model_identity_conflict"))) && !payloadCommitted()
 			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
 				(retryDeadline.IsZero() || time.Now().Before(retryDeadline)) &&
 				(!responseCommitted() || inStreamRetryable) && ctx.Err() == nil &&
@@ -1212,12 +1231,20 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			calls = interpreted.Calls
 		}
 		if hasServerSideMediaCalls(calls) && serverMediaRounds < 2 {
-			promptAdd, clientCalls, _ := s.executeServerSideMediaCalls(ctx, account, model, calls)
+			mediaStart := time.Now()
+			promptAdd, clientCalls, _ := s.executeServerSideMediaCalls(ctx, accts, scope, account, model, calls)
+			if !retryDeadline.IsZero() {
+				retryDeadline = retryDeadline.Add(time.Since(mediaStart))
+			}
 			if len(clientCalls) == 0 {
 				curPrompt = curPrompt + promptAdd
+				fullPrompt = curPrompt
 				opts.Metadata = nil
 				serverMediaRounds++
 				attempt--
+				if upstreamCalls > 0 {
+					upstreamCalls--
+				}
 				continue
 			}
 			calls = clientCalls

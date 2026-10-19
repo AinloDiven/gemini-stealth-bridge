@@ -237,11 +237,11 @@ func hasServerSideMediaCalls(calls []toolbridge.Call) bool {
 }
 
 type generatedMediaResult struct {
-	MediaType    string `json:"media_type"`
-	URL          string `json:"url"`
-	ThumbnailURL string `json:"thumbnail_url,omitempty"`
-	MimeType     string `json:"mime_type"`
-	Markdown     string `json:"markdown"`
+	MediaType    string      `json:"media_type"`
+	URL          string      `json:"url"`
+	ThumbnailURL string      `json:"thumbnail_url,omitempty"`
+	MimeType     string      `json:"mime_type"`
+	Markdown     string      `json:"markdown"`
 	Entry        *mediaEntry `json:"-"`
 }
 
@@ -266,8 +266,12 @@ func (s *Server) runMediaGenerationOnAccount(
 		genPrompt = "Generate a video: " + cleanPrompt
 	}
 
+	mediaModel := model
+	if flash := resolveModelOnAccount(account, "gemini-flash"); flash != nil {
+		mediaModel = flash
+	}
 	opts := gemini.StreamOptions{
-		Model:           model,
+		Model:           mediaModel,
 		ThinkingLevel:   1,
 		Temporary:       true,
 		Language:        s.Cfg.Locale,
@@ -276,7 +280,6 @@ func (s *Server) runMediaGenerationOnAccount(
 		ProtocolMode:    "web",
 		PersonalContext: "off",
 	}
-
 	client := s.clientFor(account)
 	var (
 		lastFrame gemini.Frame
@@ -303,6 +306,9 @@ func (s *Server) runMediaGenerationOnAccount(
 		s.mediaMu.RLock()
 		entry := s.mediaItems[id]
 		s.mediaMu.RUnlock()
+		if entry != nil {
+			_, _, _ = s.ensureMediaBytes(ctx, entry)
+		}
 		alt := img.Title
 		if alt == "" {
 			alt = "Generated Image"
@@ -320,6 +326,9 @@ func (s *Server) runMediaGenerationOnAccount(
 		s.mediaMu.RLock()
 		entry := s.mediaItems[id]
 		s.mediaMu.RUnlock()
+		if entry != nil {
+			_, _, _ = s.ensureMediaBytes(ctx, entry)
+		}
 		title := vid.Title
 		if title == "" {
 			title = "Generated Video"
@@ -345,6 +354,8 @@ func (s *Server) runMediaGenerationOnAccount(
 // append to curPrompt, plus any remaining client-side tool calls.
 func (s *Server) executeServerSideMediaCalls(
 	ctx context.Context,
+	accts []*AccountState,
+	scope AuthScope,
 	account *AccountState,
 	model *gemini.ModelInfo,
 	calls []toolbridge.Call,
@@ -366,6 +377,24 @@ func (s *Server) executeServerSideMediaCalls(
 		mType, _ := mc.Arguments["media_type"].(string)
 		mPrompt, _ := mc.Arguments["prompt"].(string)
 		items, replyText, genErr := s.runMediaGenerationOnAccount(ctx, account, model, mType, mPrompt)
+		if (genErr != nil || len(items) == 0) && scope.AccountID == "" {
+			tried := map[string]bool{account.ID: true}
+			fallbackModelName := model.ModelName
+			if strings.EqualFold(strings.TrimSpace(mType), "video") {
+				fallbackModelName = "gemini-flash"
+			}
+			for range len(accts) {
+				nextAcct, nextModel := s.pickFallbackAccount(accts, tried, "", fallbackModelName, nil)
+				if nextAcct == nil || nextModel == nil {
+					break
+				}
+				tried[nextAcct.ID] = true
+				items, replyText, genErr = s.runMediaGenerationOnAccount(ctx, nextAcct, nextModel, mType, mPrompt)
+				if genErr == nil && len(items) > 0 {
+					break
+				}
+			}
+		}
 		var outObj map[string]any
 		if genErr != nil {
 			outObj = map[string]any{
@@ -384,14 +413,21 @@ func (s *Server) executeServerSideMediaCalls(
 				urls = append(urls, it.URL)
 				mds = append(mds, it.Markdown)
 			}
+			ext := strings.TrimPrefix(filepath.Ext(items[0].URL), ".")
+			if ext == "" {
+				ext = "mp4"
+			}
+			baseName := filepath.Base(items[0].URL)
+			localFile := fmt.Sprintf("./generated-%s-%s", items[0].MediaType, baseName)
 			outObj = map[string]any{
 				"status":             "ok",
 				"media_type":         items[0].MediaType,
 				"url":                items[0].URL,
 				"urls":               urls,
 				"markdown":           strings.Join(mds, "\n\n"),
-				"local_download_cmd": fmt.Sprintf("curl -fsSL %q -o output.%s", items[0].URL, strings.TrimPrefix(filepath.Ext(items[0].URL), ".")),
-				"note":               "The generated media is live at the URL above. If the user asked to save it to a file in the workspace, run the curl command via bash; otherwise include the markdown/URL directly in your final response.",
+				"suggested_filename": localFile,
+				"local_download_cmd": fmt.Sprintf("curl -fsSL %q -o %q", items[0].URL, localFile),
+				"note":               "The media is ready at the URL above. IMPORTANT: If you have a bash/shell tool available, run local_download_cmd now (or save to the filename requested by the user) so the file is saved directly into the user's current working directory on their laptop, then include the saved filename and markdown link in your final reply.",
 			}
 			if items[0].ThumbnailURL != "" {
 				outObj["thumbnail_url"] = items[0].ThumbnailURL
@@ -461,6 +497,12 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 		sendChatError(w, false, transport.NewUpstreamError(msg, 502, "media_generation_failed", nil, nil))
 		return
 	}
+
+	prep.account.mu.Lock()
+	prep.account.Fails = 0
+	prep.account.LastUsed = s.now()
+	prep.account.mu.Unlock()
+	s.refreshQuotaAsync(prep.account, s.clientFor(prep.account))
 
 	dataList := make([]map[string]any, 0, len(items))
 	for _, it := range items {

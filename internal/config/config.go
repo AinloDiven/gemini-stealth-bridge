@@ -249,10 +249,6 @@ func FromEnv() *Config {
 	personalContext := lookupEnum("BRIDGE_PERSONAL_CONTEXT", "auto", []string{"auto", "off", "on"})
 	accountStrategy := lookupEnum("BRIDGE_ACCOUNT_STRATEGY", "rotate", []string{"rotate", "lru", "fill-first"})
 	accountPriority := parseCSVList(lookup("BRIDGE_ACCOUNT_PRIORITY"))
-	if accountStrategy == "rotate" && len(accountPriority) > 0 {
-		warnings = append(warnings, "BRIDGE_ACCOUNT_PRIORITY is ignored when BRIDGE_ACCOUNT_STRATEGY=rotate")
-	}
-
 	ipv6Default := "auto"
 	if lookup("BRIDGE_DISABLE_IPV6") == "1" {
 		ipv6Default = "off"

@@ -1765,11 +1765,20 @@
           stateEl.hidden = false;
           stateEl.innerHTML = '';
           const title = document.createElement('strong');
-          title.textContent = 'No Google accounts loaded in the pool.';
+          title.textContent = 'No Google accounts loaded in the pool yet.';
           const sub = document.createElement('span');
-          sub.textContent = 'Click "+ Add Account" in the top bar or run gsb --login <name> in your terminal.';
+          sub.textContent = 'Add a Google Gemini account via isolated browser sign-in, Incognito cookie paste, or local browser profile import.';
+          const ctaWrap = document.createElement('div');
+          ctaWrap.style.marginTop = '14px';
+          const ctaBtn = document.createElement('button');
+          ctaBtn.type = 'button';
+          ctaBtn.className = 'btn btn-primary';
+          ctaBtn.textContent = '+ Add First Google Account';
+          ctaBtn.addEventListener('click', openImportModal);
+          ctaWrap.appendChild(ctaBtn);
           stateEl.appendChild(title);
           stateEl.appendChild(sub);
+          stateEl.appendChild(ctaWrap);
           return;
         }
 

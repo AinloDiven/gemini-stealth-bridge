@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
@@ -293,5 +294,125 @@ func TestServerSideMediaGeneratorToolAndImageEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"name":"bash"`) {
 		t.Fatalf("expected final client tool call to be bash, got: %s", rec.Body.String())
+	}
+}
+
+func TestStreamingPoolRotatesOnSubstitutionAfterHeadersAndMediaRound(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = t.TempDir()
+	cfg.AccountTokens = nil
+	cfg.AccountStrategy = "rotate"
+	cfg.RejectDowngrade = true
+	cfg.MaxAttempts = 3
+	cfg.MaxUpstreamAttempts = 3
+	srv := New(cfg)
+
+	acct1Calls := 0
+	c1 := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			acct1Calls++
+			switch acct1Calls {
+			case 1:
+				// Frame 1 (done=false): verifies identity and flushes SSE 200 OK headers!
+				_ = onFrame(&gemini.LineParseResult{
+					CID:             "c1",
+					RID:             "r1",
+					AnsweredModelID: testModel.ModelID,
+					Frames: []gemini.Frame{
+						makeFrame("```json\n{\"tool_calls\":[{\"name\":\"generate_media\"", "", false, testModel.ModelID),
+					},
+				})
+				// Frame 2 (done=true): calls generate_media
+				_ = onFrame(&gemini.LineParseResult{
+					CID:             "c1",
+					RID:             "r1",
+					AnsweredModelID: testModel.ModelID,
+					Frames: []gemini.Frame{
+						makeFrame("```json\n{\"tool_calls\":[{\"name\":\"generate_media\",\"arguments\":{\"media_type\":\"video\",\"prompt\":\"explainer video\"}}]}\n```", "", true, testModel.ModelID),
+					},
+				})
+			case 2:
+				// Media generation succeeds on acct1
+				_ = onFrame(&gemini.LineParseResult{
+					CID:             "c_vid",
+					RID:             "r_vid",
+					MediaToolActive: true,
+					Frames: []gemini.Frame{
+						{
+							RCID: "rc_vid",
+							Text: "Video ready",
+							Done: true,
+							GeneratedVideos: []gemini.GeneratedVideo{
+								{URL: "https://contribution.usercontent.google.com/download?c=123", Title: "Explainer"},
+							},
+						},
+					},
+				})
+			case 3:
+				// Post-media turn on acct1 gets downgraded to 3.5 Flash-Lite!
+				_ = onFrame(&gemini.LineParseResult{
+					CID:                "c1_sub",
+					RID:                "r1_sub",
+					AnsweredModelID:    lowerModelID,
+					AnsweredModelLabel: "3.5 Flash-Lite",
+					Frames: []gemini.Frame{
+						makeFrame("downgraded", "", true, lowerModelID),
+					},
+				})
+			}
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+
+	acct2Called := false
+	c2 := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			acct2Called = true
+			if !strings.Contains(prompt, "/v1/media/") {
+				t.Fatalf("expected failover account acct2 to receive prompt with generated /v1/media/ URL, got: %s", prompt)
+			}
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c2",
+				RID:             "r2",
+				AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{
+					makeFrame("```json\n{\"tool_calls\":[{\"name\":\"bash\",\"arguments\":{\"command\":\"curl -fsSL http://127.0.0.1:20133/v1/media/vid.mp4 -o ./explainer.mp4\"}}]}\n```", "", true, testModel.ModelID),
+				},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+
+	a1 := &AccountState{ID: "acct1", Email: "1@e.com", Client: c1, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	a2 := &AccountState{ID: "acct2", Email: "2@e.com", Client: c2, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	srv.SetAccounts([]*AccountState{a1, a2})
+
+	tools := []any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "bash",
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": map[string]any{"command": map[string]any{"type": "string"}},
+					"required":   []any{"command"},
+				},
+			},
+		},
+	}
+	rec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec, map[string]any{
+		"model":       testModel.ModelName,
+		"stream":      true,
+		"tools":       tools,
+		"tool_choice": "auto",
+		"messages":    []any{map[string]any{"role": "user", "content": "make an explainer video"}},
+	}, AuthScope{OK: true, Admin: true})
+
+	if !acct2Called {
+		t.Fatalf("expected pool to rotate from acct1 to acct2 on in-stream model_substitution, body=%s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"finish_reason":"tool_calls"`) || !strings.Contains(rec.Body.String(), "./explainer.mp4") {
+		t.Fatalf("expected completed tool_calls stream from acct2, got:\n%s", rec.Body.String())
 	}
 }

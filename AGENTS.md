@@ -4,17 +4,19 @@ Guidance for AI coding agents that help a user set up `gemini-stealth-bridge` (`
 
 ## Connecting a Gemini account
 
-Use the sign-in flow. Do not start with cookie import.
+Use the sign-in flow (`--login` or the Web Control Plane `/ui`). Do not start by copying cookies from a daily browser profile that is actively open.
 
 ```sh
 gsb --login <name>
 gsb --probe
 ```
 
-`--login` opens Gemini Web in a browser and waits for the terminal. The user must complete Google sign-in themselves (including any 2FA or "verify it's you" prompt) and send one message in Gemini before pressing Enter. An agent cannot complete this step on the user's behalf, so instruct the user to run it interactively and wait for them.
+- **Desktop (`--login` or Web UI "Launch Isolated Browser")**: Launches a temporary, isolated Chrome/Chromium window with a disposable `--user-data-dir`, waits for the user to complete Google sign-in (including 2FA) on `https://gemini.google.com/app`, captures the session cookies via CDP, and immediately closes and deletes the temporary profile. Because the browser profile is destroyed right after capture, no background browser process ever competes with `gsb` for `__Secure-1PSIDTS` cookie rotation.
+- **Remote VPS / Headless (`http://127.0.0.1:20133/ui` over SSH tunnel `ssh -L 20133:127.0.0.1:20133`)**:
+  - **Option 1 (Works everywhere)**: Open a **New Incognito Window** (`Ctrl+Shift+N`), sign in to `gemini.google.com/app`, export cookies with Cookie-Editor (or copy the `Cookie` header), **immediately close the Incognito window without signing out**, and paste into the Web UI (`+ Add Account`) or `gsb --login <name>`.
+  - **Option 2 (One-click desktop popup for remote VPS)**: Run `gsb --login-helper` on the local desktop (`127.0.0.1:20134`) while connected via SSH port forwarding, then click **Launch Isolated Browser** in the Web UI.
 
-`--probe` then confirms the captured session can reach Gemini and lists the models and quota for that account. Treat a probe without an auth error as the setup success signal, not the mere existence of `accounts/<name>.json`.
-
+`--probe` confirms the captured session can reach Gemini and lists the discovered models and 5-hour + weekly quota for that account. Treat a probe without an auth error as the setup success signal, not the mere existence of `accounts/<name>.json`.
 ## When cookie import is acceptable
 
 Only when the browser profile is **already signed in** to Gemini:
@@ -76,8 +78,20 @@ Every strategy skips quarantined accounts, accounts whose cached quota shows the
 gsb --accounts --accounts-live
 ```
 
-Or query `GET /v1/accounts` on the running daemon (`GET /v1/accounts?live=1` forces a fresh upstream check). Each account includes a computed `status` (`ok`, `exhausted`, `expired`, `quarantined`, `cooling`, `degraded`, `unknown`) and `statusReason`.
+Or open `http://127.0.0.1:20133/ui` (or query `GET /v1/accounts?live=1` on the running daemon). Each account includes a computed `status` (`ok`, `exhausted`, `expired`, `quarantined`, `cooling`, `degraded`, `disabled`, `unknown`) and `statusReason`:
 
-Cached quota in `/v1/accounts` updates on traffic and every 30-minute refresh cycle, so an idle account can still display stale remaining credits from before the window exhausted. Always verify with `--accounts-live` or `?live=1` when requests return `429` (`model_substitution` or `rate_limit_error`) despite nonzero cached `remaining`. When an account's 5-hour credit pool hits `0/2400`, all non-lite models (`gemini-flash`, `gemini-pro`, `gemini-argon`) are blocked or silently downgraded upstream until `resetAt`, while `gemini-flash-lite` continues to work.
+- `ok` (UI: `Ready`): Loaded, authenticated, and ready to serve traffic. In `rotate` strategy, the account holding the sticky rotation cursor displays a `Current Turn` badge.
+- `cooling`: Failed within the last 60 seconds; temporarily skipped while the pool routes to another healthy account.
+- `degraded`: Cooldown has elapsed (`>60s`) so the account is eligible for traffic again, but its failure counter (`fails > 0`) has not yet been cleared by a successful request or manual reset.
+- `exhausted`: Either the rolling 5-hour window (`2,400` credits) or the 7-day weekly window (`48,384` credits) is spent until `resetAt`, or repeated upstream model substitutions triggered synthetic backoff (`1m -> 5m -> 15m -> 1h -> 6h -> 24h`).
+- `disabled` (UI: `Paused`): Operator paused the account via the Web Control Plane (`⋯ -> Pause Account in Pool`).
 
-Gemini also enforces two limits at once: a rolling ~5-hour window and a weekly cap. The upstream quota RPC only exposes the rolling ~5-hour window (`quotaWindow.weeklyExposed: false`), so a nonzero live remaining count does not prove the weekly cap has room. When a model repeatedly fails despite remaining 5-hour quota, `gsb` escalates its cooldown (`1m -> 5m -> 15m -> 1h -> 6h -> 24h`) and marks the account `exhausted` (`still exhausted after N retries`).
+`gsb` queries both `batchexecute` (`qpEbW`) and Gemini Web's GraphQL `GetUserQuotaService` (`GXU_FIVE_HOURLY` and `GXU_WEEKLY`), exposing both the **5-hour window** and the **7-day weekly window** (`quotaWindow.weeklyExposed: true`). Because the 5-hour window is nested under the weekly allowance, `gsb` automatically caps effective 5-hour remaining credits to the weekly remaining credits when the weekly pool runs low. When an account hits `0` credits, non-lite models (`gemini-flash`, `gemini-pro`, `gemini-argon`) are blocked or downgraded upstream until `resetAt`, while `gemini-flash-lite` remains usable.
+
+## Native image and video generation
+
+`gsb` supports Gemini Web's native image generation (Imagen / Nano Banana) and video generation (Veo MP4 with audio) in three ways:
+
+1. **Coding Agent Mode (`tools` enabled in `/v1/chat/completions` or `/v1/responses`)**: `gsb` automatically injects a server-side `generate_media` tool (`media_type: "image" | "video"`, `prompt`). When the model invokes `generate_media`, `gsb` executes the generation on Gemini Web, proxies the authenticated media at `http://<host>:<port>/v1/media/<id>.jpg|.mp4`, and returns the local URL, Markdown snippet, and a ready-to-run `curl` command to the agent in the same turn so the agent can save the file directly into the project workspace.
+2. **Direct Chat / Responses (no tools)**: Asking Gemini to generate an image or video streams the response and rewrites upstream `lh3.googleusercontent.com` / `contribution.usercontent.google.com` links into local `/v1/media/<id>` URLs that open or download without requiring Google cookies.
+3. **Dedicated OpenAI Endpoints**: `POST /v1/images/generations` (`response_format`: `url` or `b64_json`) and `POST /v1/videos/generations` (returns MP4 `url` and `thumbnail_url`).
