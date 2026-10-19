@@ -32,6 +32,21 @@ func sampleReproTools() any {
 				},
 			},
 		},
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "todo",
+				"parameters": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"op":    map[string]any{"type": "string", "enum": []any{"init", "start", "done", "view"}},
+						"i":     map[string]any{"type": "string"},
+						"items": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					},
+					"required": []any{"op", "i"},
+				},
+			},
+		},
 	}
 }
 
@@ -116,5 +131,25 @@ func TestRedundantClosingBracesInToolEnvelope(t *testing.T) {
 		if res == nil || len(res.Calls) != 1 || res.Calls[0].Name != tc.tool {
 			t.Fatalf("case %q: expected 1 %q call, got %+v", tc.name, tc.tool, res)
 		}
+	}
+}
+
+func TestMissingRequiredIntentPropertySynthesizedOrMerged(t *testing.T) {
+	// 1. Model completely omits "i" on todo
+	res1, err := InterpretReply(`{"tool_calls":[{"name":"todo","arguments":{"op":"init","items":["Audit database"]}}]}`, sampleReproTools(), "auto")
+	if err != nil {
+		t.Fatalf("expected missing 'i' to be synthesized for todo, got err: %v", err)
+	}
+	if res1 == nil || len(res1.Calls) != 1 || res1.Calls[0].Arguments["i"] != "Running todo init" {
+		t.Fatalf("expected synthesized 'i' = 'Running todo init', got %+v", res1)
+	}
+
+	// 2. Model puts "i" at top level of tool call object alongside "arguments"
+	res2, err := InterpretReply(`{"tool_calls":[{"name":"todo","i":"Initializing audit tasks","arguments":{"op":"init","items":["Audit database"]}}]}`, sampleReproTools(), "auto")
+	if err != nil {
+		t.Fatalf("expected top-level 'i' to merge into arguments, got err: %v", err)
+	}
+	if res2 == nil || len(res2.Calls) != 1 || res2.Calls[0].Arguments["i"] != "Initializing audit tasks" {
+		t.Fatalf("expected merged 'i' = 'Initializing audit tasks', got %+v", res2)
 	}
 }

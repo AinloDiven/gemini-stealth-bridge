@@ -479,6 +479,19 @@ func resolveAllowedToolName(name string, allow map[string]map[string]any) string
 	return name
 }
 
+func synthesizeIntentArg(toolName string, args map[string]any) string {
+	if op, ok := args["op"].(string); ok && strings.TrimSpace(op) != "" {
+		return "Running " + toolName + " " + strings.TrimSpace(op)
+	}
+	if p, ok := args["path"].(string); ok && strings.TrimSpace(p) != "" {
+		return "Accessing " + toolName + " path"
+	}
+	if toolName != "" {
+		return "Running " + toolName
+	}
+	return "Executing tool call"
+}
+
 func inferToolNameFromSchema(candArgs map[string]any, allow map[string]map[string]any, prevName string) string {
 	if len(candArgs) == 0 || len(allow) == 0 {
 		return ""
@@ -710,6 +723,21 @@ func normaliseCalls(envelope map[string]any, allow map[string]map[string]any) ([
 				reqSet[r] = true
 			}
 			props, _ := schema["properties"].(map[string]any)
+			for _, src := range []map[string]any{fn, itemMap} {
+				for k, v := range src {
+					if reservedCallEnvelopeKeys[strings.ToLower(strings.TrimSpace(k))] {
+						continue
+					}
+					if _, exists := args[k]; exists {
+						continue
+					}
+					if props == nil {
+						args[k] = v
+					} else if _, known := props[k]; known {
+						args[k] = v
+					}
+				}
+			}
 			for k, v := range args {
 				if v == nil {
 					propSchema := any(nil)
@@ -730,6 +758,8 @@ func normaliseCalls(envelope map[string]any, allow map[string]map[string]any) ([
 					if propMap, ok := props[reqKey].(map[string]any); ok {
 						if defVal, hasDef := propMap["default"]; hasDef && defVal != nil {
 							args[reqKey] = defVal
+						} else if reqKey == "i" && propMap["type"] == "string" && propMap["enum"] == nil && propMap["const"] == nil {
+							args[reqKey] = synthesizeIntentArg(name, args)
 						}
 					}
 				}
