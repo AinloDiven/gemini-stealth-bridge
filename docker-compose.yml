@@ -1,9 +1,12 @@
 services:
   gsb:
+    # Defaults to the published image (no local build, no Go toolchain needed).
+    # Set BRIDGE_IMAGE=gemini-stealth-bridge:dev and run `docker compose up -d --build`
+    # to build from this checkout instead.
+    image: ${BRIDGE_IMAGE:-ghcr.io/azrinaldi/gemini-stealth-bridge:latest}
     build:
       context: .
       dockerfile: Dockerfile
-    image: gemini-stealth-bridge:latest
     container_name: gemini-stealth-bridge
     restart: unless-stopped
     # Runs unprivileged as uid/gid 10001 by default. Override BRIDGE_UID/BRIDGE_GID

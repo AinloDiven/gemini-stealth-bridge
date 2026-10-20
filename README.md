@@ -377,10 +377,16 @@ curl -sS --max-time 180 http://127.0.0.1:20133/v1/videos/generations \
 ```
 ## Docker deployment
 
-Build and run the multi-stage zero-CGO container (measured: `11.9 MB` image on `overlayfs`, `~5 MB` RSS idle, non-root `uid 10001`, Web UI enabled on `:20133`):
+Docker is **optional**. The published image is multi-stage and zero-CGO (measured: `11.9 MB` on `overlayfs`, `~5 MB` RSS idle, non-root `uid 10001`, Web UI enabled on `:20133`). `docker compose up` pulls it from GHCR, so no Go toolchain and no local build is needed:
 
 ```sh
-docker compose up -d --build
+docker compose up -d
+```
+
+To build from this checkout instead:
+
+```sh
+BRIDGE_IMAGE=gemini-stealth-bridge:dev docker compose up -d --build
 ```
 
 Compose keeps state in the named volume `gsb-data`, which is pre-owned by the container user. To keep data on the host instead, point `BRIDGE_DATA_DIR` at a directory and either `chown` it to `10001:10001` or run the container as your own UID:
@@ -390,10 +396,10 @@ Compose keeps state in the named volume `gsb-data`, which is pre-owned by the co
 mkdir -p data
 # option A: give the directory to the container user
 sudo chown -R 10001:10001 data
-BRIDGE_DATA_DIR=./data docker compose up -d --build
+BRIDGE_DATA_DIR=./data docker compose up -d
 
 # option B: FUSE / NTFS / exFAT mounts that reject chown -> run as your own UID
-BRIDGE_DATA_DIR=./data BRIDGE_UID=$(id -u) BRIDGE_GID=$(id -g) docker compose up -d --build
+BRIDGE_DATA_DIR=./data BRIDGE_UID=$(id -u) BRIDGE_GID=$(id -g) docker compose up -d
 ```
 
 The published port is bound to `127.0.0.1` by default, so `/ui` is reached from the host or through an SSH tunnel. Because Docker's bridge NAT makes every request look remote, the control plane stays locked (HTTP `403`) while `BRIDGE_API_KEY` is the default `public`; set one of these before opening it:
@@ -406,11 +412,11 @@ BRIDGE_ADMIN_KEY=$(openssl rand -hex 24) docker compose up -d
 Or with `docker run` bound to loopback:
 
 ```sh
-docker build -t gemini-stealth-bridge:0.3.0 .
 docker run -d --name gsb \
   -p 127.0.0.1:20133:20133 \
   -v gsb-data:/data \
-  gemini-stealth-bridge:0.3.0
+  -e BRIDGE_ADMIN_KEY="$(openssl rand -hex 24)" \
+  ghcr.io/azrinaldi/gemini-stealth-bridge:latest
 ```
 
 Open `http://127.0.0.1:20133/ui` (or forward the port via SSH `ssh -L 20133:127.0.0.1:20133 user@server`) to add accounts and configure the pool.
