@@ -1,6 +1,14 @@
 # gemini-stealth-bridge (`gsb`)
 
+[![release](https://img.shields.io/github/v/release/azrinaldi/gemini-stealth-bridge?sort=semver)](https://github.com/azrinaldi/gemini-stealth-bridge/releases/latest)
+[![release workflow](https://github.com/azrinaldi/gemini-stealth-bridge/actions/workflows/release.yml/badge.svg)](https://github.com/azrinaldi/gemini-stealth-bridge/actions/workflows/release.yml)
+[![go](https://img.shields.io/github/go-mod/go-version/azrinaldi/gemini-stealth-bridge)](go.mod)
+[![license](https://img.shields.io/github/license/azrinaldi/gemini-stealth-bridge)](LICENSE)
+[![ghcr](https://img.shields.io/badge/ghcr.io-gemini--stealth--bridge-blue)](https://github.com/azrinaldi/gemini-stealth-bridge/pkgs/container/gemini-stealth-bridge)
+
 OpenAI-compatible proxy for [Gemini Web](https://gemini.google.com/app). Connect coding agents and other API clients to your Gemini account through Chat Completions or Responses endpoints.
+
+![gsb Web Control Plane](docs/assets/web-ui.png)
 
 `gsb` translates OpenAI-style messages, images, and tool definitions into Gemini Web requests, then converts the results back into JSON or Server-Sent Events (SSE). It authenticates with your Google session cookies, not a Gemini Developer API key. Model access and quotas depend on the connected account.
 
