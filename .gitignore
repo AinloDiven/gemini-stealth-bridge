@@ -10,9 +10,19 @@ cookies.json
 web-credentials.json
 session-cache.json
 
-# Personal backlog & internal update plans, not part of the published repo
-/ROADMAP.md
-/PLAN_UPDATE_v0.2.0.md
-/PLAN_*.md
-/DEVELOPMENT.md
-/DESIGN.md
+# Personal backlog & internal update plans, not part of the published repo.
+# Unanchored on purpose: these must stay ignored even if moved into a
+# subdirectory or a new archive/ folder.
+ROADMAP.md
+PLAN_*.md
+DEVELOPMENT.md
+DESIGN.md
+TODO.md
+NOTES.md
+SCRATCH*.md
+*.local.md
+archive/
+archive-*/
+tmp/
+tmpdemo/
+scratch/
