@@ -6,6 +6,10 @@ services:
     image: gemini-stealth-bridge:latest
     container_name: gemini-stealth-bridge
     restart: unless-stopped
+    # Runs unprivileged as uid/gid 10001 by default. Override BRIDGE_UID/BRIDGE_GID
+    # when bind-mounting a host directory that cannot be chown-ed to 10001 (FUSE,
+    # NTFS/exFAT, or a rootless Docker setup): BRIDGE_UID=$(id -u) BRIDGE_GID=$(id -g).
+    user: "${BRIDGE_UID:-10001}:${BRIDGE_GID:-10001}"
     # Bound to 127.0.0.1 by default so Docker never exposes port 20133 to the public internet
     # bypassing host firewalls (UFW/iptables). Access via localhost or SSH tunnel, or set
     # BRIDGE_API_KEY / BRIDGE_ADMIN_KEY before binding to a public interface.
@@ -21,5 +25,13 @@ services:
       BRIDGE_DEFAULT_THINKING: ${BRIDGE_DEFAULT_THINKING:-low}
       BRIDGE_ACCOUNT_STRATEGY: ${BRIDGE_ACCOUNT_STRATEGY:-rotate}
       BRIDGE_REJECT_DOWNGRADE: ${BRIDGE_REJECT_DOWNGRADE:-1}
+    # Named volume by default: the container runs as uid 10001, and a bind mount
+    # created by Docker on first `compose up` is owned by root, which makes the
+    # daemon fail with "open /data/.lock: permission denied". To keep data on the
+    # host instead, run `mkdir -p data && sudo chown 10001:10001 data` first and
+    # set BRIDGE_DATA_DIR=./data (compose will then bind-mount that directory).
     volumes:
-      - ${BRIDGE_DATA_DIR:-./data}:/data
+      - ${BRIDGE_DATA_DIR:-gsb-data}:/data
+
+volumes:
+  gsb-data:

@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath \
     -ldflags="-s -w -X github.com/azrinaldi/gemini-stealth-bridge/internal/config.Version=${VERSION}" \
     -o /out/gsb ./cmd/gsb
 
-# Stage 2: Minimal non-root runtime (~14 MB)
+# Stage 2: Minimal non-root runtime (~12 MB image, ~5 MB RSS idle)
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates tzdata \
     && adduser -D -u 10001 -h /data gsb \

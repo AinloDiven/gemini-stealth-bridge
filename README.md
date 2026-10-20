@@ -358,10 +358,30 @@ curl -sS --max-time 180 http://127.0.0.1:20133/v1/videos/generations \
 ```
 ## Docker deployment
 
-Build and run the multi-stage zero-CGO container (`~14 MB` Alpine runtime, non-root `uid 10001`, Web UI enabled on `:20133`):
+Build and run the multi-stage zero-CGO container (measured: `11.9 MB` image on `overlayfs`, `~5 MB` RSS idle, non-root `uid 10001`, Web UI enabled on `:20133`):
 
 ```sh
 docker compose up -d --build
+```
+
+Compose keeps state in the named volume `gsb-data`, which is pre-owned by the container user. To keep data on the host instead, point `BRIDGE_DATA_DIR` at a directory and either `chown` it to `10001:10001` or run the container as your own UID:
+
+```sh
+# host bind mount instead of the named volume
+mkdir -p data
+# option A: give the directory to the container user
+sudo chown -R 10001:10001 data
+BRIDGE_DATA_DIR=./data docker compose up -d --build
+
+# option B: FUSE / NTFS / exFAT mounts that reject chown -> run as your own UID
+BRIDGE_DATA_DIR=./data BRIDGE_UID=$(id -u) BRIDGE_GID=$(id -g) docker compose up -d --build
+```
+
+The published port is bound to `127.0.0.1` by default, so `/ui` is reached from the host or through an SSH tunnel. Because Docker's bridge NAT makes every request look remote, the control plane stays locked (HTTP `403`) while `BRIDGE_API_KEY` is the default `public`; set one of these before opening it:
+
+```sh
+BRIDGE_ADMIN_KEY=$(openssl rand -hex 24) docker compose up -d
+# then open http://127.0.0.1:20133/ui and paste that key into the auth prompt
 ```
 
 Or with `docker run` bound to loopback:
