@@ -67,9 +67,20 @@ Version `0.3.0` adds an embedded Web Control Plane, dual-window (`5h` + `7d Week
 6. **Zero-CGO Docker Packaging**: Multi-stage `Dockerfile` (~14 MB Alpine image, non-root `uid 10001`, built-in `--healthcheck`) and `docker-compose.yml` with persistent `/data` volume.
 ## Quick start
 
-### 1. Build
+### 1. Install
 
-Requires **Go 1.26.0 or newer**, Git, and an account that can use Gemini Web. Shell examples use a POSIX shell; on Windows, run the binary as `gsb.exe` and adapt environment-variable assignments to your shell.
+Pick whichever path fits: a prebuilt binary (no Go toolchain, no Docker), a Go install, or the container image.
+
+**Prebuilt binary (recommended)** — every release publishes static binaries for Linux, macOS, and Windows on both `amd64` and `arm64`, plus `SHA256SUMS`:
+
+```sh
+# Linux x86_64; swap in darwin_arm64, linux_arm64, windows_amd64.exe, ...
+curl -fL -o gsb https://github.com/azrinaldi/gemini-stealth-bridge/releases/latest/download/gsb_linux_amd64
+chmod +x gsb
+./gsb --version
+```
+
+**From source** — requires **Go 1.26.0 or newer**, Git, and an account that can use Gemini Web. Shell examples use a POSIX shell; on Windows, run the binary as `gsb.exe` and adapt environment-variable assignments to your shell.
 
 ```sh
 git clone https://github.com/azrinaldi/gemini-stealth-bridge.git
@@ -81,6 +92,14 @@ Alternatively, install into your Go binary directory and use `gsb` instead of `.
 
 ```sh
 go install github.com/azrinaldi/gemini-stealth-bridge/cmd/gsb@latest
+```
+
+**Container** — Docker is optional; see [Docker deployment](#docker-deployment). If you only want the binary, you can use the image purely as an installer and never leave a container running:
+
+```sh
+cid=$(docker create ghcr.io/azrinaldi/gemini-stealth-bridge:latest)
+docker cp "$cid:/usr/local/bin/gsb" ./gsb
+docker rm "$cid"
 ```
 
 ### 2. Connect a Gemini account
