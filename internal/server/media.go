@@ -237,12 +237,62 @@ func hasServerSideMediaCalls(calls []toolbridge.Call) bool {
 }
 
 type generatedMediaResult struct {
-	MediaType    string      `json:"media_type"`
-	URL          string      `json:"url"`
-	ThumbnailURL string      `json:"thumbnail_url,omitempty"`
-	MimeType     string      `json:"mime_type"`
-	Markdown     string      `json:"markdown"`
-	Entry        *mediaEntry `json:"-"`
+	MediaType     string      `json:"media_type"`
+	URL           string      `json:"url"`
+	ThumbnailURL  string      `json:"thumbnail_url,omitempty"`
+	MimeType      string      `json:"mime_type"`
+	RevisedPrompt string      `json:"revised_prompt,omitempty"`
+	AspectRatio   string      `json:"aspect_ratio,omitempty"`
+	Markdown      string      `json:"markdown"`
+	Entry         *mediaEntry `json:"-"`
+}
+
+type mediaGenParams struct {
+	MediaType   string
+	Prompt      string
+	AspectRatio string
+	Format      string
+	DurationSec int
+	OutputPath  string
+}
+
+func normalizeAspectRatio(ar, size string) string {
+	switch strings.TrimSpace(strings.ToLower(ar)) {
+	case "16:9", "landscape", "widescreen":
+		return "16:9"
+	case "9:16", "portrait", "vertical":
+		return "9:16"
+	case "4:3":
+		return "4:3"
+	case "3:4":
+		return "3:4"
+	case "1:1", "square":
+		return "1:1"
+	}
+	switch strings.TrimSpace(strings.ToLower(size)) {
+	case "1792x1024", "1536x1024", "1920x1080":
+		return "16:9"
+	case "1024x1792", "1024x1536", "1080x1920":
+		return "9:16"
+	case "1024x1024":
+		return "1:1"
+	}
+	return ""
+}
+
+func applyGoogleImageURLFormat(rawURL, format string) (string, string, string) {
+	base := rawURL
+	if idx := strings.LastIndex(base, "=s"); idx > strings.LastIndex(base, "/") {
+		base = base[:idx]
+	}
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "png":
+		return base + "=s0-rp", "image/png", "png"
+	case "gif":
+		return base, "image/gif", "gif"
+	default:
+		return base + "=s0-d", "image/jpeg", "jpg"
+	}
 }
 
 func (s *Server) runMediaGenerationOnAccount(
@@ -251,7 +301,12 @@ func (s *Server) runMediaGenerationOnAccount(
 	model *gemini.ModelInfo,
 	mediaType string,
 	userPrompt string,
+	extra ...mediaGenParams,
 ) ([]generatedMediaResult, string, error) {
+	var params mediaGenParams
+	if len(extra) > 0 {
+		params = extra[0]
+	}
 	mType := strings.ToLower(strings.TrimSpace(mediaType))
 	if mType != "video" {
 		mType = "image"
@@ -261,9 +316,26 @@ func (s *Server) runMediaGenerationOnAccount(
 		return nil, "", transport.NewUpstreamError("prompt is required for media generation", 400, "invalid_request_error", nil, nil)
 	}
 
-	genPrompt := "Generate an image: " + cleanPrompt
+	ar := normalizeAspectRatio(params.AspectRatio, "")
+	fmtHint := strings.ToLower(strings.TrimSpace(params.Format))
+	var qualifiers []string
+	if ar != "" {
+		qualifiers = append(qualifiers, "aspect ratio "+ar)
+	}
+	if mType == "image" && fmtHint == "gif" {
+		qualifiers = append(qualifiers, "animated GIF")
+	}
+	if mType == "video" && params.DurationSec > 0 {
+		qualifiers = append(qualifiers, fmt.Sprintf("%d seconds", params.DurationSec))
+	}
+	qualSuffix := ""
+	if len(qualifiers) > 0 {
+		qualSuffix = " (" + strings.Join(qualifiers, ", ") + ")"
+	}
+
+	genPrompt := "Generate an image" + qualSuffix + ": " + cleanPrompt
 	if mType == "video" {
-		genPrompt = "Generate a video: " + cleanPrompt
+		genPrompt = "Generate a video" + qualSuffix + ": " + cleanPrompt
 	}
 
 	mediaModel := model
@@ -287,6 +359,19 @@ func (s *Server) runMediaGenerationOnAccount(
 	)
 	upstream, err := client.StreamGenerateLive(ctx, genPrompt, opts, func(update *gemini.LineParseResult) error {
 		for _, f := range update.Frames {
+			if fmtHint == "png" || fmtHint == "gif" {
+				for i := range f.GeneratedImages {
+					raw := f.GeneratedImages[i].URL
+					if raw != "" && !strings.Contains(raw, "/v1/media/") {
+						formattedURL, mime, ext := applyGoogleImageURLFormat(raw, fmtHint)
+						proxyURL, _ := s.registerMedia(ctx, account.ID, formattedURL, raw, mime, ext, f.GeneratedImages[i].Title)
+						if proxyURL != "" {
+							f.Text = strings.ReplaceAll(f.Text, raw, proxyURL)
+							f.GeneratedImages[i].URL = proxyURL
+						}
+					}
+				}
+			}
 			s.rewriteFrameMedia(ctx, account.ID, &f)
 			lastFrame = f
 			hasFrame = true
@@ -306,19 +391,34 @@ func (s *Server) runMediaGenerationOnAccount(
 		s.mediaMu.RLock()
 		entry := s.mediaItems[id]
 		s.mediaMu.RUnlock()
+		mime := "image/jpeg"
 		if entry != nil {
-			_, _, _ = s.ensureMediaBytes(ctx, entry)
+			_, detectedMime, _ := s.ensureMediaBytes(ctx, entry)
+			if detectedMime != "" {
+				mime = detectedMime
+			} else if entry.MimeType != "" {
+				mime = entry.MimeType
+			}
 		}
 		alt := img.Title
 		if alt == "" {
 			alt = "Generated Image"
 		}
+		revPrompt := img.RevisedPrompt
+		if revPrompt == "" {
+			revPrompt = img.Alt
+		}
+		if revPrompt == "" {
+			revPrompt = cleanPrompt
+		}
 		results = append(results, generatedMediaResult{
-			MediaType: "image",
-			URL:       img.URL,
-			MimeType:  "image/jpeg",
-			Markdown:  fmt.Sprintf("![%s](%s)", alt, img.URL),
-			Entry:     entry,
+			MediaType:     "image",
+			URL:           img.URL,
+			MimeType:      mime,
+			RevisedPrompt: revPrompt,
+			AspectRatio:   ar,
+			Markdown:      fmt.Sprintf("![%s](%s)", alt, img.URL),
+			Entry:         entry,
 		})
 	}
 	for _, vid := range lastFrame.GeneratedVideos {
@@ -338,12 +438,14 @@ func (s *Server) runMediaGenerationOnAccount(
 			md = fmt.Sprintf("[![%s](%s)](%s)\n\n%s", title, vid.ThumbnailURL, vid.URL, md)
 		}
 		results = append(results, generatedMediaResult{
-			MediaType:    "video",
-			URL:          vid.URL,
-			ThumbnailURL: vid.ThumbnailURL,
-			MimeType:     "video/mp4",
-			Markdown:     md,
-			Entry:        entry,
+			MediaType:     "video",
+			URL:           vid.URL,
+			ThumbnailURL:  vid.ThumbnailURL,
+			MimeType:      "video/mp4",
+			RevisedPrompt: cleanPrompt,
+			AspectRatio:   ar,
+			Markdown:      md,
+			Entry:         entry,
 		})
 	}
 	return results, lastFrame.Text, nil
@@ -376,7 +478,22 @@ func (s *Server) executeServerSideMediaCalls(
 	for _, mc := range mediaCalls {
 		mType, _ := mc.Arguments["media_type"].(string)
 		mPrompt, _ := mc.Arguments["prompt"].(string)
-		items, replyText, genErr := s.runMediaGenerationOnAccount(ctx, account, model, mType, mPrompt)
+		ar, _ := mc.Arguments["aspect_ratio"].(string)
+		formatStr, _ := mc.Arguments["format"].(string)
+		outPath, _ := mc.Arguments["output_path"].(string)
+		durSec := 0
+		if d, ok := mc.Arguments["duration"].(float64); ok {
+			durSec = int(d)
+		}
+		mParams := mediaGenParams{
+			MediaType:   mType,
+			Prompt:      mPrompt,
+			AspectRatio: ar,
+			Format:      formatStr,
+			DurationSec: durSec,
+			OutputPath:  outPath,
+		}
+		items, replyText, genErr := s.runMediaGenerationOnAccount(ctx, account, model, mType, mPrompt, mParams)
 		if (genErr != nil || len(items) == 0) && scope.AccountID == "" {
 			tried := map[string]bool{account.ID: true}
 			fallbackModelName := model.ModelName
@@ -389,7 +506,7 @@ func (s *Server) executeServerSideMediaCalls(
 					break
 				}
 				tried[nextAcct.ID] = true
-				items, replyText, genErr = s.runMediaGenerationOnAccount(ctx, nextAcct, nextModel, mType, mPrompt)
+				items, replyText, genErr = s.runMediaGenerationOnAccount(ctx, nextAcct, nextModel, mType, mPrompt, mParams)
 				if genErr == nil && len(items) > 0 {
 					break
 				}
@@ -413,21 +530,25 @@ func (s *Server) executeServerSideMediaCalls(
 				urls = append(urls, it.URL)
 				mds = append(mds, it.Markdown)
 			}
-			ext := strings.TrimPrefix(filepath.Ext(items[0].URL), ".")
-			if ext == "" {
-				ext = "mp4"
-			}
 			baseName := filepath.Base(items[0].URL)
-			localFile := fmt.Sprintf("./generated-%s-%s", items[0].MediaType, baseName)
+			localFile := strings.TrimSpace(outPath)
+			if localFile == "" {
+				localFile = fmt.Sprintf("./generated-%s-%s", items[0].MediaType, baseName)
+			}
 			outObj = map[string]any{
 				"status":             "ok",
 				"media_type":         items[0].MediaType,
+				"mime_type":          items[0].MimeType,
 				"url":                items[0].URL,
 				"urls":               urls,
+				"revised_prompt":     items[0].RevisedPrompt,
 				"markdown":           strings.Join(mds, "\n\n"),
 				"suggested_filename": localFile,
 				"local_download_cmd": fmt.Sprintf("curl -fsSL %q -o %q", items[0].URL, localFile),
 				"note":               "The media is ready at the URL above. IMPORTANT: If you have a bash/shell tool available, run local_download_cmd now (or save to the filename requested by the user) so the file is saved directly into the user's current working directory on their laptop, then include the saved filename and markdown link in your final reply.",
+			}
+			if items[0].AspectRatio != "" {
+				outObj["aspect_ratio"] = items[0].AspectRatio
 			}
 			if items[0].ThumbnailURL != "" {
 				outObj["thumbnail_url"] = items[0].ThumbnailURL
@@ -440,6 +561,64 @@ func (s *Server) executeServerSideMediaCalls(
 		toolOutputs = append(toolOutputs, fmt.Sprintf(" %s\n\nUser: [Harness tool result for %s]:\n%s", string(callBytes), toolbridge.BuiltinMediaToolName, string(b)))
 	}
 	return strings.Join(toolOutputs, "\n\n") + "\n\nAssistant:", clientCalls, nil
+}
+
+// formatDirectMediaToolContinuation formats a continuation prompt block when
+// Gemini Web's built-in media generator produces GeneratedImages or
+// GeneratedVideos directly on a tool-enabled turn without a JSON tool_calls
+// envelope, allowing the coding agent to save the generated file to disk via
+// bash/curl without re-triggering image generation on Round 2.
+func formatDirectMediaToolContinuation(images []gemini.GeneratedImage, videos []gemini.GeneratedVideo) string {
+	var urls []string
+	mediaType := "image"
+	revPrompt := "generated media"
+	for _, img := range images {
+		if img.URL != "" {
+			urls = append(urls, img.URL)
+		}
+		if img.RevisedPrompt != "" {
+			revPrompt = img.RevisedPrompt
+		} else if img.Alt != "" {
+			revPrompt = img.Alt
+		}
+	}
+	for _, vid := range videos {
+		if vid.URL != "" {
+			urls = append(urls, vid.URL)
+			mediaType = "video"
+		}
+		if vid.Title != "" {
+			revPrompt = vid.Title
+		}
+	}
+	if len(urls) == 0 {
+		return ""
+	}
+	baseName := filepath.Base(urls[0])
+	localFile := fmt.Sprintf("./generated-%s-%s", mediaType, baseName)
+	synthCallBytes, _ := json.Marshal(map[string]any{
+		"tool_calls": []any{
+			map[string]any{
+				"name": toolbridge.BuiltinMediaToolName,
+				"arguments": map[string]any{
+					"media_type": mediaType,
+					"prompt":     revPrompt,
+				},
+			},
+		},
+	})
+	outObj := map[string]any{
+		"status":             "ok",
+		"media_type":         mediaType,
+		"url":                urls[0],
+		"urls":               urls,
+		"revised_prompt":     revPrompt,
+		"suggested_filename": localFile,
+		"local_download_cmd": fmt.Sprintf("curl -fsSL %q -o %q", urls[0], localFile),
+		"note":               "The media has ALREADY been generated and is ready at the URL above (do NOT generate another image). IMPORTANT: If you have a bash/shell tool available, emit a JSON tool_calls block calling bash to run local_download_cmd now so the file is saved directly into the user's current working directory on their laptop, then report the saved filename and URL in your final reply.",
+	}
+	b, _ := json.Marshal(outObj)
+	return fmt.Sprintf(" %s\n\nUser: [Harness tool result for %s]:\n%s\n\nAssistant:", string(synthCallBytes), toolbridge.BuiltinMediaToolName, string(b))
 }
 
 // HandleImageGeneration implements POST /v1/images/generations (OpenAI Images API).
@@ -466,6 +645,23 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 	requestedModel, _ := body["model"].(string)
 	respFormat, _ := body["response_format"].(string)
 	respFormat = strings.ToLower(strings.TrimSpace(respFormat))
+	sizeStr, _ := body["size"].(string)
+	arStr, _ := body["aspect_ratio"].(string)
+	outFmt, _ := body["output_format"].(string)
+	if outFmt == "" {
+		outFmt, _ = body["format"].(string)
+	}
+	durSec := 0
+	if d, ok := body["duration"].(float64); ok {
+		durSec = int(d)
+	}
+	mParams := mediaGenParams{
+		MediaType:   mediaType,
+		Prompt:      promptStr,
+		AspectRatio: normalizeAspectRatio(arStr, sizeStr),
+		Format:      outFmt,
+		DurationSec: durSec,
+	}
 
 	msgs := []map[string]any{
 		{"role": "user", "content": promptStr},
@@ -484,7 +680,7 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 		return
 	}
 
-	items, replyText, err := s.runMediaGenerationOnAccount(ctx, prep.account, prep.model, mediaType, promptStr)
+	items, replyText, err := s.runMediaGenerationOnAccount(ctx, prep.account, prep.model, mediaType, promptStr, mParams)
 	if err != nil {
 		sendChatError(w, false, err)
 		return
@@ -506,10 +702,17 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 
 	dataList := make([]map[string]any, 0, len(items))
 	for _, it := range items {
+		revPrompt := it.RevisedPrompt
+		if revPrompt == "" {
+			revPrompt = promptStr
+		}
 		itemMap := map[string]any{
 			"url":            it.URL,
-			"revised_prompt": promptStr,
+			"revised_prompt": revPrompt,
 			"mime_type":      it.MimeType,
+		}
+		if it.AspectRatio != "" {
+			itemMap["aspect_ratio"] = it.AspectRatio
 		}
 		if it.ThumbnailURL != "" {
 			itemMap["thumbnail_url"] = it.ThumbnailURL

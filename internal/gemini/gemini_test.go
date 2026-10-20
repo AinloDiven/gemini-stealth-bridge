@@ -511,10 +511,76 @@ func TestKoreanInlineThinkingHeaderAndIndonesianCannedErrorReply(t *testing.T) {
 		t.Fatalf("expected cleanText to start with tool_calls fence, got %q", cleanText)
 	}
 
-	if got := GeminiErrorReply("Saya adalah model bahasa, dan saya tidak dirancang untuk itu."); got == "" {
-		t.Fatal("expected Indonesian canned refusal to be recognized by GeminiErrorReply")
+	for _, refusal := range []string{
+		"Saya adalah model bahasa, dan saya tidak dirancang untuk itu.",
+		"Saya hanya model bahasa dan tidak bisa membantu Anda untuk itu.",
+		"Saya tidak bisa membantu untuk itu karena saya hanya model bahasa dan tidak punya informasi atau kemampuan yang diperlukan.",
+		"Saya tidak bisa membantu Anda karena saya hanya model bahasa dan tidak mampu memahami dan merespons hal tersebut.",
+		"Saya tidak diprogram untuk melakukan hal itu.",
+		"I'm a language model, and I'm not designed to do that.",
+		"I'm not programmed to do that.",
+		"I can't help with that because I'm only a language model and don't have the necessary information or abilities.",
+	} {
+		if got := GeminiErrorReply(refusal); got == "" {
+			t.Fatalf("expected canned refusal %q to be recognized by GeminiErrorReply", refusal)
+		}
 	}
-	if got := GeminiErrorReply("I'm a language model, and I'm not designed to do that."); got == "" {
-		t.Fatal("expected English canned refusal to be recognized by GeminiErrorReply")
+}
+
+func TestThoughtBubbleEmojiInlineThinkingAndFinalAnswerSplit(t *testing.T) {
+	// 1. Standalone 💭\n before tool_calls with trailing )] artifact
+	toolTurn := "💭\nLet's check why 91 GISTARU folders showed `0 lines in features.ndjson.gz`! )]\n```json\n{\"tool_calls\":[{\"name\":\"eval\",\"arguments\":{\"code\":\"print(1)\"}}]}\n```"
+	cleanText, cleanThoughts := sanitizeCandidateTextAndThoughts(toolTurn, "", true)
+	if cleanThoughts != "Let's check why 91 GISTARU folders showed `0 lines in features.ndjson.gz`!" {
+		t.Fatalf("expected stripped thought without 💭 or )], got %q", cleanThoughts)
+	}
+	if !strings.HasPrefix(cleanText, "```json") {
+		t.Fatalf("expected tool block in cleanText, got %q", cleanText)
+	}
+
+	// 2. Standalone 💭\n monologue followed by meta-sentence and final answer (like 24312863 and f5a8746f)
+	finalTurn := "💭\nAll todo items are now marked complete (`3/3 done, 0 open`).\nLet's write a brief, crisp closing note confirming that the analysis and blueprint above are complete and ready for execution whenever the user approves.✅ Seluruh tahap analisis dan perancangan struktur direktori baru (`datasets-clean/`) telah selesai."
+	ansText, ansThoughts := sanitizeCandidateTextAndThoughts(finalTurn, "", true)
+	if !strings.HasPrefix(ansText, "✅ Seluruh tahap analisis") {
+		t.Fatalf("expected final answer starting with ✅, got %q", ansText)
+	}
+	if strings.Contains(ansThoughts, "💭") || !strings.Contains(ansThoughts, "All todo items are now marked complete") {
+		t.Fatalf("expected clean thoughts without 💭, got %q", ansThoughts)
+	}
+}
+
+func TestExtractStreamEnvelopesSingleArrayNoNewlines(t *testing.T) {
+	chunk1 := ")]}'\n\n[[\"wrb.fr\",null,\"[null,[\\\"c_1\\\",\\\"r_1\\\"]]\",null,null,null,\"generic\"]"
+	envs, rem, inOuter := extractStreamEnvelopes(chunk1, false, false)
+	if len(envs) != 1 || !inOuter || rem != "" {
+		t.Fatalf("chunk1: expected 1 envelope, inOuter=true, rem=\"\", got envs=%d inOuter=%v rem=%q", len(envs), inOuter, rem)
+	}
+
+	// Split second element across chunk2a and chunk2b with no newlines
+	chunk2a := ",[\"wrb.fr\",null,\"[null,[\\\"c_1\\\",\\\"r_1\\\"],null,null,[[\\\"rc_1\\\",[\\\"Hello "
+	envs, rem, inOuter = extractStreamEnvelopes(rem+chunk2a, inOuter, false)
+	if len(envs) != 0 || !inOuter || rem == "" {
+		t.Fatalf("chunk2a: expected 0 envelopes and buffered partial element, got envs=%d inOuter=%v rem=%q", len(envs), inOuter, rem)
+	}
+
+	chunk2b := "world\\\"],null,null,null,null,null,null,[1]]]]\"]"
+	envs, rem, inOuter = extractStreamEnvelopes(rem+chunk2b, inOuter, false)
+	if len(envs) != 1 || !inOuter || rem != "" {
+		t.Fatalf("chunk2b: expected 1 completed envelope, got envs=%d inOuter=%v rem=%q", len(envs), inOuter, rem)
+	}
+	parsed, err := ParseFrameLine(envs[0])
+	if err != nil || parsed == nil || len(parsed.Frames) != 1 || parsed.Frames[0].Text != "Hello world" {
+		t.Fatalf("chunk2b ParseFrameLine: got %+v err=%v", parsed, err)
+	}
+
+	// Trailer chunk closing the outer array
+	chunk3 := ",[\"di\",123],[\"af.httprm\",123,\"456\",50]]"
+	envs, rem, inOuter = extractStreamEnvelopes(rem+chunk3, inOuter, false)
+	if len(envs) != 2 || inOuter || rem != "" {
+		t.Fatalf("chunk3: expected 2 trailer envelopes and inOuter=false, got envs=%d inOuter=%v rem=%q", len(envs), inOuter, rem)
+	}
+	pEnd, err := ParseFrameLine(envs[0])
+	if err != nil || pEnd == nil || !pEnd.StreamEnd {
+		t.Fatalf("expected ['di',...] to mark StreamEnd=true, got %+v err=%v", pEnd, err)
 	}
 }

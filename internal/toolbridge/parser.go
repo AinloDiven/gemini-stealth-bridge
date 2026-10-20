@@ -1051,6 +1051,10 @@ func ExtractPreToolPreamble(text string) string {
 	}
 	before := strings.TrimSpace(trailingTagRe.ReplaceAllString(trimmed[:loc[0]], ""))
 	before = strings.TrimSpace(trailingEnvRe.ReplaceAllString(before, ""))
+	before = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(before, "💭"), "🧠"))
+	if strings.HasSuffix(before, ")]") {
+		before = strings.TrimSpace(strings.TrimSuffix(before, ")]"))
+	}
 	return before
 }
 func SafeStreamablePrefix(text string) string {
@@ -1058,26 +1062,30 @@ func SafeStreamablePrefix(text string) string {
 		return ""
 	}
 	trimmed := strings.TrimLeft(text, " \t\r\n")
-	if trimmed == "" || trimmed[0] == '{' || trimmed[0] == '[' || trimmed[0] == '<' || strings.HasPrefix(trimmed, "```") {
+	if trimmed == "" || trimmed[0] == '{' || trimmed[0] == '[' || trimmed[0] == '<' || strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "💭") || strings.HasPrefix(trimmed, "🧠") {
+		return ""
+	}
+	if potentialToolMarkerRe.MatchString(text) {
 		return ""
 	}
 	safeEnd := len(text) - 140
-	for i := range len(text) {
-		ch := text[i]
-		if ch == '{' || ch == '[' || ch == '<' || (ch == '`' && strings.HasPrefix(text[i:], "```")) {
-			if i < safeEnd {
-				safeEnd = i
+	trimmedRight := strings.TrimRight(text, " \t\r\n")
+	if len(trimmedRight) > 0 {
+		lastCh := trimmedRight[len(trimmedRight)-1]
+		if lastCh == '{' || lastCh == '[' || lastCh == '<' || strings.HasSuffix(trimmedRight, "```") {
+			cut := len(trimmedRight) - 1
+			if strings.HasSuffix(trimmedRight, "```") {
+				cut = len(trimmedRight) - 3
 			}
-			break
+			if cut < safeEnd {
+				safeEnd = cut
+			}
 		}
 	}
 	for safeEnd > 0 && !utf8.RuneStart(text[safeEnd]) {
 		safeEnd--
 	}
 	if safeEnd <= 0 {
-		return ""
-	}
-	if potentialToolMarkerRe.MatchString(text) {
 		return ""
 	}
 	return text[:safeEnd]

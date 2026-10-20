@@ -150,7 +150,7 @@ func AugmentToolsWithMediaGenerator(tools any, toolChoice any) any {
 		"type": "function",
 		"function": map[string]any{
 			"name":        BuiltinMediaToolName,
-			"description": "Generate a real high-definition image (Imagen / Nano Banana JPEG) or video with audio (Veo MP4, ~8-10 seconds per clip) using Gemini's native media generator. ALWAYS call this tool directly whenever the user asks to create, make, or revise any video or image—NEVER inspect or run ffmpeg, ffprobe, espeak, or python scripts unless the user explicitly asks to edit/concatenate media with ffmpeg. Returns a local downloadable HTTP URL (http://.../v1/media/...) and a curl command to save it to the workspace.",
+			"description": "Generate a real high-definition raster image (Imagen / Nano Banana JPEG) or video with audio (Veo MP4, ~8-10 seconds per clip) using Gemini's native media generator. ALWAYS call this tool directly whenever the user asks to create, make, generate, or revise any image, illustration (gambar/ilustrasi/foto), or video—NEVER write inline SVG/Mermaid code blocks or run ffmpeg, ffprobe, espeak, or python scripts unless the user explicitly asks for SVG/Mermaid code or ffmpeg editing. Note: 'Nano Banana', 'Imagen', and 'Veo' are the names of this generator tool itself, NOT the subject to draw; always set 'prompt' to a detailed visual description of the actual subject requested in the conversation. Returns a local downloadable HTTP URL (http://.../v1/media/...) and a curl command to save it to the workspace.",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -162,6 +162,25 @@ func AugmentToolsWithMediaGenerator(tools any, toolChoice any) any {
 					"prompt": map[string]any{
 						"type":        "string",
 						"description": "Detailed visual description of the image or video to generate.",
+					},
+					"aspect_ratio": map[string]any{
+						"type":        "string",
+						"enum":        []string{"1:1", "16:9", "9:16", "4:3", "3:4"},
+						"description": "Aspect ratio: '16:9' or '4:3' for wide diagrams/landscapes/presentations, '9:16' or '3:4' for vertical/portrait, or '1:1' for square.",
+					},
+					"format": map[string]any{
+						"type":        "string",
+						"enum":        []string{"png", "jpeg", "gif"},
+						"description": "Image output format: 'png' for lossless high-sharpness diagrams/text (uses =s0-rp), 'jpeg' for original photo/artwork (uses =s0-d), or 'gif' for animated GIF.",
+					},
+					"duration": map[string]any{
+						"type":        "integer",
+						"enum":        []int{10, 15, 30},
+						"description": "Target video duration in seconds (10, 15, or 30).",
+					},
+					"output_path": map[string]any{
+						"type":        "string",
+						"description": "Optional relative filename in the workspace where the generated media should be saved (e.g. './gsb-workflow.png').",
 					},
 				},
 				"required": []string{"media_type", "prompt"},
@@ -515,10 +534,20 @@ func buildToolReminder(tools any, toolChoice any, forceRequiredArgs bool) (strin
 			summaries = append(summaries, d.Name+"()")
 		}
 	}
+	hasMediaTool := false
+	for _, d := range contract.Tools {
+		if d.Name == BuiltinMediaToolName {
+			hasMediaTool = true
+			break
+		}
+	}
 	lines := []string{
 		fmt.Sprintf("[Tool reminder: Available tools: %s.", strings.Join(summaries, ", ")),
 		"JSON tool calls (`{\"tool_calls\":[{\"name\":\"<tool>\",\"arguments\":{...}}]}`) are plain-text JSON replies to the caller and remain available on every turn.",
 		"Keep turns fast and iterative (at most 1–2 large or state-mutating tool calls per turn; never write draft payloads or prose outside the JSON block; use declared JSON tools rather than built-in tools).",
+	}
+	if hasMediaTool {
+		lines = append(lines, "When asked to generate an image/gambar/ilustrasi or video (including via Imagen, Nano Banana, or Veo), call `generate_media` via JSON tool_calls with a detailed visual `prompt` of the requested subject from conversation context (do not write SVG/script code, and remember 'Nano Banana'/'Imagen'/'Veo' is the generator tool name, not the subject to draw).")
 	}
 	if contract.ChoiceMode == "function" && contract.ForcedFunction != "" {
 		lines = append(lines, fmt.Sprintf("You MUST call the tool %q now by outputting ONLY the ```json {\"tool_calls\":[...]} ``` block.]", contract.ForcedFunction))

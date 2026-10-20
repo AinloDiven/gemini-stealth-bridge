@@ -843,6 +843,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			servedID, servedLabel string
 			identityConflict      bool
 			mediaToolUsed         bool
+			lastImages            []gemini.GeneratedImage
+			lastVideos            []gemini.GeneratedVideo
 			lastCID, lastRID      string
 			lastContextToken      string
 			attemptStateMu        sync.Mutex
@@ -899,9 +901,13 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					markPhase(&identityMs)
 				}
 				earlyMismatch := !mediaToolUsed && s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
+				identityVerifiedNow := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 				attemptStateMu.Unlock()
 				if earlyMismatch {
 					return transport.ErrStopStreaming
+				}
+				if stream && buffered && ctx.Err() == nil && identityVerifiedNow {
+					startStream(false)
 				}
 
 				if update.CID != "" {
@@ -925,6 +931,12 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					s.rewriteFrameMedia(ctx, account.ID, &frame)
 					if len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0 {
 						mediaToolUsed = true
+						if len(frame.GeneratedImages) > 0 {
+							lastImages = frame.GeneratedImages
+						}
+						if len(frame.GeneratedVideos) > 0 {
+							lastVideos = frame.GeneratedVideos
+						}
 					}
 					if mediaToolUsed {
 						servedID = model.ModelID
@@ -968,7 +980,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						// Thoughts are normalized monotonically via mergeStreamedThoughts.
 						// A matching served-model id proves no downgrade is in progress, so
 						// the headers no longer need to be held for an HTTP error.
-						if !headersSent && canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel) {
+						if canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel) {
 							startStream(false)
 						}
 						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
@@ -990,8 +1002,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
 								emitTextDelta(text[len(sentText):])
 								sentText = text
-							} else if hasTools && len(text) > 240 {
-								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
+						} else if hasTools && !mediaToolUsed && len(text) > 240 {
+							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
 									emitTextDelta(safePrefix[len(sentText):])
 									sentText = safePrefix
 								}
@@ -1224,14 +1236,14 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 								MaxOldToolChars: 12000,
 								AllowOverflow:   s.Cfg.HistoryOffload,
 							}); cErr == nil {
-								curPrompt = compacted
+								curPrompt = appendErrorReplyRecoveryNote(compacted, hasTools)
 								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(imageParts))
 								attachmentParts = append(attachmentParts, extraOverflow...)
 								attachmentParts = append(attachmentParts, imageParts...)
 								continue
 							}
 						}
-						curPrompt = fullPrompt
+						curPrompt = appendErrorReplyRecoveryNote(fullPrompt, hasTools)
 						attachmentParts = fullAttachmentParts
 						continue
 					}
@@ -1313,8 +1325,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				retryDeadline = retryDeadline.Add(time.Since(mediaStart))
 			}
 			if len(clientCalls) == 0 {
-				curPrompt = curPrompt + promptAdd
-				fullPrompt = curPrompt
+				fullPrompt = fullPrompt + promptAdd
+				curPrompt = fullPrompt
 				opts.Metadata = nil
 				serverMediaRounds++
 				attempt--
@@ -1324,6 +1336,18 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				continue
 			}
 			calls = clientCalls
+		} else if hasTools && len(calls) == 0 && (len(lastImages) > 0 || len(lastVideos) > 0) && serverMediaRounds < 2 && sentText == "" {
+			if promptAdd := formatDirectMediaToolContinuation(lastImages, lastVideos); promptAdd != "" {
+				fullPrompt = fullPrompt + promptAdd
+				curPrompt = fullPrompt
+				opts.Metadata = nil
+				serverMediaRounds++
+				attempt--
+				if upstreamCalls > 0 {
+					upstreamCalls--
+				}
+				continue
+			}
 		}
 		var contentStr string
 		if len(calls) > 0 {

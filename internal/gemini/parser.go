@@ -12,9 +12,14 @@ import (
 
 // GeneratedImage represents a generated image returned inside a StreamGenerate frame.
 type GeneratedImage struct {
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Alt   string `json:"alt,omitempty"`
+	URL           string `json:"url"`
+	DownloadURL   string `json:"downloadUrl,omitempty"`
+	Title         string `json:"title,omitempty"`
+	Alt           string `json:"alt,omitempty"`
+	RevisedPrompt string `json:"revisedPrompt,omitempty"`
+	Width         int    `json:"width,omitempty"`
+	Height        int    `json:"height,omitempty"`
+	IsGIF         bool   `json:"isGif,omitempty"`
 }
 
 // GeneratedVideo represents a generated video returned inside a StreamGenerate or hNvQHb frame.
@@ -66,8 +71,33 @@ var (
 		"i am a language model, and i am not designed to do that.",
 		"i'm just a language model, so i can't help with that.",
 		"i am just a language model, so i cannot help with that.",
+		"i'm not programmed to do that.",
+		"i am not programmed to do that.",
+		"i'm not able to help with that, as i'm only a language model.",
+		"i am not able to help with that, as i am only a language model.",
+		"i'm unable to help with that, as i'm only a language model and don't have the necessary information or abilities.",
+		"i'm unable to help you with that, as i'm only a language model and don't have the necessary information or abilities.",
+		"i can't help with that because i'm only a language model and don't have the necessary information or abilities.",
+		"i cannot help with that because i am only a language model and do not have the necessary information or abilities.",
+		"i can't help you with that because i'm only a language model and don't have the ability to understand and respond.",
+		"i cannot help you with that because i am only a language model and do not have the ability to understand and respond.",
+		"i'm still learning how to answer this question.",
 		"saya adalah model bahasa, dan saya tidak dirancang untuk itu.",
 		"saya hanya model bahasa, jadi saya tidak bisa membantu terkait hal itu.",
+		"saya hanya model bahasa dan tidak bisa membantu anda untuk itu.",
+		"saya hanya model bahasa dan tidak dapat membantu anda untuk itu.",
+		"saya tidak bisa membantu untuk itu karena saya hanya model bahasa dan tidak punya informasi atau kemampuan yang diperlukan.",
+		"saya tidak bisa membantu anda karena saya hanya model bahasa dan tidak mampu memahami dan merespons hal tersebut.",
+		"saya tidak bisa membantu terkait hal itu karena saya hanya model bahasa.",
+		"saya tidak dapat membantu untuk itu karena saya hanya model bahasa dan tidak punya informasi atau kemampuan yang diperlukan.",
+		"saya tidak dapat membantu anda karena saya hanya model bahasa dan tidak mampu memahami dan merespons hal tersebut.",
+		"saya tidak dapat membantu terkait hal itu karena saya hanya model bahasa.",
+		"saya tidak diprogram untuk melakukan hal itu.",
+		"saya tidak diprogram untuk membantu terkait hal itu.",
+		"saya masih belajar untuk menjawab pertanyaan ini.",
+		"saya masih belajar, jadi saat ini saya belum bisa membantu terkait hal itu.",
+		"maaf, saya belum bisa membantu terkait hal itu.",
+		"maaf, saya tidak bisa membantu terkait hal itu.",
 		"maaf, ada yang salah. silakan coba lagi.",
 		"maaf, terjadi kesalahan. silakan coba lagi.",
 	}
@@ -80,7 +110,23 @@ var (
 		"i seem to be encountering an error",
 		"i seem to be having trouble",
 		"saya adalah model bahasa, dan saya tidak dirancang untuk itu",
+		"saya hanya model bahasa, jadi saya tidak bisa membantu",
+		"saya hanya model bahasa dan tidak bisa membantu",
+		"saya hanya model bahasa dan tidak dapat membantu",
+		"karena saya hanya model bahasa dan tidak punya informasi atau kemampuan yang diperlukan",
+		"karena saya hanya model bahasa dan tidak mampu memahami dan merespons hal tersebut",
+		"saya tidak diprogram untuk melakukan hal itu",
+		"i'm not programmed to do that",
+		"only a language model and don't have the necessary information or abilities",
+		"only a language model and don't have the ability to understand and respond",
 	}
+	geminiCannedRefusalRe = regexp.MustCompile(
+		`(?i)^(?:maaf,\s*)?(?:` +
+			`saya\s+(?:tidak\s+(?:bisa|dapat|mampu)\s+membantu[^\n]*karena\s+saya\s+(?:hanya|hanyalah|adalah)\s+model\s+bahasa|tidak\s+diprogram\s+untuk\s+(?:melakukan|membantu)\s+hal\s+(?:itu|tersebut)|(?:hanya|hanyalah|adalah)\s+model\s+bahasa[^\n]*tidak\s+(?:bisa|dapat|dirancang|mampu))|` +
+			`(?:i'm|i\s+am)\s+(?:not\s+programmed\s+to\s+do\s+that|(?:unable|not\s+able)\s+to\s+help[^\n]*(?:as|because)\s+(?:i'm|i\s+am)\s+(?:only|just|a)\s+(?:a\s+)?language\s+model)|` +
+			`i\s+(?:can't|cannot)\s+help[^\n]*because\s+(?:i'm|i\s+am)\s+(?:only|just|a)\s+(?:a\s+)?language\s+model` +
+			`)[.!]?$`,
+	)
 	hex16Re                       = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
 	googleUserContentRe           = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
 	imageSizeSuffixRe             = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
@@ -99,6 +145,9 @@ var (
 			"quá\\s+trình\\s+suy\\s+nghĩ)" +
 			"(?:(?:\\*\\*|__)?\\s*[:：](?:\\*\\*|__)?[ \\t]*(?:\\r?\\n+)?|(?:\\*\\*|__)?[ \\t]*\\r?\\n+)",
 	)
+	thoughtBubbleHeaderRe         = regexp.MustCompile("(?s)^\\s*(?:💭|🧠)[ \\t]*\\r?\\n+")
+	thoughtBubbleMetaSplitRe      = regexp.MustCompile("(?im)(?:^|\\n)\\s*(?:let's|we\\s+can|we\\s+should|now\\s+let's|i\\s+will|i'll)\\s+(?:write|present|provide|formulate|draft|give|output|send|reply|answer|respond|summarize|deliver|produce)\\b[^\\n]*?[.:][ \\t]*\\r?\\n*")
+	trailingThoughtCloseBracketRe = regexp.MustCompile(`[ \t]*\)\][ \t]*$`)
 	fencedToolStartRe   = regexp.MustCompile("(?is)```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*(?:\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls|name|tool|tool_name|function)\\s*\"\\s*:|\\[\\s*\\{\\s*\"\\s*(?:name|tool|tool_name|function)\\s*\"\\s*:)")
 	xmlToolStartRe      = regexp.MustCompile("(?is)<(?:tool_call|tool_calls|function_call|function_calls)\\b")
 	bareToolEnvLineRe   = regexp.MustCompile("(?is)(?:^|\\r?\\n)[ \\t]*(\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls)\\s*\"\\s*:)")
@@ -139,6 +188,9 @@ func GeminiErrorReply(text string) string {
 		if lower == s || lower == bare || strings.HasPrefix(lower, bare) {
 			return s
 		}
+	}
+	if geminiCannedRefusalRe.MatchString(t) {
+		return lower
 	}
 	return ""
 }
@@ -388,6 +440,40 @@ func findInlineToolBlockStart(s string) int {
 	return best
 }
 
+func cleanInlineThoughtText(s string) string {
+	s = strings.TrimSpace(s)
+	if loc := thoughtBubbleHeaderRe.FindStringIndex(s); len(loc) == 2 && loc[0] == 0 {
+		s = strings.TrimSpace(s[loc[1]:])
+	} else {
+		s = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(s, "💭"), "🧠"))
+	}
+	s = strings.TrimSpace(trailingThoughtCloseBracketRe.ReplaceAllString(s, ""))
+	return s
+}
+
+func splitInlineThoughtAnswer(body string) (thoughtPart string, answerPart string, ok bool) {
+	if ansLoc := finalAnswerMarkerRe.FindStringIndex(body); len(ansLoc) == 2 {
+		ans := strings.TrimSpace(body[ansLoc[1]:])
+		if ans != "" {
+			return cleanInlineThoughtText(body[:ansLoc[0]]), ans, true
+		}
+	}
+	if idx := strings.Index(body, ")]"); idx >= 0 {
+		after := strings.TrimSpace(body[idx+2:])
+		if after != "" && !strings.HasPrefix(after, "```") && !strings.HasPrefix(after, "{") {
+			return cleanInlineThoughtText(body[:idx]), after, true
+		}
+	}
+	if locs := thoughtBubbleMetaSplitRe.FindAllStringIndex(body, -1); len(locs) > 0 {
+		last := locs[len(locs)-1]
+		ans := strings.TrimSpace(body[last[1]:])
+		if ans != "" {
+			return cleanInlineThoughtText(body[:last[1]]), ans, true
+		}
+	}
+	return "", "", false
+}
+
 func holdBackTrailingToolOpener(s string) string {
 	if strings.Count(s, "```")%2 == 1 {
 		if lastFence := strings.LastIndex(s, "```"); lastFence >= 0 && len(s)-lastFence <= 256 {
@@ -404,7 +490,13 @@ func holdBackTrailingToolOpener(s string) string {
 		lineStart = lastNL + 1
 	}
 	tailLine := strings.TrimLeft(s[lineStart:], " \t\r")
-	if tailLine != "" && (tailLine[0] == '`' || tailLine[0] == '<' || tailLine[0] == '{') {
+	if tailLine != "" && (tailLine[0] == '`' || tailLine[0] == '<' || tailLine[0] == '{' ||
+		strings.HasPrefix(strings.ToLower(tailLine), "let's ") ||
+		strings.HasPrefix(strings.ToLower(tailLine), "we can ") ||
+		strings.HasPrefix(strings.ToLower(tailLine), "we should ") ||
+		strings.HasPrefix(strings.ToLower(tailLine), "now let's ") ||
+		strings.HasPrefix(strings.ToLower(tailLine), "i will ") ||
+		strings.HasPrefix(strings.ToLower(tailLine), "i'll ")) {
 		return strings.TrimRight(s[:lineStart], " \t\r\n")
 	}
 	return strings.TrimRight(s, " \t\r\n")
@@ -425,27 +517,52 @@ func mayStartWithThinkingHeader(trimmed string) bool {
 
 func extractThinkingProcessBlock(text string, done bool) (restText string, thought string, ok bool) {
 	trimmed := strings.TrimLeft(text, " \t\r\n")
-	if trimmed == "" || !mayStartWithThinkingHeader(trimmed) {
+	if trimmed == "" {
+		return text, "", false
+	}
+	if !mayStartWithThinkingHeader(trimmed) {
+		if toolStart := findInlineToolBlockStart(text); toolStart > 0 {
+			before := strings.TrimSpace(text[:toolStart])
+			if strings.HasSuffix(before, ")]") {
+				return strings.TrimLeft(text[toolStart:], " \t\r\n"), cleanInlineThoughtText(before), true
+			}
+		}
 		return text, "", false
 	}
 	wsPrefixLen := len(text) - len(trimmed)
 	headSlice := utf8SafeSlice(text, wsPrefixLen+240)
-	hdrLoc := thinkingProcessHeaderRe.FindStringIndex(headSlice)
-	if len(hdrLoc) != 2 {
-		return text, "", false
+	if hdrLoc := thinkingProcessHeaderRe.FindStringIndex(headSlice); len(hdrLoc) == 2 {
+		body := text[hdrLoc[1]:]
+		if toolStart := findInlineToolBlockStart(body); toolStart >= 0 {
+			return strings.TrimLeft(body[toolStart:], " \t\r\n"), cleanInlineThoughtText(body[:toolStart]), true
+		}
+		if thoughtPart, ansPart, hasSplit := splitInlineThoughtAnswer(body); hasSplit {
+			return ansPart, thoughtPart, true
+		}
+		if !done {
+			safe := holdBackTrailingToolOpener(body)
+			return "", cleanInlineThoughtText(safe), true
+		}
+		return "", cleanInlineThoughtText(body), true
 	}
-	body := text[hdrLoc[1]:]
-	if toolStart := findInlineToolBlockStart(body); toolStart >= 0 {
-		return strings.TrimLeft(body[toolStart:], " \t\r\n"), strings.TrimSpace(body[:toolStart]), true
+	if hdrLoc := thoughtBubbleHeaderRe.FindStringIndex(headSlice); len(hdrLoc) == 2 {
+		body := text[hdrLoc[1]:]
+		if toolStart := findInlineToolBlockStart(body); toolStart >= 0 {
+			return strings.TrimLeft(body[toolStart:], " \t\r\n"), cleanInlineThoughtText(body[:toolStart]), true
+		}
+		if thoughtPart, ansPart, hasSplit := splitInlineThoughtAnswer(body); hasSplit {
+			return ansPart, thoughtPart, true
+		}
+		if !done {
+			safe := holdBackTrailingToolOpener(body)
+			return "", cleanInlineThoughtText(safe), true
+		}
+		if strings.HasSuffix(strings.TrimSpace(body), ")]") {
+			return "", cleanInlineThoughtText(body), true
+		}
+		return strings.TrimSpace(body), "", false
 	}
-	if !done {
-		safe := holdBackTrailingToolOpener(body)
-		return "", strings.TrimSpace(safe), true
-	}
-	if ansLoc := finalAnswerMarkerRe.FindStringIndex(body); len(ansLoc) == 2 {
-		return strings.TrimSpace(body[ansLoc[1]:]), strings.TrimSpace(body[:ansLoc[0]]), true
-	}
-	return "", strings.TrimSpace(body), true
+	return text, "", false
 }
 func joinThoughts(base string, extras []string) string {
 	if len(extras) == 0 {
@@ -509,7 +626,7 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 			code := extractErrCode(part)
 			return nil, classifyRPCErrorCode(code, part)
 		}
-		if tag == "e" {
+		if tag == "e" || tag == "di" || tag == "af.httprm" {
 			res.StreamEnd = true
 			continue
 		}
@@ -702,7 +819,7 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		if alt == "" {
 			alt = "Generated Image"
 		}
-		mdParts = append(mdParts, fmt.Sprintf("![%s](%s)", alt, img.URL))
+		mdParts = append(mdParts, fmt.Sprintf("![%s](%s)\n\n[Download Image (%s)](%s)", alt, img.URL, alt, img.URL))
 	}
 	for _, vid := range videos {
 		if strings.Contains(text, vid.URL) {
@@ -836,8 +953,18 @@ func extractGeneratedImages(c []any) []GeneratedImage {
 		if !googleUserContentRe.MatchString(rawURL) {
 			continue
 		}
-		fullURL := imageSizeSuffixRe.ReplaceAllString(rawURL, "") + "=s2048"
+		baseURL := imageSizeSuffixRe.ReplaceAllString(rawURL, "")
+		fullURL := baseURL + "=s0-d"
 		var title, alt string
+		var width, height int
+		if len(sub0_3) > 2 {
+			if w, ok := sub0_3[1].(float64); ok && w > 0 {
+				width = int(w)
+			}
+			if h, ok := sub0_3[2].(float64); ok && h > 0 {
+				height = int(h)
+			}
+		}
 		if len(item) > 3 {
 			if meta, ok := item[3].([]any); ok {
 				if len(meta) > 6 {
@@ -851,9 +978,14 @@ func extractGeneratedImages(c []any) []GeneratedImage {
 			}
 		}
 		images = append(images, GeneratedImage{
-			URL:   fullURL,
-			Title: title,
-			Alt:   alt,
+			URL:           fullURL,
+			DownloadURL:   baseURL + "=s0-d",
+			Title:         title,
+			Alt:           alt,
+			RevisedPrompt: alt,
+			Width:         width,
+			Height:        height,
+			IsGIF:         strings.HasSuffix(strings.ToLower(baseURL), ".gif"),
 		})
 	}
 	return images

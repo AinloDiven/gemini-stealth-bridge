@@ -30,7 +30,8 @@ var (
 	fencedToolCallRe        = regexp.MustCompile("(?is)```(?:json)?\\s*\\{\\s*\"(?:tool_calls|toolCalls|function_call)\"[\\s\\S]*?```")
 	trailingToolCallRe      = regexp.MustCompile(`(?s)\{\s*"(?:tool_calls|toolCalls|function_call)"[\s\S]*$`)
 	inlineThinkBlockRe      = regexp.MustCompile("(?is)<(?:think|thinking|thought)(?:\\s[^>]*)?>[\\s\\S]*?</(?:think|thinking|thought)\\s*>")
-	leakedThinkingProcessRe = regexp.MustCompile("(?is)^\\s*(?:#{1,6}\\s*)?(?:\\*\\*|__)?(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning)(?:\\*\\*|__)?\\s*:?[\\s\\S]*$")
+	leakedThinkingProcessRe   = regexp.MustCompile("(?is)^\\s*(?:(?:#{1,6}\\s*)?(?:\\*\\*|__)?(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning)(?:\\*\\*|__)?\\s*:?|(?:💭|🧠)\\s*\\r?\\n)[\\s\\S]*$")
+	leakedThoughtBubbleSplitRe = regexp.MustCompile("(?is)^\\s*(?:💭|🧠)[ \\t]*\\r?\\n+[\\s\\S]*?(?:^|\\n)\\s*(?:let's|we\\s+can|we\\s+should|now\\s+let's|i\\s+will|i'll)\\s+(?:write|present|provide|formulate|draft|give|output|send|reply|answer|respond|summarize|deliver|produce)\\b[^\\n]*?[.:][ \\t]*\\r?\\n*")
 	whitespaceCollapse      = regexp.MustCompile(`\s+`)
 	spoofedRoleLineRe       = regexp.MustCompile(`(?im)^(Assistant|Instruction|\[(?:Harness|Tool) reminder|\[Context note):`)
 )
@@ -420,6 +421,11 @@ func FlattenMessagesWithStats(
 			if inlineThinkBlockRe.MatchString(text) {
 				text = strings.TrimSpace(inlineThinkBlockRe.ReplaceAllString(text, ""))
 			}
+			if loc := leakedThoughtBubbleSplitRe.FindStringIndex(text); len(loc) == 2 && loc[0] == 0 {
+				if rest := strings.TrimSpace(text[loc[1]:]); rest != "" {
+					text = rest
+				}
+			}
 			if strings.Contains(text, "tool_calls") {
 				text = fencedToolCallRe.ReplaceAllString(text, "")
 				text = trailingToolCallRe.ReplaceAllString(text, "")
@@ -429,7 +435,6 @@ func FlattenMessagesWithStats(
 				text = ""
 			}
 		}
-
 		if role == "assistant" {
 			if tcs, ok := m["tool_calls"].([]any); ok && len(tcs) > 0 {
 				envCalls := make([]map[string]any, 0, len(tcs))
@@ -463,7 +468,7 @@ func FlattenMessagesWithStats(
 					})
 				}
 				envBytes, _ := json.Marshal(map[string]any{"tool_calls": envCalls})
-				if text != "" && !leakedThinkingProcessRe.MatchString(text) {
+				if text != "" && !leakedThinkingProcessRe.MatchString(text) && !strings.HasSuffix(strings.TrimSpace(text), ")]") {
 					text = text + "\n" + string(envBytes)
 				} else {
 					text = string(envBytes)
@@ -508,6 +513,8 @@ func FlattenMessagesWithStats(
 	header := ""
 	if len(sys) > 0 {
 		header = strings.Join(sys, "\n\n") + "\n\n"
+	} else if hasTools && opts.StartIndex > 0 && toolbridge.ShouldAugmentMediaTool(messages) {
+		header = "[Harness continuation turn — if a tool is needed, respond with ONLY the ```json {\"tool_calls\":[...]} ``` block.]\n\n"
 	}
 
 	reminder := ""

@@ -401,6 +401,7 @@ func (ac *AccountClient) streamGenerateLocked(
 	}
 	var (
 		lineBuf         strings.Builder
+		inOuterArray    bool
 		cid, rid        string
 		asyncVideoCID   string
 		frameCount      int
@@ -430,16 +431,16 @@ func (ac *AccountClient) streamGenerateLocked(
 		if parsed.AsyncVideoCID != "" {
 			asyncVideoCID = parsed.AsyncVideoCID
 		}
-		if parsed.ContextToken != "" {
-			sawContextToken = true
-		}
-		if parsed.StreamEnd {
-			sawStreamEnd = true
-		}
 		for _, f := range parsed.Frames {
 			if f.Done {
 				sawDone = true
 			}
+		}
+		if sawDone && parsed.ContextToken != "" {
+			sawContextToken = true
+		}
+		if parsed.StreamEnd {
+			sawStreamEnd = true
 		}
 		frameCount += len(parsed.Frames)
 		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.AnsweredModelID != "" || parsed.MediaToolActive || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
@@ -457,17 +458,12 @@ func (ac *AccountClient) streamGenerateLocked(
 		FreshSocket: opts.FreshSocket,
 		OnChunk: func(chunk string) error {
 			lineBuf.WriteString(chunk)
-			cur := lineBuf.String()
-			lastNL := strings.LastIndexByte(cur, '\n')
-			if lastNL < 0 {
-				return nil
-			}
-			complete := cur[:lastNL]
-			rem := cur[lastNL+1:]
+			envelopes, rem, nextInOuter := extractStreamEnvelopes(lineBuf.String(), inOuterArray, false)
+			inOuterArray = nextInOuter
 			lineBuf.Reset()
 			lineBuf.WriteString(rem)
-			for _, line := range strings.Split(complete, "\n") {
-				if err := emitLine(line); err != nil {
+			for _, env := range envelopes {
+				if err := emitLine(env); err != nil {
 					return err
 				}
 				if sawStreamEnd || (sawDone && sawContextToken) {
@@ -497,8 +493,9 @@ func (ac *AccountClient) streamGenerateLocked(
 
 	if res.Status == 200 {
 		if tail := strings.TrimSpace(lineBuf.String()); tail != "" {
-			for _, line := range strings.Split(tail, "\n") {
-				if err := emitLine(line); err != nil {
+			envelopes, _, _ := extractStreamEnvelopes(tail, inOuterArray, true)
+			for _, env := range envelopes {
+				if err := emitLine(env); err != nil {
 					var ue *transport.UpstreamError
 					if errors.As(err, &ue) && ue.Headers == nil {
 						ue.Headers = res.Headers
@@ -552,6 +549,151 @@ func (ac *AccountClient) streamGenerateLocked(
 		RID:     rid,
 		Body:    res.Body,
 	}, nil
+}
+
+// extractStreamEnvelopes incrementally extracts complete top-level ["wrb.fr",...],
+// ["er",...], ["e",...], or ["di",...] JSON array elements from a StreamGenerate
+// chunk buffer, supporting both single outer array streaming (with no newlines
+// between elements) and newline/length-delimited outer arrays.
+func extractStreamEnvelopes(buf string, inOuter bool, flushTail bool) (envelopes []string, rem string, nextInOuter bool) {
+	pos := 0
+	n := len(buf)
+	for pos < n {
+		if !inOuter {
+			for pos < n && (buf[pos] == ' ' || buf[pos] == '\t' || buf[pos] == '\r' || buf[pos] == '\n') {
+				pos++
+			}
+			if pos >= n {
+				return envelopes, "", false
+			}
+			if strings.HasPrefix(buf[pos:], ")]}'") {
+				pos += 4
+				continue
+			}
+			if strings.HasPrefix(buf[pos:], ")]}") && (pos+3 < n || flushTail) {
+				if pos+3 >= n || buf[pos+3] != '\'' {
+					pos += 3
+					continue
+				}
+			}
+			if buf[pos] >= '0' && buf[pos] <= '9' {
+				nl := strings.IndexByte(buf[pos:], '\n')
+				if nl < 0 {
+					if !flushTail {
+						return envelopes, buf[pos:], false
+					}
+					if isDigits(strings.TrimSpace(buf[pos:])) {
+						return envelopes, "", false
+					}
+				} else if isDigits(strings.TrimSpace(buf[pos : pos+nl])) {
+					pos += nl + 1
+					continue
+				}
+			}
+			if buf[pos] == '[' {
+				j := pos + 1
+				for j < n && (buf[j] == ' ' || buf[j] == '\t' || buf[j] == '\r' || buf[j] == '\n') {
+					j++
+				}
+				if j >= n {
+					if !flushTail {
+						return envelopes, buf[pos:], false
+					}
+					envelopes = append(envelopes, buf[pos:])
+					return envelopes, "", false
+				}
+				if buf[j] == '[' {
+					inOuter = true
+					pos = j
+					continue
+				}
+				if buf[j] == ']' {
+					pos = j + 1
+					continue
+				}
+			}
+			nl := strings.IndexByte(buf[pos:], '\n')
+			if nl >= 0 {
+				envelopes = append(envelopes, buf[pos:pos+nl])
+				pos += nl + 1
+				continue
+			}
+			if flushTail {
+				envelopes = append(envelopes, buf[pos:])
+				return envelopes, "", false
+			}
+			return envelopes, buf[pos:], false
+		}
+
+		for pos < n && (buf[pos] == ' ' || buf[pos] == '\t' || buf[pos] == '\r' || buf[pos] == '\n' || buf[pos] == ',') {
+			pos++
+		}
+		if pos >= n {
+			return envelopes, "", true
+		}
+		if buf[pos] == ']' {
+			inOuter = false
+			pos++
+			continue
+		}
+		if buf[pos] == '[' {
+			end := findBalancedJSONArrayEnd(buf, pos)
+			if end > pos {
+				envelopes = append(envelopes, "["+buf[pos:end]+"]")
+				pos = end
+				continue
+			}
+			if flushTail {
+				envelopes = append(envelopes, "["+buf[pos:])
+				return envelopes, "", false
+			}
+			return envelopes, buf[pos:], true
+		}
+		nl := strings.IndexByte(buf[pos:], '\n')
+		if nl >= 0 {
+			envelopes = append(envelopes, buf[pos:pos+nl])
+			pos += nl + 1
+			inOuter = false
+			continue
+		}
+		if flushTail {
+			envelopes = append(envelopes, buf[pos:])
+			return envelopes, "", false
+		}
+		return envelopes, buf[pos:], true
+	}
+	return envelopes, "", inOuter
+}
+
+func findBalancedJSONArrayEnd(s string, start int) int {
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if inStr {
+			if esc {
+				esc = false
+			} else if ch == '\\' {
+				esc = true
+			} else if ch == '"' {
+				inStr = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inStr = true
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
 }
 
 func (ac *AccountClient) pollAsyncVideoGenerationLocked(
@@ -699,7 +841,7 @@ func (ac *AccountClient) DownloadMedia(ctx context.Context, rawURL, fallbackURL 
 			continue
 		}
 		curURL := startURL
-		for hop := 0; hop < 6; hop++ {
+		for hop := 0; hop < 10; hop++ {
 			ac.mu.RLock()
 			cookie = ac.cookieHeader
 			ac.mu.RUnlock()
@@ -733,11 +875,19 @@ func (ac *AccountClient) DownloadMedia(ctx context.Context, rawURL, fallbackURL 
 				continue
 			}
 			if res.Status == 200 && len(res.Body) > 0 {
-				ct := res.Headers["content-type"]
-				if ct == "" {
-					ct = "application/octet-stream"
+				ct := strings.ToLower(strings.TrimSpace(res.Headers["content-type"]))
+				if strings.HasPrefix(ct, "text/plain") {
+					bodyStr := strings.TrimSpace(res.Body)
+					if strings.HasPrefix(bodyStr, "https://") || strings.HasPrefix(bodyStr, "http://") {
+						curURL = bodyStr
+						continue
+					}
 				}
-				return []byte(res.Body), ct, nil
+				origCT := res.Headers["content-type"]
+				if origCT == "" {
+					origCT = "application/octet-stream"
+				}
+				return []byte(res.Body), origCT, nil
 			}
 			break
 		}

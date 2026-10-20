@@ -51,17 +51,20 @@ Compatibility covers the endpoints and fields described below, not the entire Op
 
 ## What's new in v0.3.0
 
-Version `0.3.0` adds an embedded Web Control Plane, dual-window (`5h` + `Weekly`) quota telemetry, zero-conflict isolated browser login, native image & video generation across chat/agents/REST, and Docker packaging:
+Version `0.3.0` adds an embedded Web Control Plane, dual-window (`5h` + `7d Weekly`) quota telemetry, zero-conflict isolated browser login, native image & video generation across chat/agents/REST, hardened tool-call parsing with schema coercion, and Docker packaging:
 
-- **Embedded Web Control Plane (`/ui`)**: Zero-dependency HTML/CSS/JS dashboard compiled directly into the `gsb` binary (`./start.sh`, `gsb --web`, or `BRIDGE_WEB_UI=1`; compile-time removable via `-tags nowebui`). Displays side-by-side **Pool Connection** vs. **Individual Account** quick-connect keys, dual-window **5h & Weekly** quota progress bars, a `Current Turn` badge on the active rotation account, priority reordering (`↑`/`↓`), a compact `⋯` per-account action menu (Refresh, Pause/Resume, Clear Quarantine, Reset Failures, Copy Key, Remove), and live runtime configuration persisted to `$BRIDGE_HOME/config.json`.
-- **Dual-Window Quota Telemetry (`5h` + `7d Weekly`)**: Queries Gemini Web's GraphQL `GetUserQuotaService` (`GXU_FIVE_HOURLY` and `GXU_WEEKLY`) alongside `batchexecute` (`qpEbW`), exposing both the rolling **5-hour window (`2,400` credits)** and the **7-day weekly window (`48,384` credits)** with exact reset timestamps in `/v1/accounts`, `/ui`, and `gsb --accounts --accounts-live`. Effective 5-hour remaining credits are automatically capped when the weekly pool runs lower than the 5-hour window.
-- **Isolated Browser Login (Zero Cookie-Rotation Conflicts)**: `gsb --login <name>` and the Web UI's **Launch Isolated Browser** button spawn a temporary Chrome/Chromium instance with a disposable `--user-data-dir`, wait for Google sign-in via CDP, capture the cookies, and immediately close and delete the temporary profile so no browser process ever competes with `gsb` for `__Secure-1PSIDTS` cookie rotation. Includes `gsb --login-helper` (`127.0.0.1:20134`) for one-click desktop popup login when managing a remote VPS over SSH port forwarding, plus guided Incognito cookie paste.
-- **Native Image & Video Generation (Chat, Coding Agents, and REST)**:
-  - **Coding Agent Mode (`tools` enabled)**: Automatically injects a built-in server-side `generate_media` tool (`media_type: "image" | "video"`, `prompt`). When invoked by the model, `gsb` runs the generation on Gemini Web, proxies the resulting image or video at `GET /v1/media/<id>.jpg|.mp4`, and returns the local URL, Markdown snippet, and ready-to-run `curl` command to the agent in the same turn.
-  - **Direct Chat / Responses**: Prompts asking for an image or video automatically enable Gemini Web's native media extensions and rewrite upstream `lh3.googleusercontent.com` / `contribution.usercontent.google.com` URLs to local `/v1/media/<id>` URLs that require no Google cookies.
-  - **OpenAI Endpoints**: `POST /v1/images/generations` (`url` or `b64_json`) and `POST /v1/videos/generations` (Veo MP4 with audio + thumbnail URL).
-- **Hardened Tool-Call Parser & Account Health**: Strips redundant closing braces/brackets emitted by lightweight models (`gemini-flash-lite`) inside tool envelopes, detects unbalanced brackets in `{"tool_calls":[...` for automatic retry, and excludes schema/client `tool_call_error` from marking an account `degraded`.
-- **Zero-CGO Docker Packaging**: Multi-stage `Dockerfile` (~14 MB Alpine image, non-root `uid 10001`, built-in `--healthcheck`) and `docker-compose.yml` with persistent `/data` volume.
+1. **Embedded Web Control Plane (`/ui`)**: Zero-dependency fluid full-width HTML/CSS/JS dashboard compiled directly into the `gsb` binary (`./start.sh`, `gsb --web`, or `BRIDGE_WEB_UI=1`; compile-time removable via `-tags nowebui`). Displays side-by-side **Pool Connection** vs. **Individual Account** quick-connect keys, dual-window **5h & Weekly** quota progress bars, a `Current Turn` badge on the active rotation account, priority reordering (`↑`/`↓`), a compact `⋯` per-account action menu (Refresh, Pause/Resume, Clear Quarantine, Reset Failures, Copy Key, Remove), and live runtime configuration persisted to `$BRIDGE_HOME/config.json`.
+2. **Dual-Window Quota Telemetry (`5h` + `7d Weekly`)**: Queries Gemini Web's GraphQL `GetUserQuotaService` (`GXU_FIVE_HOURLY` and `GXU_WEEKLY`) alongside `batchexecute` (`qpEbW`), exposing both the rolling **5-hour window (`2,400` credits)** and the **7-day weekly window (`48,384` credits)** with exact reset timestamps in `/v1/accounts`, `/ui`, and `gsb --accounts --accounts-live`. Effective 5-hour remaining credits are automatically capped when the weekly pool runs lower than the 5-hour window.
+3. **Isolated Browser Login (Zero Cookie-Rotation Conflicts)**: `gsb --login <name>` and the Web UI's **Launch Isolated Browser** button spawn a temporary Chrome/Chromium/Brave/Edge instance with a disposable `--user-data-dir`, auto-detect Google sign-in completion (`SAPISID`) via CDP, capture the cookies, and immediately close and delete the temporary profile so no browser process ever competes with `gsb` for `__Secure-1PSIDTS` cookie rotation. Includes `gsb --login-helper` (`127.0.0.1:20134`) for one-click desktop popup login when managing a remote VPS over SSH port forwarding, plus guided Incognito cookie paste.
+4. **Native Image & Video Generation (Chat, Coding Agents, and REST)**:
+   - **Coding Agent Mode (`tools` enabled)**: Intent-gated injection of the built-in `generate_media` tool (`media_type`, `prompt`, `aspect_ratio`, `format`, `duration`, `output_path`) only when the prompt requests visual/image/diagram/video generation—keeping `SessionCache` fingerprints intact on normal coding turns. When invoked (or when Gemini Web triggers its native image generator directly), `gsb` proxies the media at `GET /v1/media/<id>.png|.jpg|.mp4` and guides the agent through saving the file directly into the user's workspace via `curl`.
+   - **Full-Resolution `=s0-d` & Lossless PNG `=s0-rp`**: Downloads unscaled original images (`=s0-d`) by default, supports lossless PNG (`=s0-rp`) when `format: "png"` is requested, follows application-level `text/plain` redirects (`?alr=yes`), and extracts Gemini Web's internal `modelDescription` as `revised_prompt`.
+   - **OpenAI Endpoints & Direct Chat**: `POST /v1/images/generations` (`url` or `b64_json`, `size`/`aspect_ratio`, `output_format`/`format`) and `POST /v1/videos/generations` (Veo MP4 with audio, `aspect_ratio`, `duration`, and `thumbnail_url`), plus automatic `/v1/media/<id>` URL rewriting in direct chat.
+5. **Hardened Tool-Call Parser, Schema Coercion & Refusal Recovery**:
+   - **Automatic Schema Coercion**: Coerces stringified numbers, booleans, and JSON objects/arrays emitted by smaller models into the exact types declared by the tool's JSON Schema.
+   - **Redundant Brace/Bracket Repair**: Strips stray closing braces/brackets (`}}]}}`) outside string literals and detects truncated `{"tool_calls":[...` arrays for automatic retry so raw JSON envelopes never leak as plain answer text.
+   - **Refusal Recovery**: Extracts valid tool calls even when preceded by refusal prose, retries automatically when a model refuses a required tool turn, and excludes client/schema `tool_call_error` from marking an account `degraded`.
+6. **Zero-CGO Docker Packaging**: Multi-stage `Dockerfile` (~14 MB Alpine image, non-root `uid 10001`, built-in `--healthcheck`) and `docker-compose.yml` with persistent `/data` volume.
 ## Quick start
 
 ### 1. Build
@@ -153,17 +156,13 @@ Cookie imports bootstrap the account against Gemini Web before reporting success
 ./gsb --login acc1
 ```
 
-The helper opens Gemini Web and waits for terminal input. Sign in, then press Enter to import from the selected local profile, or paste a cookie header / single-line JSON export. It does not automatically detect completion of login. Without a profile hint, the opened default browser and the auto-detected cookie profile may differ.
+`--login` launches a temporary Chrome/Chromium/Brave/Edge window using a disposable `--user-data-dir`, opens `https://gemini.google.com/app`, and monitors cookies via CDP (with a terminal prompt fallback if no local browser is available). As soon as Google sign-in completes and the `SAPISID` cookie is present, `gsb` captures the session, verifies it against Gemini Web, and deletes the temporary browser directory so no background browser process ever competes with `gsb` for `__Secure-1PSIDTS` rotation:
 
-Prefer `--login` over copying cookies out of a browser that was never signed in to Gemini. A profile that has not completed Google sign-in holds cookies that expire within minutes, so an import can look successful and then fail almost immediately with `401 upstream_auth_error` or `code 1016`. Signing in first, then capturing, is the reliable path:
+1. Run `./gsb --login <name>` and complete Google sign-in in the opened isolated browser window, including any 2FA or "verify it's you" prompt.
+2. If operating on a headless server without a local browser, paste a `Cookie` header or Cookie-Editor JSON export exported from an **Incognito** window that you immediately close after copying.
+3. Run `./gsb --probe` and confirm the account reports models and 5h/weekly quota without an auth error.
 
-1. Run `./gsb --login <name>` and complete Google sign-in in the opened browser, including any 2FA or "verify it's you" prompt.
-2. Open `https://gemini.google.com/app` and send one message, so the session is fully established.
-3. Press Enter in the terminal to capture the session.
-4. Run `./gsb --probe` and confirm the account reports models without an auth error.
-
-If an account later starts failing with an expired-session error, repeat the login instead of re-exporting the same stale cookies. `./gsb --rotate` only renews rotating cookies such as `__Secure-1PSIDTS`; it cannot restore a revoked or never-established sign-in.
-
+If an account later starts failing with an expired-session error, repeat `gsb --login <name>` instead of re-exporting stale cookies. `./gsb --rotate` only renews rotating cookies such as `__Secure-1PSIDTS`; it cannot restore a revoked or never-established sign-in.
 ### Reuse a signed-in browser profile
 
 Despite its name, `--import-chrome` also recognizes other Chromium browsers and Firefox cookie databases. No browser is launched during import. Use this only when that browser profile is already signed in to Gemini.
@@ -319,11 +318,20 @@ For multi-turn calls, resend the conversation in `input`, including assistant ou
 
 ### 1. Coding Agent Mode (`tools` enabled)
 
-When a coding agent (`OpenCode`, `OMP`, `Cursor`, `Cline`, etc.) sends a `/v1/chat/completions` or `/v1/responses` request with `tools`, `gsb` automatically injects a built-in server-side tool named `generate_media` (`media_type: "image" | "video"`, `prompt`). When the model calls `generate_media`:
+When a coding agent (`OpenCode`, `OMP`, `Cursor`, `Cline`, etc.) sends a `/v1/chat/completions` or `/v1/responses` request with `tools` and the user prompt asks for an image, diagram, illustration, or video, `gsb` injects a built-in server-side tool named `generate_media` (leaving non-media coding turns untouched so `SessionCache` hits are preserved).
 
-1. `gsb` intercepts the call on the server and generates the image or video on Gemini Web.
-2. `gsb` caches/proxies the media at `http://127.0.0.1:20133/v1/media/<id>.jpg|.mp4`.
-3. `gsb` feeds the tool result (including `url`, `markdown`, and a ready-to-run `local_download_cmd` `curl` command) back to the model in the same turn so the agent can save the file directly to your project directory via `bash` or embed it in its reply.
+Supported `generate_media` parameters:
+- `media_type` (`"image"` | `"video"`, required)
+- `prompt` (detailed visual description, required)
+- `aspect_ratio` (`"1:1"`, `"16:9"`, `"9:16"`, `"4:3"`, `"3:4"`)
+- `format` (`"png"` for lossless `=s0-rp` diagrams/text, `"jpeg"` for original unscaled `=s0-d`, or `"gif"`)
+- `duration` (`10`, `15`, or `30` seconds for video)
+- `output_path` (optional relative path in the user's workspace, e.g. `./gsb-workflow.png`)
+
+When the model invokes `generate_media` (or triggers Gemini Web's native media generator directly on a tool-enabled turn):
+1. `gsb` runs the generation on Gemini Web and downloads the full-resolution media (`=s0-d` / `=s0-rp`, following any `?alr=yes` redirects).
+2. `gsb` caches and serves the file at `http://127.0.0.1:20133/v1/media/<id>.png|.jpg|.mp4`.
+3. `gsb` feeds the tool result (including `url`, `revised_prompt`, `markdown`, and a ready-to-run `local_download_cmd` `curl` command) back into a continuation turn with the full tool contract so the coding agent saves the file directly into your project workspace via `bash`.
 
 ### 2. Direct Chat / Responses (without tools)
 
@@ -331,24 +339,23 @@ Ask for an image or video in a normal chat request; `gsb` enables Gemini Web's m
 
 ### 3. Dedicated OpenAI Media Endpoints
 
-Generate an image (`url` or `b64_json`):
+Generate an image (`url` or `b64_json`, with optional `aspect_ratio` / `size` and `format` / `output_format`):
 
 ```sh
 curl -sS http://127.0.0.1:20133/v1/images/generations \
   -H 'Authorization: Bearer public' \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"Minimalist flat vector icon of a golden compass on a dark navy background","response_format":"url"}'
+  -d '{"prompt":"Minimalist flat vector architecture diagram of an API bridge in light mode","aspect_ratio":"16:9","format":"png","response_format":"url"}'
 ```
 
-Generate a video (Veo MP4 with audio, typically 60–150 seconds):
+Generate a video (Veo MP4 with audio, typically 60–150 seconds, with optional `aspect_ratio` and `duration`):
 
 ```sh
 curl -sS --max-time 180 http://127.0.0.1:20133/v1/videos/generations \
   -H 'Authorization: Bearer public' \
   -H 'Content-Type: application/json' \
-  -d '{"prompt":"A glowing neon paper airplane flying smoothly through a rainy cyberpunk alley at night"}'
+  -d '{"prompt":"A glowing neon paper airplane flying smoothly through a rainy cyberpunk alley at night","aspect_ratio":"16:9","duration":10}'
 ```
-
 ## Docker deployment
 
 Build and run the multi-stage zero-CGO container (`~14 MB` Alpine runtime, non-root `uid 10001`, Web UI enabled on `:20133`):

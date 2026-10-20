@@ -660,3 +660,12 @@ func TestToolSchemaCompactionParity(t *testing.T) {
 		t.Fatalf("expected valid call to pass validation, got res=%+v err=%v", res, err)
 	}
 }
+
+func TestSafeStreamablePrefixAllowsMarkdownCodeBlocksAndLinks(t *testing.T) {
+	mdReview := "Berikut adalah hasil investigasi alur penanganan error `HTTP 403` di [server.js](server.js#L192):\n\n```javascript\nfunction isFreeTierCliGateError(status, errType, errMsg) {\n  if (status < 400) return false;\n  return errType === \"FreeTierError\";\n}\n```\n\n" +
+		strings.Repeat("Penjelasan tambahan mengenai arsitektur dan mitigasi blokir IP jaringan secara mendetail. ", 6)
+	got := SafeStreamablePrefix(mdReview)
+	if got == "" || !strings.Contains(got, "function isFreeTierCliGateError") {
+		t.Fatalf("expected SafeStreamablePrefix to stream markdown with JS code blocks and braces, got len=%d: %q", len(got), got)
+	}
+}
