@@ -117,9 +117,9 @@ The same grounding is exposed as an MCP tool at `POST /mcp` (alias `/v1/mcp`), s
 }
 ```
 
-The tool is `web_search` with a required `query` argument and an optional `model` override. The endpoint speaks MCP Streamable HTTP with JSON-RPC 2.0: it is `POST`-only (no server-initiated stream), notifications get a `202` with an empty body, and the pool, group, and account keys are all accepted. A search runs as a temporary chat, so it does not add threads to the user's Gemini conversation list, and it consumes the same account quota as a normal request.
+The tool is `web_search` with a required `query` argument, an optional `model` override, and an optional `timeout_seconds` deadline (10–600s, default 180s, set with `BRIDGE_SEARCH_TIMEOUT_MS`). The endpoint speaks MCP Streamable HTTP with JSON-RPC 2.0: it is `POST`-only (no server-initiated stream), notifications get a `202` with an empty body, and the pool, group, and account keys are all accepted. A search runs as a temporary chat, so it does not add threads to the user's Gemini conversation list, and it consumes the same account quota as a normal request.
 
-A grounded answer is a full model turn and takes as long as the model thinks (measured between 14 and 110 seconds). When reporting a slow or "hung" search, check whether a request is still in flight before assuming the endpoint is broken.
+A grounded answer is a full model turn and takes as long as the model thinks (measured between 14 and 110 seconds). When reporting a slow or "hung" search, check whether a request is still in flight before assuming the endpoint is broken, and tell the user to set a generous client timeout rather than a search-API-sized one.
 
 ## Per-account proxies
 

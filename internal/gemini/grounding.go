@@ -73,6 +73,11 @@ func stripTextFragment(u string) string {
 
 // MergeGroundingSources appends sources that are not already present, keyed by
 // URL, so the same citation is not repeated across stream frames.
+//
+// The dedupe scans the accumulated list, which holds one entry per distinct
+// citation. Gemini returns a handful of sources per search, so the scan stays
+// short, and it avoids a shared cache that would be a data race between
+// concurrent requests.
 func MergeGroundingSources(dst []GroundingSource, src []GroundingSource) []GroundingSource {
 	for _, s := range src {
 		dup := false

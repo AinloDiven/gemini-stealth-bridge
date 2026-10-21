@@ -14,7 +14,7 @@ import (
 )
 
 // Version is the build version of gemini-stealth-bridge (overridable via -ldflags).
-var Version = "0.3.0"
+var Version = "0.4.0"
 
 // Config holds all runtime settings for the gemini-stealth-bridge daemon.
 // Environment variables are 100% compatible with gemini-app-bridge.
@@ -29,6 +29,7 @@ type Config struct {
 	AccountTokens           map[string]string
 	GroupTokens             map[string]string
 	IncludeGrounding        bool
+	SearchTimeout           time.Duration
 	Temporary               bool
 	RejectDowngrade         bool
 	LiveThoughts            bool
@@ -289,6 +290,7 @@ func FromEnv() *Config {
 		AccountTokens:           tokens,
 		GroupTokens:             groupTokens,
 		IncludeGrounding:        lookupBool("BRIDGE_INCLUDE_GROUNDING", true),
+		SearchTimeout:           time.Duration(lookupPositiveInt("BRIDGE_SEARCH_TIMEOUT_MS", 180000, 10000)) * time.Millisecond,
 		Temporary:               lookupBool("BRIDGE_TEMPORARY", false),
 		RejectDowngrade:         lookupBool("BRIDGE_REJECT_DOWNGRADE", true),
 		LiveThoughts:            lookupBool("BRIDGE_LIVE_THOUGHTS", true),

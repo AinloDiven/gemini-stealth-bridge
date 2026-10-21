@@ -17,6 +17,7 @@ The daemon runs without headless Chrome or CDP. Browserless transport is an impl
 ## Contents
 
 - [Capabilities and limits](#capabilities-and-limits)
+- [What's new in v0.4.0](#whats-new-in-v040)
 - [What's new in v0.3.0](#whats-new-in-v030)
 - [Quick start](#quick-start)
 - [Web Control Plane (`/ui`)](#web-control-plane-ui)
@@ -59,6 +60,15 @@ Compatibility covers the endpoints and fields described below, not the entire Op
 - Function calling is prompt-based, not native Gemini Developer API function calling. Malformed or schema-invalid calls can fail with `tool_call_error`.
 - Token usage is estimated locally, not reported by Google's billing/tokenizer API. The model registry advertises a 1,048,576-token context window and 65,536-token output limit as metadata, not a guarantee for every account or request.
 - Audio input/output, embeddings, and the general OpenAI Files API are not exposed. Internal text-attachment offloading is not a general file-upload API.
+
+## What's new in v0.4.0
+
+Version `0.4.0` adds Google Search grounding with citation extraction, a built-in MCP server, per-account egress proxies, and group keys for multi-user deployments:
+
+1. **Web Search Grounding (`Sources:`)**: When Gemini Web answers with Google Search grounding, `gsb` extracts the cited pages and appends them to the answer as a numbered `Sources:` list of title and URL. `BRIDGE_INCLUDE_GROUNDING=0` returns the answer without the citation list.
+2. **Built-in MCP Server (`POST /mcp`, `/v1/mcp`)**: A Streamable HTTP MCP endpoint (JSON-RPC 2.0: `initialize`, `tools/list`, `tools/call`, `ping`) exposes the same grounding as a `web_search` tool for Claude Code, Cursor, OMP, and other MCP clients. It accepts `query`, an optional `model` override, and an optional `timeout_seconds` deadline (10–600s, default 180s, overridable with `BRIDGE_SEARCH_TIMEOUT_MS`). Searches run on the same account pool, quota accounting, and failover as chat requests, and each search is a temporary conversation, so it does not add threads to the account's Gemini history.
+3. **Per-Account Egress Proxies**: `BRIDGE_EGRESS_PER_ACCOUNT="acct-a:socks5://127.0.0.1:1081,acct-b:http://proxy.example:3128"` (or `proxyUrl` in an account file / the Web UI's *Outbound Proxy* field) sends each account through its own HTTP or SOCKS5 proxy. Accounts without one keep using `BRIDGE_PROXY_SERVER`; changing a proxy rebuilds that account's transport session.
+4. **Group Keys for Multi-User Deployments**: `BRIDGE_GROUP_TOKENS="alice-key:team-a,bob-key:team-b"` maps a token to an account group (`BRIDGE_ACCOUNT_GROUP`), so each user's key serves only that group's accounts, fails over inside the group, and never consumes another group's quota. The pool key still spans every loaded account, and account keys still pin exactly one.
 
 ## What's new in v0.3.0
 
@@ -146,11 +156,12 @@ Start `gsb` with `./start.sh`, `./gsb --web`, or `BRIDGE_WEB_UI=1` and open `htt
 
 ### 4. Send a request
 
-There are two kinds of key. Pick one:
+There are three kinds of key. Pick one:
 
 | Key | Value | Behavior |
 |---|---|---|
 | **Pool key** | `BRIDGE_API_KEY` (default `public`) | Routes each request across all loaded accounts using `BRIDGE_ACCOUNT_STRATEGY`. Use this normally |
+| **Group key** | `BRIDGE_GROUP_TOKENS` entry (`token:group`) | Serves only the accounts of its group and fails over inside that group. Use this in multi-user deployments |
 | **Account key** | `gsb-<name>` or `<name>` | Pins the request to that account and never fails over. Use this to test or isolate one account |
 
 List the models available to the pool:
@@ -460,18 +471,20 @@ All `/v1/*` endpoints below use the same authentication resolver. Account keys s
 
 The daemon listens on loopback by default. **`BRIDGE_API_KEY` defaults to `public`, and unauthenticated access is allowed in that mode.**
 
-Two kinds of key exist, and they do different things:
+Three kinds of key exist, and they do different things:
 
-| | **Pool key** | **Account key** |
-|---|---|---|
-| Value | `BRIDGE_API_KEY` (default `public`) | `gsb-<name>` and `<name>` |
-| Scope | All loaded accounts | Exactly one account |
-| Account selection | Automatic, per `BRIDGE_ACCOUNT_STRATEGY` | None; the named account is always used |
-| Failover on quota, ban, or failure | Yes | No; the error is returned to the caller |
-| `/v1/accounts` and `/v1/quota` | All accounts | Only the named account |
-| Best for | Normal use, agents, routers | Testing one account, per-project quota isolation |
+| | **Pool key** | **Group key** | **Account key** |
+|---|---|---|---|
+| Value | `BRIDGE_API_KEY` (default `public`) | A `BRIDGE_GROUP_TOKENS` entry (`token:group`) | `gsb-<name>` and `<name>` |
+| Scope | All loaded accounts | The accounts assigned to one group via `BRIDGE_ACCOUNT_GROUP` | Exactly one account |
+| Account selection | Automatic, per `BRIDGE_ACCOUNT_STRATEGY` | Automatic, inside the group only | None; the named account is always used |
+| Failover on quota, ban, or failure | Yes | Yes, but only among the group's accounts | No; the error is returned to the caller |
+| `/v1/accounts` and `/v1/quota` | All accounts | Only the group's accounts | Only the named account |
+| Best for | Normal use, agents, routers | Multi-user deployments where each user has their own accounts | Testing one account, per-project quota isolation |
 
-Use the pool key unless you specifically need to pin an account. Pool routing is described under `BRIDGE_ACCOUNT_STRATEGY` below.
+Group keys are the right shape for a shared daemon. Assign each user's accounts to a group (`BRIDGE_ACCOUNT_GROUP="acct-a:team-a,acct-b:team-a"`) and map a token to that group (`BRIDGE_GROUP_TOKENS="alice-key:team-a"`). Alice's traffic then stays on Alice's accounts, fails over only inside them, and never spends another user's quota. A group key cannot reach accounts outside its group, and `/v1/accounts` and `/v1/quota` show it only that group's accounts.
+
+Use the pool key unless you specifically need to pin an account or isolate a user. Pool routing is described under `BRIDGE_ACCOUNT_STRATEGY` below.
 
 - `BRIDGE_API_KEY=public` means the pool key is `public` and requests without a key are accepted. Set `BRIDGE_API_KEY` to a random value before exposing the daemon beyond loopback; the account keys then keep working alongside it.
 - Account keys are registered for every loaded account file. They are predictable from the filename, so treat them as routing aliases, not secrets. Setting a pool key does not remove them.
@@ -551,6 +564,7 @@ Duration values are in milliseconds.
 | `BRIDGE_MAX_SESSIONS` | `16` | Transport session-pool limit |
 | `BRIDGE_MAX_QUEUE` | `4` | Per-session wait-queue bound |
 | `BRIDGE_SESSION_WAIT_MS` | `10000` | Wait timeout for an available transport session |
+| `BRIDGE_SEARCH_TIMEOUT_MS` | `180000` | Default deadline for one `web_search` MCP call; clamped to 10s–600s. A caller can override it per call with the `timeout_seconds` argument |
 
 For example, use an outbound proxy without changing the local API address:
 
@@ -595,21 +609,25 @@ When Gemini Web answers with Google Search grounding, `gsb` extracts the citatio
 ---
 Sources:
 1. Article title — https://example.com/article
-   optional snippet from the search result
+2. Another page — https://example.com/other
 ```
 
-Set `BRIDGE_INCLUDE_GROUNDING=0` to return the answer without the citation list.
+Set `BRIDGE_INCLUDE_GROUNDING=0` to return the answer without the citation list. The MCP `web_search` result uses the same `Sources:` block and additionally includes a snippet line for each source when Gemini provided one.
 
-A grounded answer is a full model turn, so it takes as long as the model thinks — typically 15–120 seconds, more for a complex question. Give the client a generous timeout.
+A grounded answer is a full model turn, not a search-API lookup: Gemini has to run the query, read the results, and write the synthesis. Measured searches on a live pool took **14–110 seconds**, so give the client a generous timeout rather than the few seconds a conventional search API needs. Cutting a search short throws away the quota it already spent.
+
+The MCP `web_search` call has its own deadline, defaulting to `180000` ms (`180s`). Set `BRIDGE_SEARCH_TIMEOUT_MS` to change that default for the deployment; it is clamped to 10s–600s. A caller can override it per call with the `timeout_seconds` argument (10–600, seconds), which is useful for clients that abort tool calls on their own shorter schedule.
 
 The same grounding is exposed as an MCP tool, so a coding agent can search the web through the account pool (with its quota accounting and failover):
 
 ```sh
-curl -sS http://127.0.0.1:20133/mcp \
+curl -sS --max-time 240 http://127.0.0.1:20133/mcp \
   -H 'Authorization: Bearer gsb-pool' \
   -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"latest Go release notes"}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"latest Go release notes","timeout_seconds":180}}}'
 ```
+
+The `web_search` tool takes a required `query`, an optional `model` override (`gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-argon`), and the optional `timeout_seconds` deadline described above.
 
 Configure it in a client as an MCP server over Streamable HTTP:
 

@@ -3,10 +3,13 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
@@ -46,6 +49,32 @@ type mcpResponse struct {
 	ID      json.RawMessage `json:"id,omitempty"`
 	Result  any             `json:"result,omitempty"`
 	Error   *mcpError       `json:"error,omitempty"`
+}
+
+// mcpCallInfo describes the search behind the current MCP response, so the
+// handler can expose it as diagnostic headers.
+type mcpCallInfo struct {
+	AccountID  string
+	Model      string
+	DurationMs int64
+	Sources    int
+}
+
+// mcpCallInfoKey is the context key carrying the per-request call info.
+type mcpCallInfoKey struct{}
+
+// withMcpCallInfo returns a context that carries a mutable call-info slot for
+// this request only. It is request-scoped so concurrent MCP calls cannot mix up
+// each other's diagnostics.
+func withMcpCallInfo(ctx context.Context) (context.Context, *mcpCallInfo) {
+	info := &mcpCallInfo{}
+	return context.WithValue(ctx, mcpCallInfoKey{}, info), info
+}
+
+// mcpCallInfoFrom returns the call info attached to a context, if any.
+func mcpCallInfoFrom(ctx context.Context) *mcpCallInfo {
+	info, _ := ctx.Value(mcpCallInfoKey{}).(*mcpCallInfo)
+	return info
 }
 
 // HandleMCP serves the MCP Streamable HTTP transport.
@@ -93,10 +122,25 @@ func (s *Server) HandleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := s.dispatchMCP(r.Context(), scope, &req)
+	ctx, _ := withMcpCallInfo(r.Context())
+	resp := s.dispatchMCP(ctx, scope, &req)
 	if resp == nil {
 		w.WriteHeader(http.StatusAccepted)
 		return
+	}
+	// The diagnostic headers let a caller see which account served the search
+	// and how long it took, the same way the chat and responses endpoints do.
+	if info := mcpCallInfoFrom(ctx); info != nil {
+		if info.AccountID != "" {
+			w.Header().Set("X-GSB-Account", info.AccountID)
+		}
+		if info.Model != "" {
+			w.Header().Set("X-GSB-Model", info.Model)
+		}
+		w.Header().Set("X-GSB-Duration-Ms", strconv.FormatInt(info.DurationMs, 10))
+		if info.Sources > 0 {
+			w.Header().Set("X-GSB-Sources", strconv.Itoa(info.Sources))
+		}
 	}
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
@@ -153,6 +197,9 @@ func (s *Server) dispatchMCP(ctx context.Context, scope AuthScope, req *mcpReque
 			Arguments struct {
 				Query string `json:"query"`
 				Model string `json:"model"`
+				// TimeoutSeconds caps how long the search may take. A grounded
+				// answer is a full model turn, so the default has to be generous.
+				TimeoutSeconds int `json:"timeout_seconds"`
 			} `json:"arguments"`
 		}
 		if json.Unmarshal(req.Params, &p) != nil {
@@ -165,7 +212,8 @@ func (s *Server) dispatchMCP(ctx context.Context, scope AuthScope, req *mcpReque
 		if query == "" {
 			return ok(mcpToolText("query is required"))
 		}
-		text, err := s.mcpWebSearch(ctx, scope, query, strings.TrimSpace(p.Arguments.Model))
+		timeout := s.mcpSearchTimeout(p.Arguments.TimeoutSeconds)
+		text, err := s.mcpWebSearch(ctx, scope, query, strings.TrimSpace(p.Arguments.Model), timeout)
 		if err != nil {
 			return ok(mcpToolText("search failed: " + err.Error()))
 		}
@@ -185,6 +233,41 @@ func mcpToolText(msg string) map[string]any {
 	}
 }
 
+// mcpSearchTimeout resolves the per-call search deadline.
+//
+// A grounded answer is a full model turn, so the default is generous: the
+// measured range on a live pool is 14 to 110 seconds, and cutting a search
+// short throws away the quota it already spent. A caller can pass
+// timeout_seconds to override it, and the operator can change the default
+// with BRIDGE_SEARCH_TIMEOUT_MS.
+func (s *Server) mcpSearchTimeout(requested int) time.Duration {
+	const (
+		minTimeout = 10 * time.Second
+		maxTimeout = 600 * time.Second
+	)
+	def := s.Cfg.SearchTimeout
+	if def <= 0 {
+		def = 180 * time.Second
+	}
+	if def < minTimeout {
+		def = minTimeout
+	}
+	if def > maxTimeout {
+		def = maxTimeout
+	}
+	if requested <= 0 {
+		return def
+	}
+	d := time.Duration(requested) * time.Second
+	if d < minTimeout {
+		return minTimeout
+	}
+	if d > maxTimeout {
+		return maxTimeout
+	}
+	return d
+}
+
 // mcpWebSearchToolDef describes the web_search tool and its JSON Schema.
 func mcpWebSearchToolDef() map[string]any {
 	return map[string]any{
@@ -202,6 +285,10 @@ func mcpWebSearchToolDef() map[string]any {
 				"model": map[string]any{
 					"type":        "string",
 					"description": "Optional model override (gemini-flash, gemini-flash-lite, gemini-pro, gemini-argon).",
+				},
+				"timeout_seconds": map[string]any{
+					"type":        "integer",
+					"description": "Optional deadline for the search in seconds (10-600, default 180). A grounded answer is a full model turn and usually takes 15-110 seconds.",
 				},
 			},
 			"required": []any{"query"},
@@ -238,7 +325,18 @@ func resolveSearchModel(a *AccountState, requested string) *gemini.ModelInfo {
 // The search runs as a temporary chat so the user's Gemini conversation list
 // stays clean, and it is not stored in the session-continuation cache, so a
 // later coding-agent turn cannot inherit a half-written search thread.
-func (s *Server) mcpWebSearch(ctx context.Context, scope AuthScope, query, requestedModel string) (string, error) {
+//
+// A search is one full model turn, so it can take minutes. The deadline caps
+// the whole call, including failover, and every attempt is logged with its own
+// timing so a slow search can be told apart from a stuck one.
+func (s *Server) mcpWebSearch(ctx context.Context, scope AuthScope, query, requestedModel string, timeout time.Duration) (string, error) {
+	startedAt := time.Now()
+	if timeout <= 0 {
+		timeout = s.mcpSearchTimeout(0)
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	accts := s.scopedAccounts(scope)
 	if len(accts) == 0 {
 		return "", transport.NewUpstreamError("no accounts available for this api key", 503, "auth_unavailable", nil, nil)
@@ -262,7 +360,47 @@ func (s *Server) mcpWebSearch(ctx context.Context, scope AuthScope, query, reque
 		text, sources, err := s.runSearchOnAccount(ctx, acct, model, query)
 		if err != nil {
 			lastErr = err
+			code := mcpErrorCode(err)
+			if info := mcpCallInfoFrom(ctx); info != nil {
+				info.AccountID = acct.ID
+				info.Model = model.ModelName
+				info.DurationMs = time.Since(startedAt).Milliseconds()
+			}
+			s.logRequestJSON(map[string]any{
+				"endpoint":   "/mcp",
+				"tool":       mcpToolWebSearch,
+				"account":    acct.ID,
+				"model":      model.ModelName,
+				"status":     mcpErrorStatus(err),
+				"error_code": code,
+				"error":      err.Error(),
+				"total_ms":   time.Since(startedAt).Milliseconds(),
+			})
+			if ctx.Err() != nil {
+				// The deadline is spent; trying the next account cannot help.
+				lastErr = transport.NewUpstreamError(
+					fmt.Sprintf("search exceeded its %s deadline; a grounded answer is a full model turn, so raise timeout_seconds or retry with a simpler question", timeout),
+					504, "search_timeout", nil, nil,
+				)
+				break
+			}
 			continue
+		}
+		s.logRequestJSON(map[string]any{
+			"endpoint":     "/mcp",
+			"tool":         mcpToolWebSearch,
+			"account":      acct.ID,
+			"model":        model.ModelName,
+			"status":       200,
+			"sources":      len(sources),
+			"total_ms":     time.Since(startedAt).Milliseconds(),
+			"answer_bytes": len(text),
+		})
+		if info := mcpCallInfoFrom(ctx); info != nil {
+			info.AccountID = acct.ID
+			info.Model = model.ModelName
+			info.DurationMs = time.Since(startedAt).Milliseconds()
+			info.Sources = len(sources)
 		}
 		return formatSearchResult(text, sources), nil
 	}
@@ -270,6 +408,25 @@ func (s *Server) mcpWebSearch(ctx context.Context, scope AuthScope, query, reque
 		lastErr = transport.NewUpstreamError("no account could serve the search", 503, "auth_unavailable", nil, nil)
 	}
 	return "", lastErr
+}
+
+// mcpErrorCode extracts the upstream error code so the request log matches the
+// codes the chat endpoint logs.
+func mcpErrorCode(err error) string {
+	var ue *transport.UpstreamError
+	if errors.As(err, &ue) && ue != nil {
+		return ue.Code
+	}
+	return "upstream_error"
+}
+
+// mcpErrorStatus extracts the HTTP status of an upstream error for the log.
+func mcpErrorStatus(err error) int {
+	var ue *transport.UpstreamError
+	if errors.As(err, &ue) && ue != nil {
+		return ue.StatusCode
+	}
+	return 502
 }
 
 // orderSearchAccounts returns the accounts to try, best first. The pool's own

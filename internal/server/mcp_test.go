@@ -307,6 +307,106 @@ func TestMCPToolsCallRejectsCannedUpstreamError(t *testing.T) {
 	}
 }
 
+func TestMCPSearchTimeoutClamps(t *testing.T) {
+	cfg := config.Load()
+	cfg.SearchTimeout = 180 * time.Second
+	srv := New(cfg)
+
+	cases := []struct {
+		requested int
+		want      time.Duration
+	}{
+		{0, 180 * time.Second},
+		{-5, 180 * time.Second},
+		{1, 10 * time.Second},
+		{45, 45 * time.Second},
+		{9999, 600 * time.Second},
+	}
+	for _, c := range cases {
+		if got := srv.mcpSearchTimeout(c.requested); got != c.want {
+			t.Fatalf("mcpSearchTimeout(%d) = %s, want %s", c.requested, got, c.want)
+		}
+	}
+
+	// The operator's default applies when the caller does not pass one.
+	cfg.SearchTimeout = 45 * time.Second
+	srvOp := New(cfg)
+	if got := srvOp.mcpSearchTimeout(0); got != 45*time.Second {
+		t.Fatalf("expected the configured default of 45s, got %s", got)
+	}
+}
+
+func TestMCPToolsCallHonorsTimeout(t *testing.T) {
+	// The upstream never answers, so only the deadline can end the call.
+	srv := mcpTestServer(t, &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+
+	rec := postMCP(t, srv, "/mcp", "audit", map[string]any{
+		"jsonrpc": "2.0",
+		"id":      8,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name": "web_search",
+			"arguments": map[string]any{
+				"query":           "slow question",
+				"timeout_seconds": 10,
+			},
+		},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("expected 200 with a tool error, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Result struct {
+			IsError bool `json:"isError"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode tools/call: %v (%s)", err, rec.Body.String())
+	}
+	if !resp.Result.IsError {
+		t.Fatalf("expected a timeout to surface as an error, got %+v", resp.Result)
+	}
+	if len(resp.Result.Content) == 0 || !strings.Contains(resp.Result.Content[0].Text, "deadline") {
+		t.Fatalf("expected an actionable deadline message, got %+v", resp.Result.Content)
+	}
+}
+
+func TestMCPSuccessSetsDiagnosticHeaders(t *testing.T) {
+	srv := mcpTestServer(t, mcpSearchUpstream("answer", []gemini.GroundingSource{
+		{URL: "https://example.com/a", Title: "Example A"},
+	}, nil))
+
+	rec := postMCP(t, srv, "/mcp", "audit", map[string]any{
+		"jsonrpc": "2.0",
+		"id":      9,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "web_search",
+			"arguments": map[string]any{"query": "anything"},
+		},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-GSB-Account"); got != "acct" {
+		t.Fatalf("expected X-GSB-Account acct, got %q", got)
+	}
+	if got := rec.Header().Get("X-GSB-Sources"); got != "1" {
+		t.Fatalf("expected X-GSB-Sources 1, got %q", got)
+	}
+	if rec.Header().Get("X-GSB-Duration-Ms") == "" {
+		t.Fatalf("expected X-GSB-Duration-Ms to be set")
+	}
+}
+
 func TestMCPUnknownMethodReturnsMethodNotFound(t *testing.T) {
 	srv := mcpTestServer(t, mcpSearchUpstream("unused", nil, nil))
 
