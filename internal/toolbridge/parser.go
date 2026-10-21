@@ -13,7 +13,6 @@ var (
 	standaloneAfterRe               = regexp.MustCompile("(?is)^[}\\]\\s]*(?:(?:</(?:tool_call|tool_calls|function_call|function_calls)>|```)[}\\]\\s]*)?$")
 	standaloneBeforeRe              = regexp.MustCompile("(?is)(?:^|\\n)\\s*(?:<(?:tool_call|tool_calls|function_call|function_calls)>|```(?:json|tool_call|tool_calls|function_call|function_calls)?)\\s*$")
 	exampleIntroRe                  = regexp.MustCompile(`(?is)(?:\bdo\s+not\s+execute\b|\bdon't\s+execute\b|\bfor\s+example\b|\be\.g\.\b|\bexample\s*(?:json|call|payload|envelope|output|response|format)?\s*:\s*|\bformat\s+is\s*:\s*)\s*$`)
-	potentialToolMarkerRe           = regexp.MustCompile("(?is)(?:\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls)\\s*\"|<(?:tool_call|tool_calls|function_call|function_calls)\\b|```\\s*(?:json|tool_call|tool_calls|function_call|function_calls)\\b|\\{\\s*\"\\s*(?:name|tool|tool_name|function|tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls)\\s*\"\\s*:|\\[\\s*\\{\\s*\"\\s*(?:name|tool|tool_name|function)\\s*\"\\s*:)")
 	truncatedEnvRe                  = regexp.MustCompile("(?is)(?:(?:^|[\\r\\n]\\s*|```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*|<(?:tool_call|tool_calls|function_call|function_calls)>\\s*)\\{\\s*\"\\s*(?:tool_calls|toolCalls|tool_call|function_call|function_calls|functionCalls)\\s*\"\\s*:|(?:```(?:json|tool_call|tool_calls|function_call|function_calls)|<(?:tool_call|tool_calls|function_call|function_calls)>)\\s*\\{\\s*\"\\s*(?:name|tool|tool_name)\\s*\"\\s*:)")
 	gapFenceRe                      = regexp.MustCompile("(?is)^(?:\\s|```(?:json|tool_call|tool_calls|function_call|function_calls)?|</?(?:tool_call|tool_calls|function_call|function_calls)>)*$")
 	trailingTagRe                   = regexp.MustCompile("(?is)(?:```(?:json|tool_call|tool_calls|function_call|function_calls)?|</?(?:tool_call|tool_calls|function_call|function_calls)>)\\s*$")
@@ -1065,7 +1064,7 @@ func SafeStreamablePrefix(text string) string {
 	if trimmed == "" || trimmed[0] == '{' || trimmed[0] == '[' || trimmed[0] == '<' || strings.HasPrefix(trimmed, "```") || strings.HasPrefix(trimmed, "💭") || strings.HasPrefix(trimmed, "🧠") {
 		return ""
 	}
-	if potentialToolMarkerRe.MatchString(text) {
+	if hasPotentialToolMarker(text) {
 		return ""
 	}
 	safeEnd := len(text) - 140
