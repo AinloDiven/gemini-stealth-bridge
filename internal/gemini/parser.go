@@ -138,20 +138,22 @@ var (
 	trailingOpenThinkRe           = regexp.MustCompile("(?is)(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b[^\\n]*|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)([\\s\\S]*)$")
 	thinkingProcessHeaderRe       = regexp.MustCompile(
 		"(?is)^\\s*(?:#{1,6}\\s*)?(?:(?:💭|🧠)\\s*)?(?:\\*\\*|__)?" +
-			"(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning|" +
+			"(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning|thought|" +
 			"思考过程|思考過程|思维链|思維鏈|推理过程|推理過程|内部推理|內部推理|思考|" +
 			"思考プロセス|推論プロセス|" +
 			"생각\\s*과정|추론\\s*과정|생각이|생각|" +
 			"quá\\s+trình\\s+suy\\s+nghĩ)" +
 			"(?:(?:\\*\\*|__)?\\s*[:：](?:\\*\\*|__)?[ \\t]*(?:\\r?\\n+)?|(?:\\*\\*|__)?[ \\t]*\\r?\\n+)",
 	)
-	thoughtBubbleHeaderRe         = regexp.MustCompile("(?s)^\\s*(?:💭|🧠)[ \\t]*\\r?\\n+")
-	thoughtBubbleMetaSplitRe      = regexp.MustCompile("(?im)(?:^|\\n)\\s*(?:let's|we\\s+can|we\\s+should|now\\s+let's|i\\s+will|i'll)\\s+(?:write|present|provide|formulate|draft|give|output|send|reply|answer|respond|summarize|deliver|produce)\\b[^\\n]*?[.:][ \\t]*\\r?\\n*")
-	trailingThoughtCloseBracketRe = regexp.MustCompile(`[ \t]*\)\][ \t]*$`)
-	fencedToolStartRe   = regexp.MustCompile("(?is)```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*(?:\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls|name|tool|tool_name|function)\\s*\"\\s*:|\\[\\s*\\{\\s*\"\\s*(?:name|tool|tool_name|function)\\s*\"\\s*:)")
-	xmlToolStartRe      = regexp.MustCompile("(?is)<(?:tool_call|tool_calls|function_call|function_calls)\\b")
-	bareToolEnvLineRe   = regexp.MustCompile("(?is)(?:^|\\r?\\n)[ \\t]*(\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls)\\s*\"\\s*:)")
-	finalAnswerMarkerRe = regexp.MustCompile(
+	thoughtBubbleHeaderRe         = regexp.MustCompile("(?s)^\\s*(?:💭(?:[ \\t]*\\r?\\n+|[ \\t]+)|🧠[ \\t]*\\r?\\n+)")
+	jspbArraySplitRe              = regexp.MustCompile(`[ \t]*(?:'\s*\]\s*/\s*\[\s*'|"\s*\]\s*/\s*\[\s*")[ \t]*\r?\n*`)
+	thoughtBubbleMetaSplitRe      = regexp.MustCompile("(?im)(?:^|\\n)\\s*(?:let's|we\\s+can|we\\s+should|now\\s+let's|now\\s+i\\s+can|i\\s+will|i'll)\\s+(?:write|present|provide|formulate|draft|give|output|send|reply|answer|respond|summarize|deliver|produce|keep|make|explain|break\\s+down|structure|lay\\s+out)\\b[^\\n]*?[.:][ \\t]*\\r?\\n*")
+	trailingThoughtCloseBracketRe = regexp.MustCompile(`[ \t]*(?:\)\]|'\s*\]\s*/\s*\[\s*'|"\s*\]\s*/\s*\[\s*")[ \t]*$`)
+	trailingPartialSeamRe         = regexp.MustCompile(`(?:[ \t]*['"\)]+[\]/\['"\)]*|[.!?*)][#*\s'"\)\]/\[]+)$`)
+	fencedToolStartRe             = regexp.MustCompile("(?is)```(?:json|tool_call|tool_calls|function_call|function_calls)?\\s*(?:\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls|name|tool|tool_name|function)\\s*\"\\s*:|\\[\\s*\\{\\s*\"\\s*(?:name|tool|tool_name|function)\\s*\"\\s*:)")
+	xmlToolStartRe                = regexp.MustCompile("(?is)<(?:tool_call|tool_calls|function_call|function_calls)\\b")
+	bareToolEnvLineRe             = regexp.MustCompile("(?is)(?:^|\\r?\\n)[ \\t]*(\\{\\s*\"\\s*(?:tool_calls|toolcalls|tool_call|function_call|function_calls|functioncalls)\\s*\"\\s*:)")
+	finalAnswerMarkerRe           = regexp.MustCompile(
 		"(?im)^\\s*(?:#{1,6}\\s*)?(?:\\*\\*|__)?" +
 			"(?:final\\s+answer|answer|response|最终答案|最終答案|最终回答|最終回答|回答|答案|최종\\s*답변|답변)" +
 			"(?:\\*\\*|__)?\\s*[:：]\\s*",
@@ -279,9 +281,14 @@ func utf8SafeLowerHead(s string, maxRunes int) string {
 	return strings.ToLower(s)
 }
 
-// sanitizeCandidateTextAndThoughts strips any inline <think>/<thinking>/<thought>
-// blocks or echoed prompt markers from candidate text and merges extracted inline
-// thoughts into the thoughts channel so reasoning never leaks into chat content.
+// SanitizeCandidateTextAndThoughts strips any inline <think>/<thinking>/<thought>
+// blocks, inline thought-bubble monologues (💭), or echoed prompt markers from
+// candidate text and merges extracted inline thoughts into the thoughts channel
+// so reasoning never leaks into or duplicates chat content.
+func SanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string, string) {
+	return sanitizeCandidateTextAndThoughts(text, thoughts, done)
+}
+
 func sanitizeCandidateTextAndThoughts(text, thoughts string, done bool) (string, string) {
 	if text == "" {
 		return "", thoughts
@@ -451,11 +458,83 @@ func cleanInlineThoughtText(s string) string {
 	return s
 }
 
+func isAnswerStartEmoji(r rune) bool {
+	if r == '💭' || r == '🧠' {
+		return false
+	}
+	return (r >= 0x1F300 && r <= 0x1FAFF) || (r >= 0x2600 && r <= 0x27BF)
+}
+
+// findGluedThoughtCloseSeam detects the zero-whitespace seam left when Gemini Web's
+// detokenizer strips <thought_close> between the end of an inline thought sentence
+// (ending with ., !, ?, *, ), or ]) and the first token of the answer (a markdown
+// heading like "### 1." or a leading reaction emoji like "📊", "👍", "🧭", "🎯", "✨", "🔧", "✅").
+func findGluedThoughtCloseSeam(body string) int {
+	inBackticks := false
+	for i := range len(body) {
+		if body[i] == '`' {
+			inBackticks = !inBackticks
+			continue
+		}
+		if inBackticks || i < 12 {
+			continue
+		}
+		ch := body[i]
+		if ch != '.' && ch != '!' && ch != '?' && ch != '*' && ch != ')' && ch != ']' {
+			continue
+		}
+		rest := body[i+1:]
+		if rest == "" {
+			break
+		}
+		if rest[0] == '#' {
+			hashes := 0
+			for hashes < len(rest) && hashes < 6 && rest[hashes] == '#' {
+				hashes++
+			}
+			if hashes > 0 && hashes < len(rest) && (rest[hashes] == ' ' || rest[hashes] == '\t') {
+				afterSpace := strings.TrimLeft(rest[hashes:], " \t")
+				if afterSpace != "" && afterSpace[0] != '\n' && afterSpace[0] != '\r' {
+					return i + 1
+				}
+			}
+			continue
+		}
+		if rest[0] >= 0x80 {
+			r, width := utf8.DecodeRuneInString(rest)
+			if r != utf8.RuneError && isAnswerStartEmoji(r) && len(strings.TrimSpace(rest[width:])) > 0 {
+				return i + 1
+			}
+		}
+	}
+	return -1
+}
+
+func startsLikeThoughtContinuation(s string) bool {
+	lower := strings.ToLower(strings.TrimLeft(s, " \t\r\n"))
+	for _, prefix := range []string{
+		"wait—", "wait -", "wait,", "wait:", "wait ",
+		"let's ", "let me ", "actually,", "actually ",
+		"hmm,", "hmm ", "hold on", "first, let's", "but wait",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func splitInlineThoughtAnswer(body string) (thoughtPart string, answerPart string, ok bool) {
 	if ansLoc := finalAnswerMarkerRe.FindStringIndex(body); len(ansLoc) == 2 {
 		ans := strings.TrimSpace(body[ansLoc[1]:])
 		if ans != "" {
 			return cleanInlineThoughtText(body[:ansLoc[0]]), ans, true
+		}
+	}
+	if jspbLoc := jspbArraySplitRe.FindStringIndex(body); len(jspbLoc) == 2 {
+		ans := strings.TrimSpace(body[jspbLoc[1]:])
+		if ans != "" && !strings.HasPrefix(ans, "```") && !strings.HasPrefix(ans, "{") {
+			return cleanInlineThoughtText(body[:jspbLoc[0]]), ans, true
 		}
 	}
 	if idx := strings.Index(body, ")]"); idx >= 0 {
@@ -464,11 +543,26 @@ func splitInlineThoughtAnswer(body string) (thoughtPart string, answerPart strin
 			return cleanInlineThoughtText(body[:idx]), after, true
 		}
 	}
-	if locs := thoughtBubbleMetaSplitRe.FindAllStringIndex(body, -1); len(locs) > 0 {
-		last := locs[len(locs)-1]
-		ans := strings.TrimSpace(body[last[1]:])
+	if seam := findGluedThoughtCloseSeam(body); seam > 0 {
+		ans := strings.TrimSpace(body[seam:])
 		if ans != "" {
-			return cleanInlineThoughtText(body[:last[1]]), ans, true
+			return cleanInlineThoughtText(body[:seam]), ans, true
+		}
+	}
+	if locs := thoughtBubbleMetaSplitRe.FindAllStringIndex(body, -1); len(locs) > 0 {
+		for i := len(locs) - 1; i >= 0; i-- {
+			cand := locs[i]
+			matchedSpan := strings.TrimRight(body[cand[0]:cand[1]], " \t\r\n")
+			// A meta-sentence ending with a colon (e.g. "Let's structure the answer:")
+			// introduces an outline inside the thought block unless the answer is glued
+			// on the very same line.
+			if strings.HasSuffix(matchedSpan, ":") && strings.ContainsAny(body[cand[0]:cand[1]], "\r\n") {
+				continue
+			}
+			ans := strings.TrimSpace(body[cand[1]:])
+			if ans != "" && !startsLikeThoughtContinuation(ans) {
+				return cleanInlineThoughtText(body[:cand[1]]), ans, true
+			}
 		}
 	}
 	return "", "", false
@@ -484,22 +578,32 @@ func holdBackTrailingToolOpener(s string) string {
 			return strings.TrimRight(s[:cut], " \t\r\n")
 		}
 	}
-	lastNL := strings.LastIndexByte(s, '\n')
+	trimmedRight := strings.TrimRight(s, " \t\r\n")
+	lastNL := strings.LastIndexByte(trimmedRight, '\n')
 	lineStart := 0
 	if lastNL >= 0 {
 		lineStart = lastNL + 1
 	}
-	tailLine := strings.TrimLeft(s[lineStart:], " \t\r")
+	tailLine := strings.TrimLeft(trimmedRight[lineStart:], " \t\r")
 	if tailLine != "" && (tailLine[0] == '`' || tailLine[0] == '<' || tailLine[0] == '{' ||
 		strings.HasPrefix(strings.ToLower(tailLine), "let's ") ||
 		strings.HasPrefix(strings.ToLower(tailLine), "we can ") ||
 		strings.HasPrefix(strings.ToLower(tailLine), "we should ") ||
 		strings.HasPrefix(strings.ToLower(tailLine), "now let's ") ||
+		strings.HasPrefix(strings.ToLower(tailLine), "now i can ") ||
 		strings.HasPrefix(strings.ToLower(tailLine), "i will ") ||
 		strings.HasPrefix(strings.ToLower(tailLine), "i'll ")) {
-		return strings.TrimRight(s[:lineStart], " \t\r\n")
+		return strings.TrimRight(trimmedRight[:lineStart], " \t\r\n")
 	}
-	return strings.TrimRight(s, " \t\r\n")
+	if loc := trailingPartialSeamRe.FindStringIndex(trimmedRight); len(loc) == 2 {
+		if trimmedRight[loc[0]] == '.' || trimmedRight[loc[0]] == '!' || trimmedRight[loc[0]] == '?' || trimmedRight[loc[0]] == '*' || trimmedRight[loc[0]] == ')' || trimmedRight[loc[0]] == ']' {
+			if loc[0] > 0 && trimmedRight[loc[0]-1] != '(' && trimmedRight[loc[0]-1] != '\'' && trimmedRight[loc[0]-1] != '"' {
+				return strings.TrimRight(trimmedRight[:loc[0]+1], " \t\r\n")
+			}
+		}
+		return strings.TrimRight(trimmedRight[:loc[0]], " \t\r\n")
+	}
+	return trimmedRight
 }
 
 func mayStartWithThinkingHeader(trimmed string) bool {
@@ -557,10 +661,7 @@ func extractThinkingProcessBlock(text string, done bool) (restText string, thoug
 			safe := holdBackTrailingToolOpener(body)
 			return "", cleanInlineThoughtText(safe), true
 		}
-		if strings.HasSuffix(strings.TrimSpace(body), ")]") {
-			return "", cleanInlineThoughtText(body), true
-		}
-		return strings.TrimSpace(body), "", false
+		return "", cleanInlineThoughtText(body), true
 	}
 	return text, "", false
 }

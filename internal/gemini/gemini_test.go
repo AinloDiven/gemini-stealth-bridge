@@ -544,8 +544,37 @@ func TestThoughtBubbleEmojiInlineThinkingAndFinalAnswerSplit(t *testing.T) {
 	if !strings.HasPrefix(ansText, "✅ Seluruh tahap analisis") {
 		t.Fatalf("expected final answer starting with ✅, got %q", ansText)
 	}
-	if strings.Contains(ansThoughts, "💭") || !strings.Contains(ansThoughts, "All todo items are now marked complete") {
-		t.Fatalf("expected clean thoughts without 💭, got %q", ansThoughts)
+	if strings.Contains(ansThoughts, "💭") || !strings.Contains(ansThoughts, "All todo items are now marked complete") || strings.Contains(ansThoughts, "Seluruh tahap analisis") {
+		t.Fatalf("expected clean thoughts without 💭 or final answer leak, got %q", ansThoughts)
+	}
+
+	// 3. Glued markdown heading seam after internal colon outline (session 01a15c4b turn 3)
+	turn3 := "💭\nThe user is asking in Indonesian:\n\"kam utau an repo ini fungsinya apa\"\n\nLet's structure the answer following the engineering persona and instructions:\n1. Briefly confirm `gemini-stealth-bridge` (`gsb`) function.\n2. Explain what **Task Mode** is.\n\nLet's keep it clear, concrete, in Indonesian, matching the terse technical style.### 1. Fungsi Repo Ini (`gemini-stealth-bridge` / `gsb`)\n`gsb` adalah reverse-proxy yang mengubah sesi web `gemini.google.com` menjadi endpoint API standar."
+	t3Text, t3Thoughts := sanitizeCandidateTextAndThoughts(turn3, "", true)
+	if !strings.HasPrefix(t3Text, "### 1. Fungsi Repo Ini") {
+		t.Fatalf("turn3: expected answer starting at ### 1. Fungsi Repo Ini, got %q", t3Text)
+	}
+	if strings.Contains(t3Thoughts, "### 1. Fungsi Repo Ini") || !strings.HasSuffix(t3Thoughts, "matching the terse technical style.") {
+		t.Fatalf("turn3: expected thoughts to stop cleanly before ### 1., got %q", t3Thoughts)
+	}
+
+	// 4. JSPB ']/[' delimiter seam after internal colon outline (session 01a15c4b turn 4)
+	turn4 := "💭\nThe user asks: \"jadi kenapa gemini task mode ga cocok\".\nLet's explain concisely, technically, and clearly in Indonesian why Gemini Task Mode does not fit `gsb`:\n\n1. **Bentrok Orkestrasi**\n5. **Syarat Akun**: mayoritas akun di dalam *account pool* akan gagal (`403`/ineligible).']/['Gemini **Task Mode** tidak cocok dijadikan backend untuk `gsb` karena 5 alasan teknis utama:\n\n### 1. Bentrok Orkestrasi"
+	// Simulate mid-stream frame ending right at partial delimiter ".']"
+	partialTurn4 := turn4[:strings.Index(turn4, "']/['")+2]
+	p4Text, p4Thoughts := sanitizeCandidateTextAndThoughts(partialTurn4, "", false)
+	if p4Text != "" || strings.HasSuffix(p4Thoughts, "']") {
+		t.Fatalf("turn4 partial: expected held-back delimiter without '], got text=%q thoughts=%q", p4Text, p4Thoughts)
+	}
+	t4Text, t4Thoughts := sanitizeCandidateTextAndThoughts(turn4, "", true)
+	if !strings.HasPrefix(t4Text, "Gemini **Task Mode** tidak cocok") {
+		t.Fatalf("turn4: expected answer starting after ']/[' delimiter, got %q", t4Text)
+	}
+	if strings.Contains(t4Thoughts, "Gemini **Task Mode** tidak cocok") || strings.Contains(t4Thoughts, "']/['") {
+		t.Fatalf("turn4: expected thoughts without answer or delimiter, got %q", t4Thoughts)
+	}
+	if !strings.HasPrefix(t4Thoughts, p4Thoughts) {
+		t.Fatalf("turn4: expected final thoughts %q to extend partial thoughts %q monotonically", t4Thoughts, p4Thoughts)
 	}
 }
 

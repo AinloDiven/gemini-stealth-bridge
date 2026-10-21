@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/toolbridge"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 	"io"
@@ -30,8 +31,7 @@ var (
 	fencedToolCallRe        = regexp.MustCompile("(?is)```(?:json)?\\s*\\{\\s*\"(?:tool_calls|toolCalls|function_call)\"[\\s\\S]*?```")
 	trailingToolCallRe      = regexp.MustCompile(`(?s)\{\s*"(?:tool_calls|toolCalls|function_call)"[\s\S]*$`)
 	inlineThinkBlockRe      = regexp.MustCompile("(?is)<(?:think|thinking|thought)(?:\\s[^>]*)?>[\\s\\S]*?</(?:think|thinking|thought)\\s*>")
-	leakedThinkingProcessRe   = regexp.MustCompile("(?is)^\\s*(?:(?:#{1,6}\\s*)?(?:\\*\\*|__)?(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning)(?:\\*\\*|__)?\\s*:?|(?:💭|🧠)\\s*\\r?\\n)[\\s\\S]*$")
-	leakedThoughtBubbleSplitRe = regexp.MustCompile("(?is)^\\s*(?:💭|🧠)[ \\t]*\\r?\\n+[\\s\\S]*?(?:^|\\n)\\s*(?:let's|we\\s+can|we\\s+should|now\\s+let's|i\\s+will|i'll)\\s+(?:write|present|provide|formulate|draft|give|output|send|reply|answer|respond|summarize|deliver|produce)\\b[^\\n]*?[.:][ \\t]*\\r?\\n*")
+	leakedThinkingProcessRe = regexp.MustCompile("(?is)^\\s*(?:(?:#{1,6}\\s*)?(?:\\*\\*|__)?(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning|thought)(?:\\*\\*|__)?\\s*:?|(?:💭|🧠)(?:\\s*\\r?\\n|[ \\t]+))[\\s\\S]*$")
 	whitespaceCollapse      = regexp.MustCompile(`\s+`)
 	spoofedRoleLineRe       = regexp.MustCompile(`(?im)^(Assistant|Instruction|\[(?:Harness|Tool) reminder|\[Context note):`)
 )
@@ -421,10 +421,10 @@ func FlattenMessagesWithStats(
 			if inlineThinkBlockRe.MatchString(text) {
 				text = strings.TrimSpace(inlineThinkBlockRe.ReplaceAllString(text, ""))
 			}
-			if loc := leakedThoughtBubbleSplitRe.FindStringIndex(text); len(loc) == 2 && loc[0] == 0 {
-				if rest := strings.TrimSpace(text[loc[1]:]); rest != "" {
-					text = rest
-				}
+			if cleaned, _ := gemini.SanitizeCandidateTextAndThoughts(text, "", true); cleaned != "" {
+				text = cleaned
+			} else if leakedThinkingProcessRe.MatchString(text) {
+				text = ""
 			}
 			if strings.Contains(text, "tool_calls") {
 				text = fencedToolCallRe.ReplaceAllString(text, "")
