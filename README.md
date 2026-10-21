@@ -43,7 +43,10 @@ The daemon runs without headless Chrome or CDP. Browserless transport is an impl
 | Image input | Base64 image data URLs and remote HTTPS images |
 | Thinking effort | Maps `low`, `medium`, and `high` to Gemini Web thinking levels |
 | Conversation history | Reuses Gemini continuation tokens when matching history is available; offloads older turns into text attachments when the inline prompt budget is exceeded |
-| Multiple accounts & quota | Pool key routes across accounts (`rotate`, `lru`, `fill-first`); per-account keys pin one account. Exposes both rolling **5-hour (`2,400`)** and **7-day weekly (`48,384`)** quota windows |
+| Multiple accounts & quota | Pool key routes across accounts (`rotate`, `lru`, `fill-first`); per-account keys pin one account; group keys serve one user's accounts with failover inside the group. Exposes both rolling **5-hour (`2,400`)** and **7-day weekly (`48,384`)** quota windows |
+| Per-account proxies | Each account can egress through its own HTTP/SOCKS5 proxy, configured per account file or via `BRIDGE_EGRESS_PER_ACCOUNT` |
+| Web search & grounding | Extracts the Google Search citations Gemini Web returned and appends them to the answer |
+| MCP server | Built-in Streamable HTTP MCP endpoint at `POST /mcp` exposing the grounding as a `web_search` tool for Claude Code, Cursor, OMP, and other MCP clients |
 | Web Control Plane | Embedded single-binary dashboard at `GET /ui` (`gsb --web` or `./start.sh`) for account onboarding, 5h/weekly quota bars, priority ordering, and runtime configuration |
 | Session maintenance | Background cookie rotation and persistence of updated credentials |
 
@@ -444,6 +447,7 @@ All `/v1/*` endpoints below use the same authentication resolver. Account keys s
 | `POST` | `/v1/images/generations` | OpenAI-compatible image generation (`url` or `b64_json`) backed by Gemini Web |
 | `POST` | `/v1/videos/generations` | Video generation (Veo MP4 + audio + thumbnail URL) backed by Gemini Web |
 | `GET` | `/v1/media/<id>` | Unauthenticated local media proxy serving cached/streamed generated images (`.jpg`) and videos (`.mp4`) |
+| `POST` | `/mcp`, `/v1/mcp` | Built-in MCP server (Streamable HTTP) exposing Gemini Web's Google Search grounding as the `web_search` tool |
 | `GET` | `/v1/accounts` | Account IDs, email addresses, computed `status` and `statusReason`, `lastError`/`lastFailAt`, provenance, timestamps, quarantine/disabled state, models, cached 5h + weekly quotas, `quotaWindow` metadata, and load telemetry |
 | `GET` | `/v1/quota` | Cached or live (`?fresh=1`) upstream 5h + weekly quota buckets for scoped accounts |
 | `GET` | `/v1/sessions` | Transport session status and continuation cache hit/miss counters |
@@ -472,6 +476,7 @@ Use the pool key unless you specifically need to pin an account. Pool routing is
 - `BRIDGE_API_KEY=public` means the pool key is `public` and requests without a key are accepted. Set `BRIDGE_API_KEY` to a random value before exposing the daemon beyond loopback; the account keys then keep working alongside it.
 - Account keys are registered for every loaded account file. They are predictable from the filename, so treat them as routing aliases, not secrets. Setting a pool key does not remove them.
 - `BRIDGE_ACCOUNT_TOKENS` adds `token:account_id` mappings for custom account keys. It does not disable the automatically registered aliases.
+- `BRIDGE_GROUP_TOKENS` adds `token:group_name` mappings for group keys. A group key serves only the accounts of that group and fails over inside it, so several users can share one daemon without touching each other's accounts or quota.
 - `Authorization: Bearer <key>` is recommended. `x-api-key`, `x-goog-api-key`, and `?key=` are also accepted; query keys can leak into URL logs.
 - The daemon serves plain HTTP, not HTTPS. For access outside the local machine, use a private network/tunnel or an authenticated TLS reverse proxy that restricts access independently of the daemon's routing keys. Do not publish the port directly to an untrusted network.
 - Startup warns about a non-loopback bind with default authentication; it does **not** refuse to start. `/health` remains unauthenticated even when a pool key is set.
@@ -494,7 +499,10 @@ Set environment variables before starting `./gsb` (or configure runtime settings
 | `BRIDGE_API_KEY` | `public` | Pool key: routes across all accounts. Default `public` permits unauthenticated access |
 | `CHROME_COOKIES` | Empty | Browser cookie database/profile hint for import/login; also enables a live-cookie fallback when no saved accounts load |
 | `CHROME_PASS` | Empty | Browser cookie-encryption password override, not your Google sign-in password; treat as a secret |
-| `BRIDGE_PROXY_SERVER` | Empty | Outbound HTTP or SOCKS5 proxy URL for Gemini transport |
+| `BRIDGE_PROXY_SERVER` | Empty | Outbound HTTP or SOCKS5 proxy URL for Gemini transport, used by every account that has no proxy of its own |
+| `BRIDGE_EGRESS_PER_ACCOUNT` | Empty | `account_id:proxy_url` pairs. Each account leaves through its own proxy instead of `BRIDGE_PROXY_SERVER` |
+| `BRIDGE_GROUP_TOKENS` | Empty | `token:group_name` pairs. A group key serves only the accounts of that group, with failover inside the group |
+| `BRIDGE_INCLUDE_GROUNDING` | `true` | Append the Google Search citations Gemini Web returned to the end of an answer |
 | `BRIDGE_IMPERSONATE` | `chrome_150_psk` | uTLS profile; alternatives include `chrome_146`, `chrome_133`, `firefox_135`, and `safari_18_0` |
 | `BRIDGE_IPV6` | `auto` | IPv6 transport mode: `auto`, `off` (disables IPv6; also set by `BRIDGE_DISABLE_IPV6=1`), or `on` |
 | `BRIDGE_ALLOW_PRIVATE_IMAGE_URLS` | Disabled | Exactly `1` permits private/loopback image destinations; weakens SSRF protection, so leave unset for untrusted requests |
@@ -551,6 +559,73 @@ BRIDGE_PROXY_SERVER=socks5://127.0.0.1:1080 ./gsb
 ```
 
 `BRIDGE_PROXY_SERVER` applies to Gemini transport, not the separate remote-image downloader. It does not provide a process-wide proxy or privacy boundary. `WEB_CRED_FILE` is parsed by configuration but is not used by the daemon's credential loader; use `$BRIDGE_HOME/accounts/` for account management.
+
+### Per-account proxies and per-user keys
+
+Each account can leave through its own proxy, so several accounts can sit behind different egress IPs without the daemon restarting:
+
+```sh
+BRIDGE_EGRESS_PER_ACCOUNT="acct-a:socks5://127.0.0.1:1081,acct-b:http://user:pass@proxy.example:3128" ./gsb
+```
+
+The same is available in the Web Control Plane: the **Add Google Account** dialog has an *Outbound Proxy* field. The value is stored in the account file and applied to that account's transport session only; changing it rebuilds the session so no connection survives from the previous egress.
+
+To give a user their own key over a set of accounts, give those accounts the same **account group** and map a key to that group:
+
+```sh
+BRIDGE_ACCOUNT_GROUP="acct-a:team-a,acct-b:team-a,acct-c:team-b" \
+BRIDGE_GROUP_TOKENS="alice-key:team-a,bob-key:team-b" ./gsb
+```
+
+A group key serves only the accounts of its group, fails over inside that group when one account is exhausted or rate-limited, and never touches another group's accounts or their quota. A group key is the right shape for multi-user deployments; a per-account key (`gsb-<name>`) pins exactly one account.
+
+| Key | Scope | Failover |
+|---|---|---|
+| `BRIDGE_API_KEY` (pool key) | Every loaded account | Yes, across the whole pool |
+| `BRIDGE_GROUP_TOKENS` entry | The accounts of one group | Yes, inside the group |
+| `gsb-<account>` / `<account>` | Exactly one account | No |
+
+### Web search and the built-in MCP server
+
+When Gemini Web answers with Google Search grounding, `gsb` extracts the citations and appends them to the answer:
+
+```
+<answer text>
+
+---
+Sources:
+1. Article title — https://example.com/article
+   optional snippet from the search result
+```
+
+Set `BRIDGE_INCLUDE_GROUNDING=0` to return the answer without the citation list.
+
+A grounded answer is a full model turn, so it takes as long as the model thinks — typically 15–120 seconds, more for a complex question. Give the client a generous timeout.
+
+The same grounding is exposed as an MCP tool, so a coding agent can search the web through the account pool (with its quota accounting and failover):
+
+```sh
+curl -sS http://127.0.0.1:20133/mcp \
+  -H 'Authorization: Bearer gsb-pool' \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"latest Go release notes"}}}'
+```
+
+Configure it in a client as an MCP server over Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "gemini-search": {
+      "type": "http",
+      "url": "http://127.0.0.1:20133/mcp",
+      "headers": { "Authorization": "Bearer gsb-pool" }
+    }
+  }
+}
+```
+
+The endpoint is `POST`-only (no server-initiated stream), accepts the pool key, a group key, or an account key, and returns the synthesized answer followed by the source list. `/v1/mcp` is an alias for clients that expect the versioned path.
 
 ## Operations and troubleshooting
 

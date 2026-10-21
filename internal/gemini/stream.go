@@ -48,12 +48,13 @@ type StreamOptions struct {
 
 // StreamResponse captures the final HTTP status, headers, and conversation state from StreamGenerateLive.
 type StreamResponse struct {
-	Status  int
-	Headers map[string]string
-	Empty   bool
-	CID     string
-	RID     string
-	Body    string
+	Status           int
+	Headers          map[string]string
+	Empty            bool
+	CID              string
+	RID              string
+	Body             string
+	GroundingSources []GroundingSource
 }
 
 // UploadFile uploads a binary file or image to Google's content-push service
@@ -408,6 +409,7 @@ func (ac *AccountClient) streamGenerateLocked(
 		sawDone         bool
 		sawContextToken bool
 		sawStreamEnd    bool
+		grounding       []GroundingSource
 	)
 
 	emitLine := func(line string) error {
@@ -443,6 +445,7 @@ func (ac *AccountClient) streamGenerateLocked(
 			sawStreamEnd = true
 		}
 		frameCount += len(parsed.Frames)
+		grounding = MergeGroundingSources(grounding, parsed.GroundingSources)
 		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.AnsweredModelID != "" || parsed.MediaToolActive || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
 			return onFrame(parsed)
 		}
@@ -542,12 +545,13 @@ func (ac *AccountClient) streamGenerateLocked(
 	}
 
 	return &StreamResponse{
-		Status:  res.Status,
-		Headers: res.Headers,
-		Empty:   frameCount == 0,
-		CID:     cid,
-		RID:     rid,
-		Body:    res.Body,
+		Status:           res.Status,
+		Headers:          res.Headers,
+		Empty:            frameCount == 0,
+		CID:              cid,
+		RID:              rid,
+		Body:             res.Body,
+		GroundingSources: grounding,
 	}, nil
 }
 

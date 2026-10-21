@@ -52,14 +52,26 @@ func (s *Server) Accounts() []*AccountState {
 	return out
 }
 
+// scopedAccounts returns the accounts the caller's scope may use. A group scope
+// is limited to the accounts that carry the matching account group; an account
+// scope is limited to that single account.
 func (s *Server) scopedAccounts(scope AuthScope) []*AccountState {
 	accts := s.Accounts()
-	if scope.AccountID == "" {
+	if scope.AccountID == "" && scope.Group == "" {
 		return accts
 	}
 	var out []*AccountState
 	for _, a := range accts {
-		if a.ID == scope.AccountID {
+		if scope.AccountID != "" {
+			if a.ID == scope.AccountID {
+				out = append(out, a)
+			}
+			continue
+		}
+		a.mu.RLock()
+		group := a.AccountGroup
+		a.mu.RUnlock()
+		if group == scope.Group {
 			out = append(out, a)
 		}
 	}
@@ -1355,7 +1367,24 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 		}
 		return nil
 	}
-	if !scope.Admin {
+	if scope.Group != "" {
+		// A group-scoped key may only use the accounts of its own group, and it
+		// keeps normal failover inside that group instead of the whole pool.
+		grouped := make([]*AccountState, 0, len(accts))
+		for _, a := range accts {
+			a.mu.RLock()
+			group := a.AccountGroup
+			a.mu.RUnlock()
+			if group == scope.Group {
+				grouped = append(grouped, a)
+			}
+		}
+		if len(grouped) == 0 {
+			return nil
+		}
+		accts = grouped
+	}
+	if !scope.Admin && scope.Group == "" {
 		s.mu.RLock()
 		explicitTokens := len(s.Cfg.AccountTokens) > 0
 		s.mu.RUnlock()
@@ -1583,7 +1612,10 @@ func (s *Server) prepareGeneration(
 	rawModel, _ := body["model"].(string)
 	requested, inlineThink := gemini.ParseModelRequest(rawModel)
 
-	accts := s.Accounts()
+	// The scope decides which accounts this request may touch: an account key
+	// sees only its own account, a group key only its group, the pool key all
+	// of them. Scoping the list here keeps failover inside the same boundary.
+	accts := s.scopedAccounts(scope)
 	if len(accts) == 0 {
 		return nil, transport.NewUpstreamError("no accounts configured", 503, "auth_unavailable", nil, nil)
 	}
@@ -1608,9 +1640,11 @@ func (s *Server) prepareGeneration(
 				return nil, transport.NewUpstreamError(fmt.Sprintf("all accounts are quarantined (last: %s)", r), 403, "account_banned", nil, nil)
 			}
 		}
-		msg := "this endpoint requires a pool key (BRIDGE_API_KEY) or an account key; no usable account is loaded for this request"
+		msg := "this endpoint requires a pool key (BRIDGE_API_KEY), a group key, or an account key; no usable account is loaded for this request"
 		if scope.AccountID != "" {
 			msg = fmt.Sprintf("account key is bound to account %q, which is not loaded", scope.AccountID)
+		} else if scope.Group != "" {
+			msg = fmt.Sprintf("group key is bound to group %q, which has no loaded account", scope.Group)
 		}
 		return nil, transport.NewUpstreamError(msg, 401, "authentication_error", nil, nil)
 	}

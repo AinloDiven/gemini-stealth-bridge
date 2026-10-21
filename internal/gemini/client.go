@@ -455,7 +455,10 @@ func classifyUpstreamAuthOrBan(status int, headers map[string]string, body strin
 
 func (ac *AccountClient) acquireSession(ctx context.Context) (*transport.Session, error) {
 	ac.ReloadFromDiskIfNewer()
-	return ac.Pool.Acquire(ctx, ac.sessionKey(), ac.CookieHeader())
+	ac.mu.RLock()
+	proxy := ac.proxyURL
+	ac.mu.RUnlock()
+	return ac.Pool.AcquireWithProxy(ctx, ac.sessionKey(), ac.CookieHeader(), proxy)
 }
 
 // Bootstrap loads https://gemini.google.com/app over the account's stealth session

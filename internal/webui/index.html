@@ -419,7 +419,7 @@
       padding: 14px 18px;
       margin-bottom: 14px;
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 16px;
     }
 
@@ -1162,6 +1162,18 @@
             <span class="helper">Click any <code class="mono">Key: gsb-...</code> button in the Account column below to copy that account's dedicated key.</span>
           </div>
         </div>
+
+        <div class="conn-col">
+          <div class="conn-head">
+            <span>3. MCP Endpoint (Web Search Tool)</span>
+            <span class="source-tag mono">Claude Code · Cursor · OMP</span>
+          </div>
+          <div class="conn-desc">Built-in MCP server exposing Gemini Web's Google Search grounding as a <code class="mono">web_search</code> tool.</div>
+          <div class="conn-pills mono">
+            <button type="button" class="copy-chip" data-copy-id="conn-mcp-url"><span>URL:</span> <span class="chip-val" id="conn-mcp-url">http://127.0.0.1:20133/mcp</span></button>
+            <button type="button" class="copy-chip" data-copy-id="conn-mcp-key"><span>API Key:</span> <span class="chip-val" id="conn-mcp-key">gsb-pool</span></button>
+          </div>
+        </div>
       </div>
       <div class="pool-toolbar" style="margin-bottom: 14px;">
         <div class="filter-pills" role="group" aria-label="Filter accounts by status">
@@ -1359,6 +1371,16 @@
         <div class="field">
           <label for="inp-acct-id">Custom Account Name (Optional)</label>
           <input id="inp-acct-id" name="id" type="text" class="input mono" placeholder="Leave blank to auto-name from email (e.g. bacotsih4)" pattern="[A-Za-z0-9._-]{1,64}" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="inp-acct-proxy">Outbound Proxy for This Account (Optional)</label>
+          <input id="inp-acct-proxy" name="proxyUrl" type="text" class="input mono" placeholder="socks5://127.0.0.1:1080 or http://user:pass@host:port" autocomplete="off">
+          <span class="helper">This account's traffic leaves through this proxy only. Leave blank to use the daemon-wide <code class="mono">BRIDGE_PROXY_SERVER</code>.</span>
+        </div>
+        <div class="field">
+          <label for="inp-acct-group">Account Group (Optional)</label>
+          <input id="inp-acct-group" name="accountGroup" type="text" class="input mono" placeholder="e.g. team-a" autocomplete="off">
+          <span class="helper">Accounts in the same group share failover and can be served together by one group API key (<code class="mono">BRIDGE_GROUP_TOKENS</code>).</span>
         </div>
 
         <div class="modal-actions">
@@ -1948,6 +1970,8 @@
         document.getElementById('lbl-env-file').textContent = adm.envFile || '$BRIDGE_HOME/config.env';
         document.getElementById('conn-base-url').textContent = window.location.origin + '/v1';
         document.getElementById('conn-pool-key').textContent = adm.poolKey || 'gsb-pool';
+        document.getElementById('conn-mcp-url').textContent = window.location.origin + '/mcp';
+        document.getElementById('conn-mcp-key').textContent = adm.poolKey || 'gsb-pool';
         btnAuthModal.hidden = (adm.authMode === 'local_public');
         const cfg = adm.config || {};
         const metrics = adm.metrics || {};
@@ -2228,6 +2252,8 @@
         const id = document.getElementById('inp-acct-id').value.trim();
         const cookieEl = document.getElementById('inp-acct-cookie');
         const cookie = cookieEl.value.trim();
+        const proxyUrl = document.getElementById('inp-acct-proxy').value.trim();
+        const accountGroup = document.getElementById('inp-acct-group').value.trim();
         if (!cookie) {
           showBanner('err', 'Please paste a Cookie header or Cookie-Editor JSON array.');
           return;
@@ -2238,10 +2264,12 @@
         try {
           const res = await apiRequest('/v1/admin/accounts/import', {
             method: 'POST',
-            body: { id: id, cookie: cookie }
+            body: { id: id, cookie: cookie, proxyUrl: proxyUrl, accountGroup: accountGroup }
           });
           cookieEl.value = '';
           document.getElementById('inp-acct-id').value = '';
+          document.getElementById('inp-acct-proxy').value = '';
+          document.getElementById('inp-acct-group').value = '';
           closeImportModal();
           const addedId = (res.account && res.account.id) || id || 'account';
           showBanner('ok', 'Verified and added account ' + addedId + ' (' + ((res.account && res.account.email) || 'session active') + ').');

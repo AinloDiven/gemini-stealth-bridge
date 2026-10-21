@@ -27,6 +27,7 @@ type Session struct {
 	Generation    uint64
 	MaxQueueDepth int
 	WaitTimeout   time.Duration
+	proxyURL      string
 	mu            sync.Mutex
 	ready         bool
 	active        int
@@ -99,6 +100,14 @@ func (s *Session) CookieHeader() string {
 		return s.pendingCookie
 	}
 	return s.cookieHeader
+}
+
+// ProxyURL returns the proxy this session routes through, or "" when it dials
+// directly.
+func (s *Session) ProxyURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.proxyURL
 }
 
 // Lease runs fn exclusively under this account session's lease, enforcing
@@ -249,6 +258,19 @@ func (s *Session) Close() {
 	}
 }
 
+// Retire takes a session out of service without rebuilding its client. An
+// in-flight request keeps its connection until it finishes; only the idle
+// connections of the retired session are released.
+func (s *Session) Retire() {
+	s.mu.Lock()
+	s.ready = false
+	s.pendingCookie = ""
+	s.mu.Unlock()
+	if s.Client != nil {
+		s.Client.CloseIdleConnections()
+	}
+}
+
 // Pool manages isolated per-account stealth transport sessions with bounded capacity,
 // reservation grace windows, and idle reaping.
 type Pool struct {
@@ -312,8 +334,17 @@ func (p *Pool) Existing(key string) *Session {
 	return nil
 }
 
-// Acquire returns or creates the isolated Session bound to key.
+// Acquire returns or creates the isolated Session bound to key, using the
+// pool-wide egress configuration.
 func (p *Pool) Acquire(ctx context.Context, key, cookieHeader string) (*Session, error) {
+	return p.AcquireWithProxy(ctx, key, cookieHeader, "")
+}
+
+// AcquireWithProxy returns or creates the isolated Session bound to key,
+// routing that session's traffic through proxyURL instead of the pool-wide
+// default. Each Google account may sit behind its own proxy, so the proxy is
+// a property of the session rather than of the pool.
+func (p *Pool) AcquireWithProxy(ctx context.Context, key, cookieHeader, proxyURL string) (*Session, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -324,6 +355,7 @@ func (p *Pool) Acquire(ctx context.Context, key, cookieHeader string) (*Session,
 		if existing, ok := p.sessions[key]; ok {
 			existing.mu.Lock()
 			isReady := existing.Generation == p.generation && existing.ready
+			proxyChanged := existing.proxyURL != proxyURL
 			if isReady {
 				if cookieHeader != "" && cookieHeader != existing.cookieHeader {
 					existing.pendingCookie = cookieHeader
@@ -331,20 +363,28 @@ func (p *Pool) Acquire(ctx context.Context, key, cookieHeader string) (*Session,
 				existing.reservedUntil = time.Now().Add(p.reserveFor)
 			}
 			existing.mu.Unlock()
-			if isReady {
+			if isReady && !proxyChanged {
 				p.mu.Unlock()
 				return existing, nil
 			}
+			// The account was re-pointed at a different proxy: the old client
+			// still holds connections to the previous egress, so drop it.
 			delete(p.sessions, key)
+			go existing.Retire()
 		}
 
 		if len(p.sessions) < p.maxSessions || p.evictLRUIdleLocked() {
-			sc, err := NewStealthClient(p.clientCfg)
+			cfg := p.clientCfg
+			if proxyURL != "" {
+				cfg.ProxyURL = proxyURL
+			}
+			sc, err := NewStealthClient(cfg)
 			if err != nil {
 				p.mu.Unlock()
 				return nil, err
 			}
 			s := NewSession(key, sc, p.generation, cookieHeader, p.maxQueue, p.waitTimeout)
+			s.proxyURL = proxyURL
 			s.reservedUntil = time.Now().Add(p.reserveFor)
 			p.sessions[key] = s
 			p.mu.Unlock()

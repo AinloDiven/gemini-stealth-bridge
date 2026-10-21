@@ -222,6 +222,24 @@ func (sc *StealthClient) getDoer() Doer {
 	return sc.client
 }
 
+// ProxyURL returns the proxy this client routes through, or "" when it dials
+// directly. It exists so callers can verify which egress an account uses.
+func (sc *StealthClient) ProxyURL() string {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.cfg.ProxyURL
+}
+
+// CloseIdleConnections releases the client's idle connections without
+// rebuilding it, so an in-flight request is not disturbed.
+func (sc *StealthClient) CloseIdleConnections() {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.client != nil {
+		sc.client.CloseIdleConnections()
+	}
+}
+
 // RequestOptions specifies parameters for an outbound HTTP request.
 type RequestOptions struct {
 	Method           string

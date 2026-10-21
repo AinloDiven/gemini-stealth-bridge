@@ -49,16 +49,19 @@ Cookie export via `--import-cookie` is the fallback when browser decryption is u
 
 Repeat `gsb --login` with a different name per account. Each account is a separate credential file under `$BRIDGE_HOME/accounts/`.
 
-## Two kinds of API key
+## Three kinds of API key
 
 | Key | Value | Use it for |
 |---|---|---|
 | **Pool key** | `BRIDGE_API_KEY` (default `public`) | Normal use. `gsb` picks an account per request and fails over automatically |
+| **Group key** | `BRIDGE_GROUP_TOKENS` entry (`token:group`) | One user's own set of accounts. Serves only that group and fails over inside it |
 | **Account key** | `gsb-<name>` or `<name>` | Pinning one account for testing or isolating a project's quota |
 
-Default to the pool key in examples and client configuration. It is the only key that can fail over: a request made with an account key stays on that account and returns `429` or `401` instead of switching. When a user reports that a request failed while another account had quota, check which key the client used before assuming a routing bug.
+Default to the pool key in examples and client configuration. The pool key is the only key that fails over across every account: an account key stays on that account and returns `429` or `401` instead of switching. A group key fails over, but only among the accounts of its own group. When a user reports that a request failed while another account had quota, check which key the client used before assuming a routing bug.
 
 Do not tell users to create one router connection per account. Account rotation belongs to `gsb`, which tracks quota, quarantine state, and conversation continuation affinity. A router that spreads requests over per-account connections cannot see any of that and will discard the cached Gemini session between turns. One connection with the pool key is the intended setup.
+
+For a multi-user deployment, give each user a group key instead of the shared pool key: assign their accounts to a group (`BRIDGE_ACCOUNT_GROUP`) and map their key to it (`BRIDGE_GROUP_TOKENS`). Each user's traffic then stays on their own accounts and their own quota.
 
 ## Pool routing
 
@@ -95,3 +98,29 @@ Or open `http://127.0.0.1:20133/ui` (or query `GET /v1/accounts?live=1` on the r
 1. **Coding Agent Mode (`tools` enabled in `/v1/chat/completions` or `/v1/responses`)**: When the user prompt asks for an image, diagram, illustration, or video, `gsb` injects a server-side `generate_media` tool (`media_type`: `"image"` | `"video"`, `prompt`, plus optional `aspect_ratio`: `"1:1"` | `"16:9"` | `"9:16"` | `"4:3"` | `"3:4"`, `format`: `"png"` | `"jpeg"` | `"gif"`, `duration`: `10` | `15` | `30`, and `output_path`). `gsb` downloads original unscaled images (`=s0-d`) or lossless PNGs (`=s0-rp`), proxies the authenticated media at `http://<host>:<port>/v1/media/<id>.png|.jpg|.mp4`, and returns `url`, `revised_prompt`, `markdown`, and `local_download_cmd` (`curl`) so the coding agent saves the file directly into the user's workspace.
 2. **Direct Chat / Responses (no tools)**: Asking Gemini to generate an image or video streams the response and rewrites upstream `lh3.googleusercontent.com` / `contribution.usercontent.google.com` links into local `/v1/media/<id>` URLs that open or download without requiring Google cookies.
 3. **Dedicated OpenAI Endpoints**: `POST /v1/images/generations` (`response_format`: `url` or `b64_json`, `aspect_ratio`/`size`, `format`/`output_format`, returns `revised_prompt`) and `POST /v1/videos/generations` (`aspect_ratio`, `duration`, returns MP4 `url` and `thumbnail_url`).
+
+## Web search, grounding, and the MCP server
+
+When Gemini Web answers with Google Search grounding, `gsb` extracts the citations and appends them to the end of the answer under a `Sources:` heading. Set `BRIDGE_INCLUDE_GROUNDING=0` to return the answer without them.
+
+The same grounding is exposed as an MCP tool at `POST /mcp` (alias `/v1/mcp`), so a coding agent can search the web through the account pool:
+
+```json
+{
+  "mcpServers": {
+    "gemini-search": {
+      "type": "http",
+      "url": "http://127.0.0.1:20133/mcp",
+      "headers": { "Authorization": "Bearer gsb-pool" }
+    }
+  }
+}
+```
+
+The tool is `web_search` with a required `query` argument and an optional `model` override. The endpoint speaks MCP Streamable HTTP with JSON-RPC 2.0: it is `POST`-only (no server-initiated stream), notifications get a `202` with an empty body, and the pool, group, and account keys are all accepted. A search runs as a temporary chat, so it does not add threads to the user's Gemini conversation list, and it consumes the same account quota as a normal request.
+
+A grounded answer is a full model turn and takes as long as the model thinks (measured between 14 and 110 seconds). When reporting a slow or "hung" search, check whether a request is still in flight before assuming the endpoint is broken.
+
+## Per-account proxies
+
+Each account can egress through its own HTTP or SOCKS5 proxy, set per account file (`proxyUrl` in the Web UI's *Add Google Account* dialog) or via `BRIDGE_EGRESS_PER_ACCOUNT="acct-a:socks5://127.0.0.1:1081"`. An account without its own proxy uses `BRIDGE_PROXY_SERVER`. Changing an account's proxy rebuilds its transport session so no connection survives from the previous egress.

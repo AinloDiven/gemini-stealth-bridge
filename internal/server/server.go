@@ -86,6 +86,7 @@ type AccountState struct {
 type AuthScope struct {
 	OK        bool
 	AccountID string
+	Group     string
 	Admin     bool
 }
 
@@ -111,6 +112,7 @@ type Server struct {
 	mu                sync.RWMutex
 	accounts          []*AccountState
 	tokenToAcct       map[string]string
+	tokenToGroup      map[string]string
 	sessionCache      map[string][]any
 	sessionCacheAt    map[string]time.Time
 	sessionOrder      []string
@@ -176,11 +178,17 @@ func New(cfg config.Config) *Server {
 		tokMap[k] = v
 	}
 
+	grpMap := make(map[string]string, len(cfg.GroupTokens))
+	for k, v := range cfg.GroupTokens {
+		grpMap[k] = v
+	}
+
 	s := &Server{
 		Cfg:            cfg,
 		Pool:           pool,
 		Rotator:        rotator,
 		tokenToAcct:    tokMap,
+		tokenToGroup:   grpMap,
 		sessionCache:   make(map[string][]any),
 		sessionCacheAt: make(map[string]time.Time),
 		uploadCache:    make(map[string]cachedUpload),
@@ -233,6 +241,10 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 	if acctID, ok := s.tokenToAcct[token]; ok && token != "" {
 		s.mu.RUnlock()
 		return AuthScope{OK: true, AccountID: acctID}
+	}
+	if group, ok := s.tokenToGroup[token]; ok && token != "" {
+		s.mu.RUnlock()
+		return AuthScope{OK: true, Group: group}
 	}
 	explicitTokens := len(s.Cfg.AccountTokens) > 0
 	s.mu.RUnlock()
@@ -310,6 +322,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case (r.Method == http.MethodGet || r.Method == http.MethodHead) && (strings.HasPrefix(p, "/v1/media/") || strings.HasPrefix(p, "/media/")):
 		s.HandleGetMedia(w, r)
+		return
+	case (p == "/mcp" || p == "/v1/mcp"):
+		s.HandleMCP(w, r)
 		return
 	case s.Cfg.WebUI && r.Method == http.MethodGet && (p == "/" || p == "/ui" || p == "/ui/" || p == "/dashboard"):
 		s.HandleWebUI(w, r)

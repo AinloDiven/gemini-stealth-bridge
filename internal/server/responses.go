@@ -847,6 +847,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			lastVideos            []gemini.GeneratedVideo
 			lastCID, lastRID      string
 			lastContextToken      string
+			grounding             []gemini.GroundingSource
 			attemptStateMu        sync.Mutex
 		)
 		observeIdentity := func(ansID, ansLabel string) {
@@ -919,6 +920,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				if update.ContextToken != "" {
 					lastContextToken = update.ContextToken
 				}
+				grounding = gemini.MergeGroundingSources(grounding, update.GroundingSources)
 				for _, frame := range update.Frames {
 					if !selected {
 						candidateID = frame.RCID
@@ -1021,6 +1023,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}
 		if upstream != nil && upstream.Status > 0 {
 			lastUpstreamStatus = upstream.Status
+		}
+		if upstream != nil {
+			grounding = gemini.MergeGroundingSources(grounding, upstream.GroundingSources)
 		}
 
 		interpreted, runCheck := s.evaluateAttemptCompletion(
@@ -1358,6 +1363,14 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			}
 		} else {
 			contentStr = text
+			if sentText == "" && thoughts != "" {
+				contentStr = stripLeakedThoughtsFromContent(contentStr, thoughts)
+			}
+		}
+		// Web-search citations are appended to the answer so the client sees the
+		// sources the model actually used, in the order Google returned them.
+		if s.Cfg.IncludeGrounding && len(grounding) > 0 && len(calls) == 0 {
+			contentStr = appendGroundingCitations(contentStr, grounding)
 		}
 
 		oaCalls := toolbridge.ToOpenAIToolCalls(calls)

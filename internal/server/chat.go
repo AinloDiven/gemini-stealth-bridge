@@ -328,6 +328,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			lastVideos            []gemini.GeneratedVideo
 			lastCID, lastRID      string
 			lastContextToken      string
+			grounding             []gemini.GroundingSource
 		)
 		observeIdentity := func(ansID, ansLabel string) {
 			if ansID == "" {
@@ -430,6 +431,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				if update.ContextToken != "" {
 					lastContextToken = update.ContextToken
 				}
+				grounding = gemini.MergeGroundingSources(grounding, update.GroundingSources)
 				for _, frame := range update.Frames {
 					if !selected {
 						candidateID = frame.RCID
@@ -547,6 +549,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		}
 		if upstream != nil && upstream.Status > 0 {
 			lastUpstreamStatus = upstream.Status
+		}
+		if upstream != nil {
+			grounding = gemini.MergeGroundingSources(grounding, upstream.GroundingSources)
 		}
 
 		interpreted, runCheck := s.evaluateAttemptCompletion(
@@ -894,6 +899,15 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 				content = nil
 			}
+		} else if sentText == "" && thoughts != "" {
+			content = stripLeakedThoughtsFromContent(text, thoughts)
+		}
+		// Web-search citations are appended to the answer so the client sees the
+		// sources the model actually used, in the order Google returned them.
+		if s.Cfg.IncludeGrounding && len(grounding) > 0 {
+			if textStr, ok := content.(string); ok {
+				content = appendGroundingCitations(textStr, grounding)
+			}
 		}
 		var served map[string]any
 		if servedID != "" {
@@ -949,10 +963,15 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		if stream {
 			startStream(false)
 			if buffered && len(calls) == 0 {
-				if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
+				if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) {
 					emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
 					sentThought = thoughts
 				}
+			}
+			if len(calls) == 0 {
+				// The citations are part of the answer, so whatever has not been
+				// streamed yet (the answer tail in eager mode, the citation list
+				// in both modes) is emitted here.
 				if contentStr, ok := content.(string); ok {
 					if tail, ok := remainingStreamTail(contentStr, sentText); ok && tail != "" {
 						emit(sseDeltaContent{Content: tail}, nil, nil)
@@ -1244,6 +1263,26 @@ func parseRetryAfterDuration(ue *transport.UpstreamError, maxWait time.Duration,
 	return wait
 }
 
+func stripLeakedThoughtsFromContent(text, thoughts string) string {
+	if text == "" || thoughts == "" {
+		return text
+	}
+	trimmedThoughts := strings.TrimSpace(thoughts)
+	if trimmedThoughts == "" {
+		return text
+	}
+	cand := strings.TrimSpace(text)
+	cand = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(cand, "💭"), "🧠"))
+	if strings.HasPrefix(cand, trimmedThoughts) {
+		rem := strings.TrimSpace(cand[len(trimmedThoughts):])
+		rem = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(rem, "']/['"), ")]"))
+		if rem != "" {
+			return rem
+		}
+	}
+	return text
+}
+
 func mergeStreamedThoughts(prev, next string) string {
 	if next == "" {
 		return prev
@@ -1255,6 +1294,23 @@ func mergeStreamedThoughts(prev, next string) string {
 		return prev + next[len(trimmedPrev):]
 	}
 	if strings.Contains(prev, next) {
+		return prev
+	}
+	// If prev and next share a long common prefix (e.g., prev had a trailing
+	// partial seam marker that was trimmed once the seam completed), extend prev
+	// monotonically instead of duplicating the entire thought block.
+	minLen := len(prev)
+	if len(next) < minLen {
+		minLen = len(next)
+	}
+	common := 0
+	for common < minLen && prev[common] == next[common] {
+		common++
+	}
+	if common >= 32 && common >= len(prev)-16 {
+		if len(next) > common {
+			return prev + next[common:]
+		}
 		return prev
 	}
 	return appendPreambleToThoughts(prev, next)

@@ -33,14 +33,15 @@ type GeneratedVideo struct {
 
 // Frame is a single parsed candidate frame from a wrb.fr envelope.
 type Frame struct {
-	RCID               string           `json:"rcid"`
-	Text               string           `json:"text"`
-	Thoughts           string           `json:"thoughts"`
-	Done               bool             `json:"done"`
-	AnsweredModelID    string           `json:"answeredModelId,omitempty"`
-	AnsweredModelLabel string           `json:"answeredModelLabel,omitempty"`
-	GeneratedImages    []GeneratedImage `json:"generatedImages,omitempty"`
-	GeneratedVideos    []GeneratedVideo `json:"generatedVideos,omitempty"`
+	RCID               string            `json:"rcid"`
+	Text               string            `json:"text"`
+	Thoughts           string            `json:"thoughts"`
+	Done               bool              `json:"done"`
+	AnsweredModelID    string            `json:"answeredModelId,omitempty"`
+	AnsweredModelLabel string            `json:"answeredModelLabel,omitempty"`
+	GeneratedImages    []GeneratedImage  `json:"generatedImages,omitempty"`
+	GeneratedVideos    []GeneratedVideo  `json:"generatedVideos,omitempty"`
+	GroundingSources   []GroundingSource `json:"groundingSources,omitempty"`
 }
 
 // LineParseResult holds the parsed contents of one StreamGenerate line.
@@ -55,6 +56,7 @@ type LineParseResult struct {
 	MediaToolActive    bool
 	StreamEnd          bool
 	Frames             []Frame
+	GroundingSources   []GroundingSource
 }
 
 var (
@@ -827,6 +829,7 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 							res.AnsweredModelID = ""
 							res.AnsweredModelLabel = ""
 						}
+						res.GroundingSources = MergeGroundingSources(res.GroundingSources, frame.GroundingSources)
 						res.Frames = append(res.Frames, frame)
 					}
 				}
@@ -908,6 +911,8 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 	}
 	text, thoughts = sanitizeCandidateTextAndThoughts(text, thoughts, done)
 
+	grounding := extractGroundingSources(c)
+
 	var mdParts []string
 	for _, img := range images {
 		if strings.Contains(text, img.URL) {
@@ -954,6 +959,7 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		AnsweredModelLabel: answeredLabel,
 		GeneratedImages:    images,
 		GeneratedVideos:    videos,
+		GroundingSources:   grounding,
 	}, true
 }
 

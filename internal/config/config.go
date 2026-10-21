@@ -27,6 +27,8 @@ type Config struct {
 	CookieDB                string
 	APIKey                  string
 	AccountTokens           map[string]string
+	GroupTokens             map[string]string
+	IncludeGrounding        bool
 	Temporary               bool
 	RejectDowngrade         bool
 	LiveThoughts            bool
@@ -206,6 +208,7 @@ func FromEnv() *Config {
 	accountsDir := filepath.Join(bridgeHome, "accounts")
 
 	tokens := parseKeyValMap(lookup("BRIDGE_ACCOUNT_TOKENS"))
+	groupTokens := parseKeyValMap(lookup("BRIDGE_GROUP_TOKENS"))
 	accountGroups := parseKeyValMap(lookup("BRIDGE_ACCOUNT_GROUP"))
 	egressPerAccount := parseKeyValMap(lookup("BRIDGE_EGRESS_PER_ACCOUNT"))
 
@@ -284,6 +287,8 @@ func FromEnv() *Config {
 		CookieDB:                lookup("CHROME_COOKIES"),
 		APIKey:                  lookupStr("BRIDGE_API_KEY", "public"),
 		AccountTokens:           tokens,
+		GroupTokens:             groupTokens,
+		IncludeGrounding:        lookupBool("BRIDGE_INCLUDE_GROUNDING", true),
 		Temporary:               lookupBool("BRIDGE_TEMPORARY", false),
 		RejectDowngrade:         lookupBool("BRIDGE_REJECT_DOWNGRADE", true),
 		LiveThoughts:            lookupBool("BRIDGE_LIVE_THOUGHTS", true),
