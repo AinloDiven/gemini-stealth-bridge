@@ -1369,6 +1369,18 @@ func classifyRPCErrorCode(code int, raw any) error {
 			nil,
 			nil,
 		)
+	case 1185:
+		// Observed on accounts with plenty of quota left, so it is not a quota
+		// signal: Gemini Web fails the turn on its side. Report it as a retryable
+		// upstream degradation so the pool can fail over to a healthier account
+		// instead of surfacing a bare number to the caller.
+		return transport.NewUpstreamError(
+			fmt.Sprintf("upstream error code 1185: Gemini Web failed the turn upstream; retrying on another account usually succeeds: %s", snippet),
+			502,
+			"upstream_degraded",
+			nil,
+			nil,
+		)
 	case 1050, 1052:
 		return transport.NewUpstreamError(
 			fmt.Sprintf("upstream error code %d", code),

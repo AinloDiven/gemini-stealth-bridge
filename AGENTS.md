@@ -153,8 +153,9 @@ Two supported paths:
 2. **One-click isolated browser with a local helper**
    - On the laptop: `gsb --login-helper` (listens on `127.0.0.1:20134`).
    - Forward both ports: `ssh -L 20133:127.0.0.1:20133 -L 20134:127.0.0.1:20134 user@vps`.
-   - In the VPS Web UI: **+ Add Account → Launch Isolated Browser**.
+   - In the VPS Web UI: **+ Add Account → Isolated browser window → Launch**.
    - The page calls the VPS first; if the VPS has no browser/GUI, it falls back to the local helper and posts the captured cookie to the VPS import endpoint.
+   - Account name, proxy, and group are collapsed under **Optional settings** in that dialog; leave them closed for a normal single-key setup.
 
 ### 4.3 Cookie import is acceptable only when the profile is already signed in
 
@@ -691,7 +692,7 @@ Docker always looks remote because of bridge NAT. Tell users to set `BRIDGE_ADMI
 ### 14.3 Tabs and actions
 
 - Accounts tab: pool/per-account keys, quota bars, filters, priority `↑`/`↓`, `⋯` menu (Refresh, Pause/Resume, Unquarantine/Reset failures, Copy Key, Remove), Refresh All.
-- Add Account: Incognito cookie paste, Launch Isolated Browser (with local helper fallback), optional name/proxy/group.
+- Add Account: Incognito cookie paste plus an isolated-browser launcher (with local helper fallback). Account name, proxy, and group are collapsed under **Optional settings**.
 - Runtime configuration: strategy, quota preflight, priority, default thinking, RPM, concurrency, downgrade rejection, live thoughts, live tool calls, tool preamble, history offload. Apply in memory or persist to `config.env`.
 
 ### 14.4 Admin API

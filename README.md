@@ -348,20 +348,18 @@ Status badges map the API statuses to UI labels: `ok` → Ready, `disabled` → 
 
 ### 5.3 Add Account
 
-The **+ Add Account** dialog offers two isolated methods plus optional metadata:
+The **+ Add Account** dialog offers two isolated methods. Only the cookie box is visible by default; account name, proxy, and group live under **Optional settings**.
 
-1. **Paste cookies from an Incognito window** (works locally and over SSH):
+1. **Isolated browser window** (recommended): the daemon opens a disposable browser profile and auto-captures cookies on sign-in. On a headless VPS, the page falls back to the local helper at `http://127.0.0.1:20134` when the server reports no browser/GUI. Run `gsb --login-helper` on your laptop and forward both ports (`ssh -L 20133:127.0.0.1:20133 -L 20134:127.0.0.1:20134 user@vps`).
+2. **Incognito session cookies** (works locally and over SSH):
    - Open a new Incognito window (`Ctrl+Shift+N`), sign in to `gemini.google.com/app`, export cookies with Cookie-Editor (or copy the `Cookie` header), then immediately close the Incognito window **without signing out**.
    - Paste the JSON array or raw header into the dialog.
-2. **Launch Isolated Browser**:
-   - The daemon opens a disposable browser profile and auto-captures cookies on sign-in.
-   - On a headless VPS, the page falls back to the local helper at `http://127.0.0.1:20134` when the server reports no browser/GUI. Run `gsb --login-helper` on your laptop and forward both ports (`ssh -L 20133:127.0.0.1:20133 -L 20134:127.0.0.1:20134 user@vps`).
 
 Optional fields:
 
-- **Custom Account Name** — leave blank to derive an ID from the Google email.
-- **Outbound Proxy** — per-account HTTP/SOCKS5 proxy; blank uses `BRIDGE_PROXY_SERVER`.
-- **Account Group** — used by group keys and group-scoped failover.
+- **Account name** — leave blank to derive an ID from the Google email.
+- **Outbound proxy** — per-account HTTP/SOCKS5 proxy; blank uses `BRIDGE_PROXY_SERVER`.
+- **Account group** — only needed when you issue group keys; ignore it for a single pool key.
 
 For an already-signed-in local browser profile, use the CLI: `gsb --import-chrome <name>`.
 
@@ -501,8 +499,8 @@ gsb --web
 
 Then open `http://127.0.0.1:20133/ui` locally and use **+ Add Account**:
 
-- **Paste cookies** from an Incognito window (works everywhere), or
-- **Launch Isolated Browser** with `gsb --login-helper` running on the laptop.
+- **Incognito session cookies** (works everywhere), or
+- **Isolated browser window → Launch** with `gsb --login-helper` running on the laptop.
 
 `gsb --login-helper` listens on `127.0.0.1:20134` and exposes `POST /browser-login`. It allows CORS only from `http://localhost:*` and `http://127.0.0.1:*` origins.
 

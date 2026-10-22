@@ -575,6 +575,11 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	eagerStream := strings.EqualFold(s.Cfg.StreamBufferMode, "eager")
 
 	headersSent := false
+	// handlerDone is set before the handler returns. Keepalive and early-SSE
+	// goroutines outlive the handler, and net/http nils the response writer once
+	// the handler returns; writing or flushing past that point dereferences a nil
+	// bufio.Writer and crashes the whole daemon.
+	var handlerDone atomic.Bool
 	var ttftMs atomic.Int64
 	var headerMs, identityMs atomic.Int64
 	var firstReasoningMs, firstContentMs, firstToolMs atomic.Int64
@@ -622,6 +627,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}
 		streamMu.Lock()
 		defer streamMu.Unlock()
+		if handlerDone.Load() {
+			return
+		}
 		seqNum++
 		ev := make(map[string]any, len(payload)+2)
 		for k, v := range payload {
@@ -636,16 +644,19 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}
 	}
 
-	var keepaliveStop chan struct{}
+	var pinger *streamPinger
+	var pingerMu sync.Mutex
 	stopKeepalive := func() {
-		streamMu.Lock()
-		if keepaliveStop != nil {
-			close(keepaliveStop)
-			keepaliveStop = nil
-		}
-		streamMu.Unlock()
+		pingerMu.Lock()
+		p := pinger
+		pinger = nil
+		pingerMu.Unlock()
+		p.Stop()
 	}
 	defer stopKeepalive()
+	// Defers run LIFO, so this runs before stopKeepalive: the pinger sees
+	// handlerDone and exits instead of writing after the handler returns.
+	defer handlerDone.Store(true)
 
 	// streamStarted closes as soon as the response headers are flushed, so the
 	// grace timer below does not keep a goroutine alive after streaming begins.
@@ -655,7 +666,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 
 	startStreamWith := func(early bool, attempt, upstreamStatus int, retryReason string) {
 		streamMu.Lock()
-		if headersSent || ctx.Err() != nil {
+		if headersSent || ctx.Err() != nil || handlerDone.Load() {
 			streamMu.Unlock()
 			return
 		}
@@ -673,9 +684,13 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		if flusher != nil {
 			flusher.Flush()
 		}
-		keepaliveStop = make(chan struct{})
-		kaCh := keepaliveStop
 		streamMu.Unlock()
+
+		pingerMu.Lock()
+		if pinger == nil && !handlerDone.Load() {
+			pinger = startStreamPinger(&streamMu, w, flusher, defaultKeepaliveInterval, nil)
+		}
+		pingerMu.Unlock()
 
 		baseResp := map[string]any{
 			"id":         respID,
@@ -688,26 +703,6 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		}
 		emitSSE("response.created", map[string]any{"response": baseResp})
 		emitSSE("response.in_progress", map[string]any{"response": baseResp})
-
-		go func() {
-			ticker := time.NewTicker(15 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-kaCh:
-					return
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					streamMu.Lock()
-					_, _ = io.WriteString(w, ": ping\n\n")
-					if flusher != nil {
-						flusher.Flush()
-					}
-					streamMu.Unlock()
-				}
-			}
-		}()
 	}
 
 	// startStream reads the caller-owned attempt diagnostics, so it must only be
@@ -1095,6 +1090,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					errCode == "upstream_connect_timeout" ||
 					errCode == "upstream_stalled" ||
 					errCode == "upstream_timeout" ||
+					errCode == "upstream_degraded" ||
 					errCode == "model_identity_unknown" ||
 					errCode == "model_identity_conflict"))) && !payloadCommitted()
 			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
@@ -1189,6 +1185,32 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							continue
 						}
 					}
+				}
+				if errCode == "upstream_degraded" {
+					// Gemini Web failed the turn on its side while the account still
+					// has quota. Prefer a different account; if the request is pinned
+					// or the pool is spent, retry once on a fresh socket.
+					lastRetryReason = errCode
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct)
+							model = nextModel
+							opts.Model = nextModel
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
+					}
+					freshSocketNext = true
+					rebootstrapNext = true
+					opts.Metadata = nil
+					opts.Files = nil
+					curPrompt = fullPrompt
+					attachmentParts = fullAttachmentParts
+					continue
 				}
 				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" {
 					lastRetryReason = errCode

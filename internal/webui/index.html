@@ -28,6 +28,7 @@
       --status-err-bg: #FEE2E2;
       --status-err-fg: #B91C1C;
       --shadow-modal: 0 16px 40px rgba(20, 20, 19, 0.18);
+      --scroll-shadow: rgba(20, 20, 19, 0.16);
       --backdrop: rgba(20, 20, 19, 0.5);
     }
 
@@ -53,6 +54,7 @@
       --status-err-bg: rgba(127, 29, 29, 0.38);
       --status-err-fg: #F87171;
       --shadow-modal: 0 16px 48px rgba(0, 0, 0, 0.65);
+      --scroll-shadow: rgba(0, 0, 0, 0.55);
       --backdrop: rgba(0, 0, 0, 0.72);
     }
 
@@ -956,7 +958,35 @@
       box-shadow: var(--shadow-modal);
       width: 100%;
       max-width: 520px;
+      max-height: calc(100vh - 32px);
+      max-height: calc(100dvh - 32px);
       padding: 24px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* The body is the only scrollable region; header and actions stay put so the
+       primary action is reachable on short viewports. The inset shadow signals
+       that more content continues below the fold. */
+    .modal-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      margin: 0 -24px;
+      padding: 0 24px;
+      box-shadow: inset 0 -12px 12px -12px var(--scroll-shadow);
+      scrollbar-width: thin;
+      scrollbar-color: var(--border-strong) transparent;
+    }
+
+    .modal-body::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    .modal-body::-webkit-scrollbar-thumb {
+      background: var(--border-strong);
+      border-radius: 4px;
     }
 
     .modal-header {
@@ -965,6 +995,111 @@
       justify-content: space-between;
       gap: 12px;
       margin-bottom: 16px;
+      flex: 0 0 auto;
+    }
+
+    /* Sign-in method picker */
+    .signin-option {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+
+    .signin-option-text {
+      min-width: 0;
+    }
+
+    .signin-option-title {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .signin-option-tag {
+      font-size: 0.625rem;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: var(--status-ok-fg);
+      background: var(--status-ok-bg);
+      border-radius: 4px;
+      padding: 1px 6px;
+    }
+
+    .signin-divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text-secondary);
+      font-size: 0.6875rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .signin-divider::before,
+    .signin-divider::after {
+      content: "";
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* Collapsed optional sections */
+    .advanced {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface-subtle);
+    }
+
+    .advanced > summary {
+      cursor: pointer;
+      padding: 9px 12px;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .advanced > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .advanced > summary::after {
+      content: "+";
+      color: var(--text-secondary);
+      font-weight: 400;
+    }
+
+    .advanced[open] > summary::after {
+      content: "\2212";
+    }
+
+    .advanced > summary:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+      border-radius: 8px;
+    }
+
+    .advanced-body {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 0 12px 12px;
+    }
+
+    #inp-acct-cookie {
+      min-height: 92px;
     }
 
     .modal-title {
@@ -986,6 +1121,14 @@
       margin-top: 20px;
       padding-top: 16px;
       border-top: 1px solid var(--border);
+      flex: 0 0 auto;
+    }
+
+    .modal-form {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      flex: 1 1 auto;
     }
 
     /* Tablet Breakpoint */
@@ -1094,6 +1237,35 @@
       .row-actions {
         justify-content: flex-start;
         flex-wrap: wrap;
+      }
+
+      .modal-backdrop {
+        padding: 8px;
+      }
+
+      .modal-card {
+        padding: 16px;
+        max-height: calc(100dvh - 16px);
+        border-radius: 8px;
+      }
+
+      .modal-body {
+        margin: 0 -16px;
+        padding: 0 16px;
+      }
+
+      .modal-actions {
+        margin-top: 12px;
+        padding-top: 12px;
+      }
+
+      .signin-option {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .signin-option .btn {
+        width: 100%;
       }
     }
   </style>
@@ -1341,46 +1513,56 @@
       <div class="modal-header">
         <div>
           <h2 id="import-modal-title" class="modal-title">Add Google Account</h2>
-          <p class="modal-subtitle">Choose an isolated sign-in method so your main Chrome browser and gsb never fight over cookie rotation.</p>
+          <p class="modal-subtitle">Use an isolated session so Chrome and gsb never rotate the same cookies.</p>
         </div>
         <button type="button" id="btn-import-close" class="btn btn-ghost">Close</button>
       </div>
 
-      <div style="background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; font-size: 0.78rem; line-height: 1.45;">
-        <div style="color: var(--status-warn-fg); font-weight: 500; margin-bottom: 4px;">Why sessions expire if copied from your main Chrome:</div>
-        <div style="color: var(--text-secondary);">Copying cookies from an active daily Chrome tab makes Chrome and <code class="mono">gsb</code> share the same Google session (<code class="mono">SID</code>). When one rotates <code class="mono">__Secure-1PSIDTS</code>, the other expires. Always use one of the two isolated methods below:</div>
-      </div>
+      <form id="form-import" class="modal-form" novalidate>
+        <div class="modal-body">
+          <div class="form-stack">
+            <div class="signin-option">
+              <div class="signin-option-text">
+                <div class="signin-option-title">
+                  Isolated browser window
+                  <span class="signin-option-tag">Recommended</span>
+                </div>
+                <div class="helper">Opens a disposable profile, captures cookies, then closes it. Needs a desktop GUI on the machine running gsb.</div>
+              </div>
+              <button type="button" id="btn-isolated-login" class="btn btn-secondary">Launch</button>
+            </div>
 
-      <div style="background: var(--surface-subtle); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;">
-        <div style="flex: 1; min-width: 220px;">
-          <div style="font-weight: 500; color: var(--text-primary); font-size: 0.8125rem;">Option 2: Isolated Popup Window (Auto-Capture)</div>
-          <div class="helper">Opens a disposable browser profile, captures cookies automatically on login, and closes the window so only <code class="mono">gsb</code> owns the session. (Or run <code class="mono">gsb --login &lt;name&gt;</code> on your desktop).</div>
-        </div>
-        <button type="button" id="btn-isolated-login" class="btn btn-secondary">Launch Isolated Browser</button>
-      </div>
+            <div class="signin-divider">or paste cookies</div>
 
-      <form id="form-import" class="form-stack" novalidate>
-        <div class="field">
-          <div class="field-label-row">
-            <label for="inp-acct-cookie">Option 1: Paste Cookies from an Incognito Window (Ctrl+Shift+N)</label>
-            <span class="source-tag mono">Works Everywhere (Local &amp; Remote SSH)</span>
+            <div class="field">
+              <div class="field-label-row">
+                <label for="inp-acct-cookie">Incognito session cookies</label>
+                <span class="source-tag mono">Ctrl+Shift+N</span>
+              </div>
+              <textarea id="inp-acct-cookie" name="cookie" class="textarea mono" placeholder="Cookie-Editor JSON array or raw Cookie header" spellcheck="false" autocomplete="off" required></textarea>
+              <span class="helper">Sign in to <code class="mono">gemini.google.com/app</code> in an Incognito window, copy the cookies, then close that window without signing out.</span>
+            </div>
+
+            <details class="advanced">
+              <summary>Optional settings</summary>
+              <div class="advanced-body">
+                <div class="field">
+                  <label for="inp-acct-id">Account name</label>
+                  <input id="inp-acct-id" name="id" type="text" class="input mono" placeholder="Auto-named from email" pattern="[A-Za-z0-9._-]{1,64}" autocomplete="off">
+                </div>
+                <div class="field">
+                  <label for="inp-acct-proxy">Outbound proxy</label>
+                  <input id="inp-acct-proxy" name="proxyUrl" type="text" class="input mono" placeholder="socks5://127.0.0.1:1080" autocomplete="off">
+                  <span class="helper">Leave blank to use <code class="mono">BRIDGE_PROXY_SERVER</code>.</span>
+                </div>
+                <div class="field">
+                  <label for="inp-acct-group">Account group</label>
+                  <input id="inp-acct-group" name="accountGroup" type="text" class="input mono" placeholder="Optional" autocomplete="off">
+                  <span class="helper">Only needed for a group key (<code class="mono">BRIDGE_GROUP_TOKENS</code>). Ignore it for single-key setups.</span>
+                </div>
+              </div>
+            </details>
           </div>
-          <div class="helper" style="margin-bottom: 4px;">1. Open a <strong>New Incognito Window (Ctrl+Shift+N)</strong> &amp; sign in to <code class="mono">gemini.google.com/app</code>.<br>2. Copy cookies via Cookie-Editor &amp; paste below.<br>3. <strong>Immediately close the Incognito window (X)</strong> <em>without clicking Sign Out</em> so Chrome stops rotating that session.</div>
-          <textarea id="inp-acct-cookie" name="cookie" class="textarea mono" placeholder="Paste exported JSON array from Cookie-Editor or raw Cookie header..." spellcheck="false" autocomplete="off" required></textarea>
-        </div>
-        <div class="field">
-          <label for="inp-acct-id">Custom Account Name (Optional)</label>
-          <input id="inp-acct-id" name="id" type="text" class="input mono" placeholder="Leave blank to auto-name from email (e.g. bacotsih4)" pattern="[A-Za-z0-9._-]{1,64}" autocomplete="off">
-        </div>
-        <div class="field">
-          <label for="inp-acct-proxy">Outbound Proxy for This Account (Optional)</label>
-          <input id="inp-acct-proxy" name="proxyUrl" type="text" class="input mono" placeholder="socks5://127.0.0.1:1080 or http://user:pass@host:port" autocomplete="off">
-          <span class="helper">This account's traffic leaves through this proxy only. Leave blank to use the daemon-wide <code class="mono">BRIDGE_PROXY_SERVER</code>.</span>
-        </div>
-        <div class="field">
-          <label for="inp-acct-group">Account Group (Optional)</label>
-          <input id="inp-acct-group" name="accountGroup" type="text" class="input mono" placeholder="e.g. team-a" autocomplete="off">
-          <span class="helper">Accounts in the same group share failover and can be served together by one group API key (<code class="mono">BRIDGE_GROUP_TOKENS</code>).</span>
         </div>
 
         <div class="modal-actions">
@@ -1402,11 +1584,13 @@
         <button type="button" id="btn-auth-cancel" class="btn btn-ghost">Close</button>
       </div>
 
-      <form id="form-auth" class="form-stack">
-        <div class="field">
-          <label for="inp-admin-token">Access Key</label>
-          <input id="inp-admin-token" type="password" class="input mono" placeholder="Enter admin or pool key" autocomplete="current-password">
-          <span class="helper">Kept in this tab's sessionStorage only.</span>
+      <form id="form-auth" class="modal-form">
+        <div class="modal-body">
+          <div class="field">
+            <label for="inp-admin-token">Access Key</label>
+            <input id="inp-admin-token" type="password" class="input mono" placeholder="Enter admin or pool key" autocomplete="current-password">
+            <span class="helper">Kept in this tab's sessionStorage only.</span>
+          </div>
         </div>
         <div class="modal-actions">
           <button type="submit" class="btn btn-primary">Save Key &amp; Connect</button>
@@ -2243,7 +2427,7 @@
           showBanner('err', err.message);
         } finally {
           btn.disabled = false;
-          btn.textContent = 'Launch Isolated Browser';
+          btn.textContent = 'Launch';
         }
       });
 

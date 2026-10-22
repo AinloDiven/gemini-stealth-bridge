@@ -28,6 +28,17 @@ func TestParseFrameLineSkipsNullKeepaliveAndExtractsMetadata(t *testing.T) {
 	if !errors.As(err, &ue) || ue.StatusCode != 429 || ue.Code != "rate_limit_error" {
 		t.Fatalf("expected 429 rate_limit_error on 1037 frame, got %v", err)
 	}
+
+	// 1185 is an upstream turn failure, not a quota signal: it must stay
+	// retryable so the pool can fail over to a healthier account.
+	degradedFrame := `[["wrb.fr",null,null,null,null,[8,null,[["type.googleapis.com/assistant.lamda.BardFrontendService",[[1185]]]]]]]`
+	_, err = ParseFrameLine(degradedFrame)
+	if !errors.As(err, &ue) || ue.StatusCode != 502 || ue.Code != "upstream_degraded" {
+		t.Fatalf("expected 502 upstream_degraded on 1185 frame, got %v", err)
+	}
+	if !strings.Contains(ue.Message, "1185") {
+		t.Fatalf("expected the message to keep the upstream code for diagnostics, got %q", ue.Message)
+	}
 }
 
 func TestParseFrameLineExtractsAnsweredModelAndThoughts(t *testing.T) {
