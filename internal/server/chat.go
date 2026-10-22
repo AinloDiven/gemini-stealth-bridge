@@ -87,24 +87,15 @@ func buildActionStatusPayload(operationID string, a *gemini.ActionStatus) map[st
 	if progress == "" && template == "" {
 		return nil
 	}
-	state := strings.TrimSpace(a.State)
-	if state == "" {
-		state = "active"
-	}
+	// A tool/thinking card is a progress observation, not the generation's
+	// terminal signal. The web client keeps the turn active after a tool card
+	// completes, and the bot treats a terminal frame as final for the whole
+	// operation, so these cards are always non-terminal.
+	state := "active"
 	terminal := false
 	leaseSeconds := 300
 	if phase == "generating_media" {
 		leaseSeconds = 1020
-	}
-	switch state {
-	case "complete":
-		phase = "completed"
-		terminal = true
-		leaseSeconds = 0
-	case "failed":
-		phase = "failed"
-		terminal = true
-		leaseSeconds = 0
 	}
 	payload := map[string]any{
 		"operation_id":       operationID + ":generation",

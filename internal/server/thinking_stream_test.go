@@ -66,7 +66,7 @@ func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 				ToolID:         "skills",
 				ToolTitle:      "Skill Title",
 				StatusTemplate: "{tool_logo_placeholder} Skills: Eksie",
-				State:          "active",
+				State:          "complete",
 			},
 			Frames: []gemini.Frame{makeFrame("answer", "", true, testModel.ModelID)},
 		}); err != nil {
@@ -84,6 +84,8 @@ func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 		`"status_template":"{tool_logo_placeholder} Skills: Eksie"`,
 		`"progress_detail":"Skill Title"`,
 		`"source_type":"tool_progress"`,
+		`"state":"active"`,
+		`"terminal":false`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected SSE body to contain %s, got:\n%s", want, body)

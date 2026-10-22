@@ -145,9 +145,10 @@ Tool cards add the icon inputs the bot already understands:
 `provider` is the wire tool id and `status_template` is field `[1][1][5]` only
 when it still contains `{tool_logo_placeholder}`. The bot resolves that pair to
 its own icon; no icon URL or invented id is sent. Upstream's branch-1 thinking
-payload has no icon field at all, so a thinking title is text-only. A tool state
-of `complete`/`failed` is projected to the matching terminal phase so the
-lifecycle remains schema-consistent.
+payload has no icon field at all, so a thinking title is text-only. A tool card
+is always relayed as `state:"active"`/`terminal:false`: completing one tool step
+does not end the generation, and the bot treats a terminal frame as final for
+the whole operation.
 
 If the `cCSu7` handle cannot be bound, the turn still runs and still keeps the
 configured `/skill` text projection at byte 0; only slot 81 is left empty.

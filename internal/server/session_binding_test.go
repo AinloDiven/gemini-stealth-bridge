@@ -174,6 +174,22 @@ func TestSessionHeaderValidation(t *testing.T) {
 	}
 }
 
+func TestSessionBindingPersistsAcrossRestart(t *testing.T) {
+	srv, _ := newTestHarness(false, true)
+	srv.Cfg.HomeDir = t.TempDir()
+	key := "sid:test-restart"
+	srv.putSessionBinding(sessionBinding{
+		Key: key, AccountID: "acct", Model: testModel.ModelName,
+		Meta:    []any{"cid", "rid", "rcid", nil, nil, nil, nil, nil, nil, "ctx"},
+		NextLen: 2, HistoryHash: "hash",
+	})
+	restarted := New(srv.Cfg)
+	got := restarted.getSessionBinding(key)
+	if got == nil || got.AccountID != "acct" || got.NextLen != 2 || got.HistoryHash != "hash" {
+		t.Fatalf("binding did not survive restart: %+v", got)
+	}
+}
+
 func TestDefaultModelFallsBackWhenUnavailable(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 	srv.Cfg.DefaultModel = "missing-model"
