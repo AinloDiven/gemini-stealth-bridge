@@ -77,9 +77,10 @@ func TestExplicitSessionBindingReusesContinuation(t *testing.T) {
 	}
 }
 
-// TestExplicitSessionBindingDropsOnModelChange keeps the upstream conversation
-// from being replayed across a model switch.
-func TestExplicitSessionBindingDropsOnModelChange(t *testing.T) {
+// TestExplicitSessionBindingSurvivesModelChange preserves the same upstream
+// conversation when the caller switches models; an upstream rejection still
+// falls back to the full prompt through the normal retry path.
+func TestExplicitSessionBindingSurvivesModelChange(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
 	alt := testModel
 	alt.ModelName = "gemini-flash-alt"
@@ -119,8 +120,8 @@ func TestExplicitSessionBindingDropsOnModelChange(t *testing.T) {
 	if rec2.Code != 200 {
 		t.Fatalf("turn 2 failed: %d %s", rec2.Code, rec2.Body.String())
 	}
-	if len(metas[1]) != 0 {
-		t.Fatalf("model change must not reuse the old continuation, got %#v", metas[1])
+	if len(metas[1]) == 0 {
+		t.Fatal("model change must reuse the old continuation instead of starting a new session")
 	}
 }
 

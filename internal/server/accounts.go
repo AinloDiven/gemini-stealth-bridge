@@ -1754,13 +1754,19 @@ func (s *Server) prepareGeneration(
 	}
 	mid := model.ModelName
 
-	if binding != nil && binding.Model != mid {
-		binding = nil
-	}
+	// A model switch must not silently start a new Gemini conversation. The
+	// stored continuation was minted by another model, so validate the history
+	// prefix against the model recorded in the binding, then reuse its metadata
+	// with the newly selected model. If upstream rejects the continuation, the
+	// normal retry path drops it and falls back to the full prompt.
 	bindingSplit := -1
 	if binding != nil && binding.NextLen > 0 && binding.HistoryHash != "" && hasher != nil {
+		hashModel := binding.Model
+		if hashModel == "" {
+			hashModel = mid
+		}
 		for split := binding.NextLen; split < len(messages); split++ {
-			if hasher.HashPrefix(account.ID, mid, split) == binding.HistoryHash {
+			if hasher.HashPrefix(account.ID, hashModel, split) == binding.HistoryHash {
 				bindingSplit = split
 				break
 			}
