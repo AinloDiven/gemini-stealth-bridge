@@ -28,6 +28,7 @@ import (
 )
 
 var reSafeID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+var reSafeSession = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 
 // UpstreamClient abstracts an account's Gemini Web operations so unit tests can
 // inject deterministic frame streams while production uses *gemini.AccountClient.
@@ -42,6 +43,13 @@ type UpstreamClient interface {
 	InvalidateAuth()
 }
 
+// skillRuntimeBinder is an optional account-client capability. Keeping it out of
+// UpstreamClient preserves the existing test doubles while the real client
+// implements cloud Skill resolution.
+type skillRuntimeBinder interface {
+	BindSkillRuntime(ctx context.Context, name string) (string, error)
+}
+
 // AccountState holds the server-side state and cached metadata for one Google account.
 type AccountState struct {
 	mu               sync.RWMutex
@@ -54,6 +62,7 @@ type AccountState struct {
 	ProfileID        string
 	AccountGroup     string
 	ProxyURL         string
+	Skill            string
 	Quarantined      bool
 	QuarantineReason string
 	Disabled         bool
@@ -88,6 +97,8 @@ type AuthScope struct {
 	AccountID string
 	Group     string
 	Admin     bool
+	Token     string
+	SessionID string
 }
 
 // canStreamVerified is the single commit predicate for model output in both
@@ -116,6 +127,7 @@ type Server struct {
 	sessionCache      map[string][]any
 	sessionCacheAt    map[string]time.Time
 	sessionOrder      []string
+	sessionBindings   map[string]sessionBinding
 	uploadCache       map[string]cachedUpload
 	uploadOrder       []string
 	lastHotLoadAt     time.Time
@@ -184,18 +196,20 @@ func New(cfg config.Config) *Server {
 	}
 
 	s := &Server{
-		Cfg:            cfg,
-		Pool:           pool,
-		Rotator:        rotator,
-		tokenToAcct:    tokMap,
-		tokenToGroup:   grpMap,
-		sessionCache:   make(map[string][]any),
-		sessionCacheAt: make(map[string]time.Time),
-		uploadCache:    make(map[string]cachedUpload),
-		startedAt:      time.Now().UTC(),
-		clock:          time.Now,
+		Cfg:             cfg,
+		Pool:            pool,
+		Rotator:         rotator,
+		tokenToAcct:     tokMap,
+		tokenToGroup:    grpMap,
+		sessionCache:    make(map[string][]any),
+		sessionCacheAt:  make(map[string]time.Time),
+		sessionBindings: make(map[string]sessionBinding),
+		uploadCache:     make(map[string]cachedUpload),
+		startedAt:       time.Now().UTC(),
+		clock:           time.Now,
 	}
 	s.loadSessionCacheFromDisk()
+	s.loadSessionBindingsFromDisk()
 	return s
 }
 
@@ -298,6 +312,14 @@ func (s *Server) requireAuthScope(w http.ResponseWriter, r *http.Request) (AuthS
 	if !scope.OK {
 		sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
 		return AuthScope{}, false
+	}
+	scope.Token = extractRequestToken(r)
+	if sid := strings.TrimSpace(r.Header.Get("X-GSB-Session")); sid != "" {
+		if !reSafeSession.MatchString(sid) {
+			sendJSON(w, 400, map[string]any{"error": map[string]any{"message": "invalid X-GSB-Session; expected 1-128 characters from [A-Za-z0-9._:-]", "type": "invalid_request_error"}}, nil)
+			return AuthScope{}, false
+		}
+		scope.SessionID = sid
 	}
 	return scope, true
 }

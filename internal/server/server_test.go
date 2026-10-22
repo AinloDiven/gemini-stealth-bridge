@@ -1065,7 +1065,7 @@ func TestSessionCacheDiskPersistenceAndAccountAffinity(t *testing.T) {
 		{"role": "assistant", "content": "Hi there"},
 		{"role": "user", "content": "Follow up"},
 	}
-	srv1.saveSessionContinuation("acctB", testModel.ModelName, history[:1], nil, nil, "Hi there", nil, "cid_b", "rid_b", "rcid_b", "ctx_b")
+	srv1.saveSessionContinuation("acctB", testModel.ModelName, history[:1], nil, nil, "Hi there", nil, "cid_b", "rid_b", "rcid_b", "ctx_b", "")
 
 	// Wait briefly for async disk flush to complete
 	deadline := time.Now().Add(2 * time.Second)
@@ -2275,8 +2275,11 @@ func TestStreamedReasoningPreventsRetryConcatenation(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("expected no retry after reasoning output, got %d upstream calls", calls.Load())
 	}
-	if strings.Count(rec.Body.String(), "reasoning once") != 1 {
-		t.Fatalf("expected one reasoning emission, got %s", rec.Body.String())
+	if strings.Count(rec.Body.String(), `"reasoning_content":"reasoning once"`) != 1 {
+		t.Fatalf("expected one reasoning_content emission, got %s", rec.Body.String())
+	}
+	if strings.Count(rec.Body.String(), `"x_gemini_reasoning"`) != 2 { // start + delta
+		t.Fatalf("expected reasoning lifecycle start+delta, got %s", rec.Body.String())
 	}
 }
 

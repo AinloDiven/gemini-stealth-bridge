@@ -147,6 +147,7 @@ func (s *Server) LoadCredentials() int {
 		prev.ProfileID = st.ProfileID
 		prev.AccountGroup = st.AccountGroup
 		prev.ProxyURL = st.ProxyURL
+		prev.Skill = st.Skill
 		prev.Quarantined = st.Quarantined
 		prev.QuarantineReason = st.QuarantineReason
 		prev.Disabled = st.Disabled
@@ -203,7 +204,7 @@ func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error
 	ac.ID = id
 	rec, _, _ := cookies.LoadAccountFile(path)
 	var capAt, rotAt time.Time
-	var importedFrom, profileID, acctGroup, qReason string
+	var importedFrom, profileID, acctGroup, qReason, skill string
 	var quarantined, disabled bool
 	surfaces := make(map[string]string)
 	if rec != nil {
@@ -216,6 +217,7 @@ func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error
 		importedFrom = rec.ImportedFrom
 		profileID = rec.ProfileID
 		acctGroup = rec.AccountGroup
+		skill = rec.Skill
 		quarantined = rec.Quarantined
 		qReason = rec.QuarantineReason
 		disabled = rec.Disabled
@@ -244,6 +246,7 @@ func (s *Server) loadAccountStateFromFile(id, path string) (*AccountState, error
 		ProfileID:        profileID,
 		AccountGroup:     acctGroup,
 		ProxyURL:         proxyURL,
+		Skill:            skill,
 		Quarantined:      quarantined,
 		QuarantineReason: qReason,
 		Disabled:         disabled,
@@ -1358,6 +1361,35 @@ func (s *Server) pickRotateFallback(accts []*AccountState, tried map[string]bool
 	return nil, nil
 }
 
+func (s *Server) preferBindingAccount(accts []*AccountState, requested, accountID string) *AccountState {
+	if accountID == "" {
+		return nil
+	}
+	for _, a := range accts {
+		if a == nil || a.ID != accountID {
+			continue
+		}
+		a.mu.RLock()
+		unavailable := a.Quarantined || a.Disabled
+		a.mu.RUnlock()
+		if unavailable {
+			return nil
+		}
+		m := resolveModelOnAccount(a, requested)
+		if m == nil {
+			return nil
+		}
+		if err := s.checkPreFlightQuotaInternal(a, *m, m.ModelName, true); err != nil {
+			return nil
+		}
+		if s.isAccountBusy(a.ID) {
+			return nil
+		}
+		return a
+	}
+	return nil
+}
+
 func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requested string, hasher *prompt.HistoryHasher) *AccountState {
 	if scope.AccountID != "" {
 		for _, a := range accts {
@@ -1599,6 +1631,9 @@ type preparedGeneration struct {
 	// cacheSplit is the message index at which the cached continuation was
 	// selected. It is zero when no continuation was used.
 	cacheSplit int
+	// sessionBindingKey is the explicit X-GSB-Session binding consumed/created
+	// by this generation. Empty when the caller did not send a session id.
+	sessionBindingKey string
 }
 
 func (s *Server) prepareGeneration(
@@ -1610,6 +1645,9 @@ func (s *Server) prepareGeneration(
 	toolChoiceRaw any,
 ) (*preparedGeneration, error) {
 	rawModel, _ := body["model"].(string)
+	if strings.TrimSpace(rawModel) == "" {
+		rawModel = strings.TrimSpace(s.Cfg.DefaultModel)
+	}
 	requested, inlineThink := gemini.ParseModelRequest(rawModel)
 
 	// The scope decides which accounts this request may touch: an account key
@@ -1627,6 +1665,13 @@ func (s *Server) prepareGeneration(
 	var hasher *prompt.HistoryHasher
 	if s.Cfg.SessionCache && len(messages) >= 3 {
 		hasher = prompt.NewHistoryHasher(messages, toolsRaw, toolChoiceRaw)
+	}
+
+	sessionKey := ""
+	var binding *sessionBinding
+	if s.Cfg.SessionCache && scope.SessionID != "" {
+		sessionKey = sessionBindingKey(scope, scope.SessionID)
+		binding = s.getSessionBinding(sessionKey)
 	}
 
 	account := s.resolveChatAccount(accts, scope, requested, hasher)
@@ -1647,6 +1692,11 @@ func (s *Server) prepareGeneration(
 			msg = fmt.Sprintf("group key is bound to group %q, which has no loaded account", scope.Group)
 		}
 		return nil, transport.NewUpstreamError(msg, 401, "authentication_error", nil, nil)
+	}
+	if binding != nil {
+		if preferred := s.preferBindingAccount(accts, requested, binding.AccountID); preferred != nil {
+			account = preferred
+		}
 	}
 
 	if err := s.checkAccountRateLimit(account); err != nil {
@@ -1685,6 +1735,19 @@ func (s *Server) prepareGeneration(
 		return nil, transport.NewUpstreamError(fmt.Sprintf("account %s cannot serve model %s", account.ID, reqLabel), 404, "model_not_found", nil, nil)
 	}
 	mid := model.ModelName
+
+	if binding != nil && binding.Model != mid {
+		binding = nil
+	}
+	bindingSplit := -1
+	if binding != nil && binding.NextLen > 0 && binding.HistoryHash != "" && hasher != nil {
+		for split := binding.NextLen; split < len(messages); split++ {
+			if hasher.HashPrefix(account.ID, mid, split) == binding.HistoryHash {
+				bindingSplit = split
+				break
+			}
+		}
+	}
 
 	if err := s.checkPreFlightQuota(account, *model, mid); err != nil {
 		if scope.AccountID == "" {
@@ -1743,11 +1806,36 @@ func (s *Server) prepareGeneration(
 		ProtocolMode:    s.Cfg.ProtocolMode,
 		PersonalContext: s.Cfg.PersonalContext,
 	}
+	skillTarget := s.skillTargetFor(scope, account)
+	if skillTarget != "" {
+		if binder, ok := account.Client.(skillRuntimeBinder); ok {
+			if handle, bindErr := binder.BindSkillRuntime(ctx, skillTarget); bindErr == nil {
+				opts.SkillRuntime = handle
+			} else {
+				log.Printf("cloud Skill %q could not be bound for account %s: %v; turn runs without slot 81", skillTarget, account.ID, bindErr)
+			}
+		}
+	}
 
 	curPrompt := fullPrompt
 	cacheKey := ""
 	cacheSplit := 0
-	if s.Cfg.SessionCache && !opts.Temporary && hasher != nil {
+	if bindingSplit >= 0 {
+		opts.Metadata = append([]any(nil), binding.Meta...)
+		cacheKey = sessionKey
+		cacheSplit = bindingSplit
+		deltaPrompt, _, dErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
+			StartIndex:      bindingSplit,
+			MaxPromptChars:  s.Cfg.MaxPromptChars,
+			MaxOldToolChars: s.Cfg.MaxOldToolChars,
+			AllowOverflow:   false,
+		})
+		if dErr == nil {
+			curPrompt = deltaPrompt
+			attachmentParts = prompt.ExtractImageParts(messages[bindingSplit:])
+		}
+	}
+	if len(opts.Metadata) == 0 && s.Cfg.SessionCache && !opts.Temporary && hasher != nil {
 		selectedKey, cachedMeta, split := s.consumeSessionCacheForGeneration(account.ID, mid, hasher)
 		if len(cachedMeta) > 0 {
 			opts.Metadata = cachedMeta
@@ -1769,6 +1857,10 @@ func (s *Server) prepareGeneration(
 		account.mu.Lock()
 		account.offloadRequests++
 		account.mu.Unlock()
+	}
+	if skillTarget != "" {
+		fullPrompt = formatSkillPrompt(fullPrompt, skillTarget)
+		curPrompt = formatSkillPrompt(curPrompt, skillTarget)
 	}
 
 	return &preparedGeneration{
@@ -1794,6 +1886,7 @@ func (s *Server) prepareGeneration(
 		hasher:              hasher,
 		cacheKey:            cacheKey,
 		cacheSplit:          cacheSplit,
+		sessionBindingKey:   sessionKey,
 	}, nil
 }
 
@@ -1812,4 +1905,95 @@ func isLightweightTitleRequest(messages []map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// skillTargetFor resolves the fixed cloud Skill for this request:
+// per-key override > account file override > global BRIDGE_SKILL.
+func (s *Server) skillTargetFor(scope AuthScope, account *AccountState) string {
+	s.mu.RLock()
+	perKey := s.Cfg.SkillPerKey[scope.Token]
+	global := strings.TrimSpace(s.Cfg.Skill)
+	s.mu.RUnlock()
+	if strings.TrimSpace(perKey) != "" {
+		return strings.TrimSpace(perKey)
+	}
+	if account != nil {
+		account.mu.RLock()
+		accountSkill := strings.TrimSpace(account.Skill)
+		account.mu.RUnlock()
+		if accountSkill != "" {
+			return accountSkill
+		}
+	}
+	return global
+}
+
+func normalizeSkillCommand(skill string) string {
+	cmd := strings.TrimSpace(skill)
+	if cmd == "" {
+		return ""
+	}
+	if !strings.HasPrefix(cmd, "/") {
+		cmd = "/" + cmd
+	}
+	return cmd
+}
+
+func stripLeadingSkillPrefix(value, prefix string) string {
+	if prefix == "" || !strings.HasPrefix(value, prefix) {
+		return value
+	}
+	return strings.TrimLeft(value[len(prefix):], " \t\r\n")
+}
+
+func skillPrefixAtFront(value, prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	return strings.HasPrefix(value, prefix+" ") || strings.HasPrefix(value, prefix+"\n") || value == prefix
+}
+
+func prependSkillPrefix(value, prefix string) string {
+	remainder := stripLeadingSkillPrefix(value, prefix)
+	if remainder == "" {
+		return prefix
+	}
+	return prefix + " " + remainder
+}
+
+// formatSkillPrompt places the configured cloud Skill command at byte 0,
+// idempotently and without changing any other character (the browser sends the
+// same text projection beside inner[81]).
+func formatSkillPrompt(text, skill string) string {
+	prefix := normalizeSkillCommand(skill)
+	if prefix == "" {
+		return text
+	}
+	stripped := strings.TrimSpace(text)
+	if stripped == "" {
+		return prefix
+	}
+	if strings.HasPrefix(stripped, "<|im_start|>") {
+		return text
+	}
+	if strings.Contains(text, "【用户消息】") {
+		idx := strings.Index(text, "【用户消息】") + len("【用户消息】")
+		header := text[:idx]
+		body := stripLeadingSkillPrefix(strings.TrimLeft(text[idx:], "\n "), prefix)
+		clean := strings.TrimSpace(header)
+		if body != "" {
+			clean = header + "\n" + body
+		}
+		if skillPrefixAtFront(strings.TrimSpace(clean), prefix) {
+			return clean
+		}
+		return prependSkillPrefix(strings.TrimSpace(clean), prefix)
+	}
+	if skillPrefixAtFront(stripped, prefix) {
+		return text
+	}
+	if strings.HasPrefix(stripped, prefix) {
+		return prependSkillPrefix(stripped, prefix)
+	}
+	return prefix + " " + text
 }

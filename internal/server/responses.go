@@ -1004,8 +1004,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
 								emitTextDelta(text[len(sentText):])
 								sentText = text
-						} else if hasTools && !mediaToolUsed && len(text) > 240 {
-							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
+							} else if hasTools && !mediaToolUsed && len(text) > 240 {
+								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
 									emitTextDelta(safePrefix[len(sentText):])
 									sentText = safePrefix
 								}
@@ -1069,6 +1069,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			}
 			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 				s.deleteSessionCache(cacheKey)
+				s.deleteSessionBinding(prep.sessionBindingKey)
 				cacheKey = ""
 			}
 
@@ -1383,7 +1384,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			if len(oaCalls) > 0 && contentStr == "" {
 				cachedContent = nil
 			}
-			s.saveSessionContinuation(account.ID, mid, messages, toolsRaw, toolChoiceRaw, cachedContent, oaCalls, lastCID, lastRID, candidateID, lastContextToken)
+			s.saveSessionContinuation(account.ID, mid, messages, toolsRaw, toolChoiceRaw, cachedContent, oaCalls, lastCID, lastRID, candidateID, lastContextToken, prep.sessionBindingKey)
 		}
 
 		stopKeepalive()

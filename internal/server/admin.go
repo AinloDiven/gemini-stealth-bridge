@@ -268,6 +268,7 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 		},
 		"config": map[string]any{
 			"defaultThinking":         defThink,
+			"defaultModel":            cfg.DefaultModel,
 			"accountStrategy":         cfg.AccountStrategy,
 			"accountPriority":         prio,
 			"rejectDowngrade":         cfg.RejectDowngrade,
@@ -281,6 +282,7 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 		},
 		"sources": map[string]string{
 			"defaultThinking":         sourceOrDefault(sources, "BRIDGE_DEFAULT_THINKING"),
+			"defaultModel":            sourceOrDefault(sources, "BRIDGE_DEFAULT_MODEL"),
 			"accountStrategy":         sourceOrDefault(sources, "BRIDGE_ACCOUNT_STRATEGY"),
 			"accountPriority":         sourceOrDefault(sources, "BRIDGE_ACCOUNT_PRIORITY"),
 			"rejectDowngrade":         sourceOrDefault(sources, "BRIDGE_REJECT_DOWNGRADE"),
@@ -410,6 +412,25 @@ func (s *Server) handleAdminPatchConfig(w http.ResponseWriter, body map[string]a
 	cfg := s.Cfg
 	if cfg.FieldSources == nil {
 		cfg.FieldSources = make(map[string]string)
+	}
+
+	if raw, exists := body["defaultModel"]; exists {
+		val := ""
+		if raw != nil {
+			val = strings.TrimSpace(fmt.Sprint(raw))
+		}
+		if val == "<nil>" {
+			val = ""
+		}
+		if len(val) > 128 || strings.IndexFunc(val, func(r rune) bool { return r <= ' ' }) >= 0 {
+			s.mu.Unlock()
+			sendJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]any{"message": "defaultModel must be a model id without whitespace, at most 128 characters", "type": "invalid_request_error"},
+			}, nil)
+			return
+		}
+		cfg.DefaultModel = val
+		envUpdates["BRIDGE_DEFAULT_MODEL"] = val
 	}
 
 	if raw, exists := body["defaultThinking"]; exists {

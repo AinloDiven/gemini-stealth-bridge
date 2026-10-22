@@ -31,6 +31,26 @@ type GeneratedVideo struct {
 	MimeType     string `json:"mimeType,omitempty"`
 }
 
+// ActionStatus is the pass-through view of one Gemini Web action card from
+// candidate slot 2 (field 7) or its slot-11 mirror. It deliberately contains
+// only values that were present on the wire; labels/icons are never invented.
+type ActionStatus struct {
+	// ThinkingTitle is branch 1's short micro-step title (field 7[5]).
+	ThinkingTitle string
+	// ToolID is branch 2/3's wire tool id (field 7[1][0]); the UI derives its
+	// icon from this id, never from a URL or a locally invented mapping.
+	ToolID string
+	// ToolTitle is branch 2/3's title (field 7[1][1][2]).
+	ToolTitle string
+	// StatusTemplate is field 7[1][1][5] when it still carries Gemini Web's
+	// {tool_logo_placeholder} token.
+	StatusTemplate string
+	// BranchTitle is field 7[0], the branch 3 display title.
+	BranchTitle string
+	// State is the normalized tool lifecycle state (active/complete/failed).
+	State string
+}
+
 // Frame is a single parsed candidate frame from a wrb.fr envelope.
 type Frame struct {
 	RCID               string            `json:"rcid"`
@@ -42,6 +62,7 @@ type Frame struct {
 	GeneratedImages    []GeneratedImage  `json:"generatedImages,omitempty"`
 	GeneratedVideos    []GeneratedVideo  `json:"generatedVideos,omitempty"`
 	GroundingSources   []GroundingSource `json:"groundingSources,omitempty"`
+	Action             *ActionStatus     `json:"action,omitempty"`
 }
 
 // LineParseResult holds the parsed contents of one StreamGenerate line.
@@ -960,7 +981,85 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		GeneratedImages:    images,
 		GeneratedVideos:    videos,
 		GroundingSources:   grounding,
+		Action:             parseActionStatus(c),
 	}, true
+}
+
+// parseActionStatus reads candidate slot 2 (field "7") and its slot-11 mirror.
+// It returns nil when the candidate carries no action card. The mapping is the
+// same one the web client uses (see FastAPI wire/activity.py): branch 1 has a
+// list of thinking titles at index 5, branches 2/3 put [tool_id, meta, state] at
+// index 1 with meta[2]=title and meta[5]=status template.
+func parseActionStatus(c []any) *ActionStatus {
+	actionArr, _ := jspbSubField(jspbSubField(c, 2), 6).([]any)
+	if len(actionArr) == 0 {
+		if mirror, ok := jspbSubField(c, 11).([]any); ok {
+			actionArr, _ = jspbSubField(mirror, 0).([]any)
+		}
+	}
+	if len(actionArr) == 0 {
+		return nil
+	}
+	out := &ActionStatus{}
+	if title := firstActionString(jspbField(actionArr, 5)); title != "" {
+		out.ThinkingTitle = title
+	}
+	if toolArr, ok := jspbField(actionArr, 1).([]any); ok && len(toolArr) > 0 {
+		out.ToolID = firstActionString(jspbField(toolArr, 0))
+		if meta, ok := jspbField(toolArr, 1).([]any); ok {
+			out.ToolTitle = firstActionString(jspbField(meta, 2))
+			out.StatusTemplate = firstActionString(jspbField(meta, 5))
+		}
+		out.State = normalizeActionState(jspbField(toolArr, 2))
+	}
+	out.BranchTitle = firstActionString(jspbField(actionArr, 0))
+	if out.ThinkingTitle == "" && out.ToolID == "" && out.ToolTitle == "" && out.StatusTemplate == "" && out.BranchTitle == "" {
+		return nil
+	}
+	return out
+}
+
+func firstActionString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeActionState(value any) string {
+	switch v := value.(type) {
+	case float64:
+		switch int(v) {
+		case 1:
+			return "active"
+		case 4:
+			return "complete"
+		}
+	case int:
+		switch v {
+		case 1:
+			return "active"
+		case 4:
+			return "complete"
+		}
+	case string:
+		switch strings.ToLower(v) {
+		case "1", "started", "active":
+			return "active"
+		case "4", "complete", "completed", "settled":
+			return "complete"
+		case "failed", "error":
+			return "failed"
+		}
+	}
+	return "active"
 }
 
 // ParseConversationPollResponse parses an hNvQHb batchexecute response payload

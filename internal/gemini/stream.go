@@ -43,6 +43,7 @@ type StreamOptions struct {
 	HasTools        bool
 	ProtocolMode    string // "bridge" | "web"
 	PersonalContext string // "auto" | "off" | "on"
+	SkillRuntime    string // server-issued cloud Skill handle for inner[81]
 	FreshSocket     bool
 }
 
@@ -248,7 +249,7 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 		filesSlot = fArr
 	}
 
-	inner := make([]any, 81)
+	inner := make([]any, 82)
 	inner[0] = []any{prompt, 0, nil, filesSlot, nil, nil, 0}
 	inner[1] = []string{lang}
 	inner[2] = meta
@@ -304,6 +305,9 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 		thinkLvl = 1
 	}
 	inner[80] = thinkLvl
+	if opts.SkillRuntime != "" {
+		inner[81] = []any{opts.SkillRuntime}
+	}
 
 	uuidVal = strings.ToUpper(uuid.NewString())
 	inner[59] = uuidVal

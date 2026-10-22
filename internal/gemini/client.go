@@ -1146,6 +1146,104 @@ func (ac *AccountClient) nextReqID() int64 {
 	return ac.reqCounter.Add(100000)
 }
 
+// BindSkillRuntime resolves a configured cloud Skill name to the server-issued
+// runtime handle that StreamGenerate carries in inner[81]. The cCSu7 RPC is
+// called per turn (matching the web client, which does not cache the handle
+// across turns), with one retry when the listing comes back empty.
+func (ac *AccountClient) BindSkillRuntime(ctx context.Context, name string) (string, error) {
+	target := normalizeSkillName(name)
+	if target == "" {
+		return "", nil
+	}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		_, entries, err := ac.BatchExec(ctx, "cCSu7", "[]")
+		if err != nil {
+			return "", err
+		}
+		records := extractSkillRecords(findBatchPayload(entries, "cCSu7"))
+		if len(records) == 0 {
+			lastErr = fmt.Errorf("cloud Skill list is empty")
+			continue
+		}
+		for _, rec := range records {
+			if !skillRecordMatches(rec, target) {
+				continue
+			}
+			if handle, _ := rec[0].(string); handle != "" {
+				return handle, nil
+			}
+		}
+		return "", fmt.Errorf("cloud Skill %q is not available on this account", name)
+	}
+	return "", lastErr
+}
+
+var skillHandleRe = regexp.MustCompile(`^[0-9a-fA-F-]{20,40}$`)
+
+var skillAliases = map[string]bool{
+	"伊珂丝": true, "eksie": true, "eks": true, "ex": true, "エクス": true,
+}
+
+func normalizeSkillName(name string) string {
+	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "/")))
+}
+
+// extractSkillRecords mirrors the web client's cCSu7 decoder: the records are
+// nested one or more levels deep and the first record's first element is the
+// runtime handle.
+func extractSkillRecords(payload any) [][]any {
+	node := payload
+	for depth := 0; depth < 6; depth++ {
+		arr, ok := node.([]any)
+		if !ok || len(arr) == 0 {
+			return nil
+		}
+		first, ok := arr[0].([]any)
+		if !ok || len(first) == 0 {
+			return nil
+		}
+		if handle, ok := first[0].(string); ok && skillHandleRe.MatchString(handle) {
+			out := make([][]any, 0, len(arr))
+			for _, item := range arr {
+				rec, ok := item.([]any)
+				if !ok || len(rec) == 0 {
+					continue
+				}
+				if _, ok := rec[0].(string); ok {
+					out = append(out, rec)
+				}
+			}
+			return out
+		}
+		node = first
+	}
+	return nil
+}
+
+func skillRecordMatches(rec []any, target string) bool {
+	if target == "" {
+		return false
+	}
+	for _, idx := range []int{0, 1} {
+		if idx >= len(rec) {
+			continue
+		}
+		raw, ok := rec[idx].(string)
+		if !ok {
+			continue
+		}
+		candidate := normalizeSkillName(raw)
+		if candidate == target {
+			return true
+		}
+		if skillAliases[candidate] && skillAliases[target] {
+			return true
+		}
+	}
+	return false
+}
+
 func findBatchPayload(entries []BatchEntry, rpcID string) any {
 	for _, e := range entries {
 		if e.RPCID == rpcID {

@@ -52,6 +52,7 @@ type CredentialFile struct {
 	Disabled         bool              `json:"disabled,omitempty"`
 	AccountGroup     string            `json:"accountGroup,omitempty"`
 	ProxyURL         string            `json:"proxyUrl,omitempty"`
+	Skill            string            `json:"skill,omitempty"`
 	Surfaces         map[string]string `json:"surfaces,omitempty"`
 }
 

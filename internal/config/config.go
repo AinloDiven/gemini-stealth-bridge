@@ -34,6 +34,8 @@ type Config struct {
 	RejectDowngrade         bool
 	LiveThoughts            bool
 	SessionCache            bool
+	SessionBindingTTL       time.Duration
+	SessionBindingMax       int
 	KeepToolPreamble        bool
 	LiveToolCalls           bool
 	MaxPromptChars          int
@@ -50,6 +52,9 @@ type Config struct {
 	ProxyURL                string
 	ImpersonateProfile      string
 	DefaultThinking         int
+	DefaultModel            string
+	Skill                   string
+	SkillPerKey             map[string]string
 	UserAgent               string
 	SecCHUA                 string
 	SecCHUAPlatform         string
@@ -295,6 +300,8 @@ func FromEnv() *Config {
 		RejectDowngrade:         lookupBool("BRIDGE_REJECT_DOWNGRADE", true),
 		LiveThoughts:            lookupBool("BRIDGE_LIVE_THOUGHTS", true),
 		SessionCache:            lookupBool("BRIDGE_SESSION_CACHE", true),
+		SessionBindingTTL:       time.Duration(lookupPositiveInt("BRIDGE_SESSION_BINDING_TTL_MS", 86400000, 1000)) * time.Millisecond,
+		SessionBindingMax:       lookupPositiveInt("BRIDGE_SESSION_BINDING_MAX", 1024, 1),
 		KeepToolPreamble:        lookupBool("BRIDGE_TOOL_PREAMBLE", false),
 		LiveToolCalls:           lookupBool("BRIDGE_LIVE_TOOL_CALLS", false),
 		MaxPromptChars:          lookupPositiveInt("BRIDGE_MAX_PROMPT_CHARS", 850000, 1024),
@@ -311,6 +318,9 @@ func FromEnv() *Config {
 		ProxyURL:                lookup("BRIDGE_PROXY_SERVER"),
 		ImpersonateProfile:      impersonate,
 		DefaultThinking:         defThink,
+		DefaultModel:            lookup("BRIDGE_DEFAULT_MODEL"),
+		Skill:                   lookup("BRIDGE_SKILL"),
+		SkillPerKey:             parseKeyValMap(lookup("BRIDGE_SKILL_PER_KEY")),
 		UserAgent:               ua,
 		SecCHUA:                 chUA,
 		SecCHUAPlatform:         platform,

@@ -116,6 +116,7 @@ func TestAdminConfigPatchAndEnvFilePersistence(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BRIDGE_HOME", home)
 	t.Setenv("BRIDGE_DEFAULT_THINKING", "")
+	t.Setenv("BRIDGE_DEFAULT_MODEL", "")
 	t.Setenv("BRIDGE_ACCOUNT_STRATEGY", "")
 	t.Setenv("BRIDGE_MAX_RPM_PER_ACCOUNT", "")
 
@@ -125,6 +126,7 @@ func TestAdminConfigPatchAndEnvFilePersistence(t *testing.T) {
 
 	patchBody := map[string]any{
 		"defaultThinking":  "medium",
+		"defaultModel":     "gemini-flash-lite",
 		"accountStrategy":  "lru",
 		"maxRpmPerAccount": 36,
 		"liveToolCalls":    true,
@@ -139,17 +141,20 @@ func TestAdminConfigPatchAndEnvFilePersistence(t *testing.T) {
 		t.Fatalf("PATCH /v1/admin/config failed: %d %s", rec.Code, rec.Body.String())
 	}
 
-	if srv.Cfg.DefaultThinking != 4 || srv.Cfg.AccountStrategy != "lru" || srv.Cfg.MaxRPMPerAccount != 36 || !srv.Cfg.LiveToolCalls {
+	if srv.Cfg.DefaultThinking != 4 || srv.Cfg.DefaultModel != "gemini-flash-lite" || srv.Cfg.AccountStrategy != "lru" || srv.Cfg.MaxRPMPerAccount != 36 || !srv.Cfg.LiveToolCalls {
 		t.Fatalf("in-memory config not updated: %+v", srv.Cfg)
 	}
 
 	// Reload from disk via config.Load() and verify config.env was persisted
 	reloaded := config.Load()
-	if reloaded.DefaultThinking != 4 || reloaded.AccountStrategy != "lru" || reloaded.MaxRPMPerAccount != 36 || !reloaded.LiveToolCalls {
+	if reloaded.DefaultThinking != 4 || reloaded.DefaultModel != "gemini-flash-lite" || reloaded.AccountStrategy != "lru" || reloaded.MaxRPMPerAccount != 36 || !reloaded.LiveToolCalls {
 		t.Fatalf("reloaded config from config.env did not match persisted values: %+v", reloaded)
 	}
 	if reloaded.FieldSources["BRIDGE_DEFAULT_THINKING"] != "file" {
 		t.Fatalf("expected source 'file' for BRIDGE_DEFAULT_THINKING, got %q", reloaded.FieldSources["BRIDGE_DEFAULT_THINKING"])
+	}
+	if reloaded.FieldSources["BRIDGE_DEFAULT_MODEL"] != "file" {
+		t.Fatalf("expected source 'file' for BRIDGE_DEFAULT_MODEL, got %q", reloaded.FieldSources["BRIDGE_DEFAULT_MODEL"])
 	}
 }
 
