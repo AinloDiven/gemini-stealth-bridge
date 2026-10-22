@@ -91,6 +91,21 @@ func buildActionStatusPayload(operationID string, a *gemini.ActionStatus) map[st
 	if state == "" {
 		state = "active"
 	}
+	terminal := false
+	leaseSeconds := 300
+	if phase == "generating_media" {
+		leaseSeconds = 1020
+	}
+	switch state {
+	case "complete":
+		phase = "completed"
+		terminal = true
+		leaseSeconds = 0
+	case "failed":
+		phase = "failed"
+		terminal = true
+		leaseSeconds = 0
+	}
 	payload := map[string]any{
 		"operation_id":       operationID + ":generation",
 		"type":               "generation",
@@ -99,7 +114,9 @@ func buildActionStatusPayload(operationID string, a *gemini.ActionStatus) map[st
 		"phase":              phase,
 		"text":               progress,
 		"progress_detail":    progress,
-		"terminal":           false,
+		"terminal":           terminal,
+		"lease_seconds":      leaseSeconds,
+		"turn_admitted":      false,
 		"artifacts_expected": 0,
 		"artifacts_ready":    0,
 		"artifacts_failed":   0,
@@ -236,6 +253,14 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			},
 		})
 	}
+	// Error paths after headers must still close a started reasoning lifecycle.
+	defer func() {
+		streamMu.Lock()
+		if headersSent {
+			closeReasoningLocked()
+		}
+		streamMu.Unlock()
+	}()
 
 	// markPhase records a phase timestamp once, in milliseconds from request
 	// start. A value stays -1 until that phase is actually observed.

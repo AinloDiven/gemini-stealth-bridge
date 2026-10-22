@@ -2278,8 +2278,8 @@ func TestStreamedReasoningPreventsRetryConcatenation(t *testing.T) {
 	if strings.Count(rec.Body.String(), `"reasoning_content":"reasoning once"`) != 1 {
 		t.Fatalf("expected one reasoning_content emission, got %s", rec.Body.String())
 	}
-	if strings.Count(rec.Body.String(), `"x_gemini_reasoning"`) != 2 { // start + delta
-		t.Fatalf("expected reasoning lifecycle start+delta, got %s", rec.Body.String())
+	if strings.Count(rec.Body.String(), `"x_gemini_reasoning"`) != 3 { // start + delta + fallback done
+		t.Fatalf("expected reasoning lifecycle start+delta+done, got %s", rec.Body.String())
 	}
 }
 

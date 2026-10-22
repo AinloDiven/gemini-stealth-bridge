@@ -120,7 +120,8 @@ begins or at stream end. This frame carries the reasoning **detail only**.
    "type":"generation","source_type":"thinking_progress",
    "state":"active","phase":"thinking",
    "text":"Analyzing Video Content","progress_detail":"Analyzing Video Content",
-   "terminal":false,"artifacts_expected":0,"artifacts_ready":0,"artifacts_failed":0}}
+   "terminal":false,"lease_seconds":300,"turn_admitted":false,
+   "artifacts_expected":0,"artifacts_ready":0,"artifacts_failed":0}}
 ```
 
 The title comes from Gemini Web's top-level action payload
@@ -141,7 +142,12 @@ Tool cards add the icon inputs the bot already understands:
 `provider` is the wire tool id and `status_template` is field `[1][1][5]` only
 when it still contains `{tool_logo_placeholder}`. The bot resolves that pair to
 its own icon; no icon URL or invented id is sent. Upstream's branch-1 thinking
-payload has no icon field at all, so a thinking title is text-only.
+payload has no icon field at all, so a thinking title is text-only. A tool state
+of `complete`/`failed` is projected to the matching terminal phase so the
+lifecycle remains schema-consistent.
+
+If the `cCSu7` handle cannot be bound, the turn still runs and still keeps the
+configured `/skill` text projection at byte 0; only slot 81 is left empty.
 
 `x_gemini_action_status` frames are deduplicated by their payload (excluding
 `sequence`) and `sequence` increases monotonically per completion.

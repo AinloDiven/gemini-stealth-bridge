@@ -1020,32 +1020,50 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 // [tool_id, meta, state] at index 1 with meta[2]=title and meta[5]=status
 // template.
 func parseActionStatus(frame []any) *ActionStatus {
-	actionArr, _ := jspbSubField(jspbIndex(frame, 2), 6).([]any)
-	if len(actionArr) == 0 {
-		if mirror, ok := jspbIndex(frame, 11).([]any); ok {
-			actionArr, _ = jspbSubField(mirror, 0).([]any)
-		}
-	}
-	if len(actionArr) == 0 {
+	primary := actionArray(frame, 2, 6)
+	mirror := actionArray(frame, 11, 0)
+	if len(primary) == 0 && len(mirror) == 0 {
 		return nil
 	}
 	out := &ActionStatus{}
-	if title := firstActionString(jspbField(actionArr, 5)); title != "" {
+	if title := firstActionString(jspbField(primary, 5)); title != "" {
+		out.ThinkingTitle = title
+	} else if title := firstActionString(jspbField(mirror, 5)); title != "" {
 		out.ThinkingTitle = title
 	}
-	if toolArr, ok := jspbField(actionArr, 1).([]any); ok && len(toolArr) > 0 {
+
+	// Tool cards may live in the primary slot or only in the mirror. Resolve the
+	// action array and its tool cell together so action[0] stays consistent.
+	toolAction := primary
+	toolArr, _ := jspbField(primary, 1).([]any)
+	if len(toolArr) == 0 {
+		toolAction = mirror
+		toolArr, _ = jspbField(mirror, 1).([]any)
+	}
+	if len(toolArr) > 0 {
 		out.ToolID = firstActionString(jspbField(toolArr, 0))
 		if meta, ok := jspbField(toolArr, 1).([]any); ok {
 			out.ToolTitle = firstActionString(jspbField(meta, 2))
 			out.StatusTemplate = firstActionString(jspbField(meta, 5))
 		}
 		out.State = normalizeActionState(jspbField(toolArr, 2))
+		out.BranchTitle = firstActionString(jspbField(toolAction, 0))
 	}
-	out.BranchTitle = firstActionString(jspbField(actionArr, 0))
+	if out.BranchTitle == "" {
+		out.BranchTitle = firstActionString(jspbField(primary, 0))
+	}
+	if out.BranchTitle == "" {
+		out.BranchTitle = firstActionString(jspbField(mirror, 0))
+	}
 	if out.ThinkingTitle == "" && out.ToolID == "" && out.ToolTitle == "" && out.StatusTemplate == "" && out.BranchTitle == "" {
 		return nil
 	}
 	return out
+}
+
+func actionArray(frame []any, slot, field int) []any {
+	arr, _ := jspbSubField(jspbIndex(frame, slot), field).([]any)
+	return arr
 }
 
 func firstActionString(value any) string {
