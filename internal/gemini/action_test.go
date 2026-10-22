@@ -5,41 +5,60 @@ import (
 	"testing"
 )
 
-func TestParseActionStatusThinkingTitle(t *testing.T) {
-	var c []any
-	candidate := `["rc_1",["answer"],{"7":[null,null,null,null,null,["Analyzing Video Content"]]},null,null,null,null,null,[[2]]]`
-	if err := json.Unmarshal([]byte(candidate), &c); err != nil {
+func parseActionFromFrame(t *testing.T, inner []any) *LineParseResult {
+	t.Helper()
+	innerJSON, err := json.Marshal(inner)
+	if err != nil {
 		t.Fatal(err)
 	}
-	action := parseActionStatus(c)
-	if action == nil || action.ThinkingTitle != "Analyzing Video Content" {
-		t.Fatalf("expected thinking title, got %+v", action)
+	envelope, err := json.Marshal([]any{[]any{"wrb.fr", nil, string(innerJSON)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := ParseFrameLine(string(envelope))
+	if err != nil || res == nil {
+		t.Fatalf("ParseFrameLine failed: %+v err=%v", res, err)
+	}
+	return res
+}
+
+func TestParseActionStatusThinkingTitle(t *testing.T) {
+	res := parseActionFromFrame(t, []any{
+		nil,
+		[]any{"c_1", "r_1"},
+		map[string]any{"7": []any{nil, nil, nil, nil, nil, []any{"Analyzing Video Content"}}},
+	})
+	if res.Action == nil || res.Action.ThinkingTitle != "Analyzing Video Content" {
+		t.Fatalf("expected thinking title, got %+v", res.Action)
 	}
 }
 
 func TestParseActionStatusToolCardRelaysIconInputs(t *testing.T) {
-	var c []any
-	candidate := `["rc_1",["answer"],{"7":[null,["skills",[null,null,"Skill Title",null,null,"{tool_logo_placeholder} Skills: Eksie"],1]]},null,null,null,null,null,[[2]]]`
-	if err := json.Unmarshal([]byte(candidate), &c); err != nil {
-		t.Fatal(err)
-	}
-	action := parseActionStatus(c)
-	if action == nil {
+	template := "{tool_logo_placeholder} Skills: Eksie"
+	res := parseActionFromFrame(t, []any{
+		nil,
+		[]any{"c_1", "r_1"},
+		map[string]any{"7": []any{
+			template,
+			[]any{"skills", []any{nil, nil, "Skill Title", "https://example.invalid/logo.svg", nil, template}, float64(1)},
+		}},
+	})
+	if res.Action == nil {
 		t.Fatal("expected action card")
 	}
-	if action.ToolID != "skills" || action.ToolTitle != "Skill Title" || action.StatusTemplate != "{tool_logo_placeholder} Skills: Eksie" || action.State != "active" {
-		t.Fatalf("unexpected action card: %+v", action)
+	if res.Action.ToolID != "skills" || res.Action.ToolTitle != "Skill Title" || res.Action.StatusTemplate != template || res.Action.State != "active" {
+		t.Fatalf("unexpected action card: %+v", res.Action)
 	}
 }
 
 func TestParseActionStatusMirrorSlot(t *testing.T) {
-	var c []any
-	candidate := `["rc_1",["answer"],null,null,null,null,null,null,null,null,null,[[null,null,null,null,null,["Mirrored title"]]]]`
-	if err := json.Unmarshal([]byte(candidate), &c); err != nil {
-		t.Fatal(err)
-	}
-	action := parseActionStatus(c)
-	if action == nil || action.ThinkingTitle != "Mirrored title" {
-		t.Fatalf("expected mirrored thinking title, got %+v", action)
+	action := []any{nil, nil, nil, nil, nil, []any{"Mirrored title"}}
+	inner := make([]any, 12)
+	inner[1] = []any{"c_1", "r_1"}
+	inner[2] = nil
+	inner[11] = []any{action}
+	res := parseActionFromFrame(t, inner)
+	if res.Action == nil || res.Action.ThinkingTitle != "Mirrored title" {
+		t.Fatalf("expected mirrored thinking title, got %+v", res.Action)
 	}
 }

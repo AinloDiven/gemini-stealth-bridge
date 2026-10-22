@@ -124,6 +124,56 @@ func TestExplicitSessionBindingDropsOnModelChange(t *testing.T) {
 	}
 }
 
+func TestTemporaryRequestDoesNotReuseSessionBinding(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	var mu sync.Mutex
+	var metas [][]any
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		mu.Lock()
+		metas = append(metas, append([]any(nil), opts.Metadata...))
+		mu.Unlock()
+		_ = onFrame(&gemini.LineParseResult{CID: "c", RID: "r", ContextToken: "ctx", AnsweredModelID: testModel.ModelID, Frames: []gemini.Frame{makeFrame("answer", "", true, testModel.ModelID)}})
+		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
+	}}
+	acct.Client = client
+	scope := AuthScope{OK: true, AccountID: "acct", Token: "acct", SessionID: "sess-temp"}
+	first := map[string]any{"model": testModel.ModelName, "messages": []any{map[string]any{"role": "user", "content": "one"}}}
+	rec1 := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec1, first, scope)
+	if rec1.Code != 200 {
+		t.Fatalf("turn 1 failed: %d", rec1.Code)
+	}
+	second := map[string]any{
+		"model":     testModel.ModelName,
+		"temporary": true,
+		"messages": []any{
+			map[string]any{"role": "user", "content": "one"},
+			map[string]any{"role": "assistant", "content": "answer"},
+			map[string]any{"role": "user", "content": "two"},
+		},
+	}
+	rec2 := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec2, second, scope)
+	if rec2.Code != 200 {
+		t.Fatalf("turn 2 failed: %d %s", rec2.Code, rec2.Body.String())
+	}
+	if len(metas[1]) != 0 {
+		t.Fatalf("temporary request must not reuse the session binding, got %#v", metas[1])
+	}
+}
+
+func TestSessionHeaderValidation(t *testing.T) {
+	srv, _ := newTestHarness(false, false)
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer public")
+	req.Header.Set("X-GSB-Session", "bad id!")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), "invalid X-GSB-Session") {
+		t.Fatalf("expected 400 invalid X-GSB-Session, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestDefaultModelUsedWhenRequestOmitsModel(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 	alt := testModel

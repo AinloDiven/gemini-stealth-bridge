@@ -450,7 +450,7 @@ func (ac *AccountClient) streamGenerateLocked(
 		}
 		frameCount += len(parsed.Frames)
 		grounding = MergeGroundingSources(grounding, parsed.GroundingSources)
-		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.AnsweredModelID != "" || parsed.MediaToolActive || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
+		if onFrame != nil && (len(parsed.Frames) > 0 || parsed.Action != nil || parsed.AnsweredModelID != "" || parsed.MediaToolActive || parsed.CID != "" || parsed.RID != "" || parsed.ContextToken != "") {
 			return onFrame(parsed)
 		}
 		return nil

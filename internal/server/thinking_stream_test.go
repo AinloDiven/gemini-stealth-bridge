@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -12,10 +13,22 @@ import (
 // upstream thinking header, which is relayed as action-status progress_detail.
 func TestThinkingStreamEmitsReasoningLifecycleAndActionTitle(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
-	first := makeFrame("", "step one", false, testModel.ModelID)
-	first.Action = &gemini.ActionStatus{ThinkingTitle: "Analyzing Video Content"}
-	second := makeFrame("hello", "", true, testModel.ModelID)
-	client := clientFromFrames([]gemini.Frame{first, second})
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Action: &gemini.ActionStatus{ThinkingTitle: "Analyzing Video Content"},
+			Frames: []gemini.Frame{makeFrame("", "step one", false, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Frames: []gemini.Frame{makeFrame("hello", "", true, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
+	}}
 
 	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
 	body := rec.Body.String()
@@ -46,14 +59,23 @@ func TestThinkingStreamEmitsReasoningLifecycleAndActionTitle(t *testing.T) {
 // no icon or title is synthesized.
 func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
-	frame := makeFrame("answer", "", true, testModel.ModelID)
-	frame.Action = &gemini.ActionStatus{
-		ToolID:         "skills",
-		ToolTitle:      "Skill Title",
-		StatusTemplate: "{tool_logo_placeholder} Skills: Eksie",
-		State:          "active",
-	}
-	rec := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{frame}), map[string]any{"stream": true})
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Action: &gemini.ActionStatus{
+				ToolID:         "skills",
+				ToolTitle:      "Skill Title",
+				StatusTemplate: "{tool_logo_placeholder} Skills: Eksie",
+				State:          "active",
+			},
+			Frames: []gemini.Frame{makeFrame("answer", "", true, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
+	}}
+
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
 	body := rec.Body.String()
 
 	for _, want := range []string{

@@ -123,9 +123,11 @@ begins or at stream end. This frame carries the reasoning **detail only**.
    "terminal":false,"artifacts_expected":0,"artifacts_ready":0,"artifacts_failed":0}}
 ```
 
-The title comes from Gemini Web's action payload `candidate[2]["7"]`
-(`[5]` for branch-1 thinking micro-step titles); it is passed through unchanged
-in `progress_detail`/`text`. No title is synthesized.
+The title comes from Gemini Web's top-level action payload
+`part_json[2]["7"]` (`[5]` for branch-1 thinking micro-step titles); it is
+passed through unchanged. Those status frames can arrive without any candidate
+frames, so the parser exposes the action on the line result rather than on a
+candidate.
 
 Tool cards add the icon inputs the bot already understands:
 

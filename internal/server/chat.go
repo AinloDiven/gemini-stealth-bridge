@@ -623,6 +623,10 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 				if stream && buffered && ctx.Err() == nil && identityVerifiedNow {
 					startStream(false)
+					flushPendingAction()
+				}
+				if update.Action != nil {
+					queueActionStatus(update.Action)
 				}
 
 				if update.CID != "" {
@@ -699,6 +703,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if identityVerified {
 							startStream(false)
+							flushPendingAction()
 						}
 						if identityVerified && s.Cfg.LiveThoughts {
 							if hasTools && !s.Cfg.KeepToolPreamble && sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) {
@@ -741,11 +746,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 							}
 						}
 					}
-					if frame.Action != nil {
-						queueActionStatus(frame.Action)
-					}
-					flushPendingAction()
 				}
+				flushPendingAction()
 				return nil
 			})
 			account.mu.Lock()

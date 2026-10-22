@@ -62,7 +62,6 @@ type Frame struct {
 	GeneratedImages    []GeneratedImage  `json:"generatedImages,omitempty"`
 	GeneratedVideos    []GeneratedVideo  `json:"generatedVideos,omitempty"`
 	GroundingSources   []GroundingSource `json:"groundingSources,omitempty"`
-	Action             *ActionStatus     `json:"action,omitempty"`
 }
 
 // LineParseResult holds the parsed contents of one StreamGenerate line.
@@ -78,6 +77,10 @@ type LineParseResult struct {
 	StreamEnd          bool
 	Frames             []Frame
 	GroundingSources   []GroundingSource
+	// Action is the top-level action card carried by this line (field 7 or
+	// its field-12 mirror). It can arrive on a status-only line with no
+	// candidate frames, which is why it does not belong to Frame.
+	Action *ActionStatus
 }
 
 var (
@@ -774,6 +777,9 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 		if err := json.Unmarshal([]byte(innerStr), &pj); err != nil {
 			return nil, transport.NewUpstreamError("malformed upstream frame payload", 502, "upstream_parse_error", nil, err)
 		}
+		if action := parseActionStatus(pj); action != nil {
+			res.Action = action
+		}
 
 		if len(pj) > 1 {
 			if ids, ok := pj[1].([]any); ok {
@@ -893,6 +899,29 @@ func jspbSubField(parent any, index int) any {
 	return nil
 }
 
+// jspbIndex is jspbSubField for a positional slot on a frame whose trailing
+// element may be a sparse dictionary. Unlike jspbField it prefers the dense
+// position even when the slot happens to be the last element, which is how a
+// status-only frame ([null, ids, {"7":...}]) encodes its action card.
+func jspbIndex(parent any, index int) any {
+	if parent == nil {
+		return nil
+	}
+	if arr, ok := parent.([]any); ok {
+		if index >= 0 && index < len(arr) {
+			return arr[index]
+		}
+		if lastMap, ok := arr[len(arr)-1].(map[string]any); ok {
+			return lastMap[strconv.Itoa(index+1)]
+		}
+		return nil
+	}
+	if m, ok := parent.(map[string]any); ok {
+		return m[strconv.Itoa(index+1)]
+	}
+	return nil
+}
+
 func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool) {
 	var rcid string
 	if len(c) > 0 {
@@ -981,19 +1010,19 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		GeneratedImages:    images,
 		GeneratedVideos:    videos,
 		GroundingSources:   grounding,
-		Action:             parseActionStatus(c),
 	}, true
 }
 
-// parseActionStatus reads candidate slot 2 (field "7") and its slot-11 mirror.
-// It returns nil when the candidate carries no action card. The mapping is the
-// same one the web client uses (see FastAPI wire/activity.py): branch 1 has a
-// list of thinking titles at index 5, branches 2/3 put [tool_id, meta, state] at
-// index 1 with meta[2]=title and meta[5]=status template.
-func parseActionStatus(c []any) *ActionStatus {
-	actionArr, _ := jspbSubField(jspbSubField(c, 2), 6).([]any)
+// parseActionStatus reads the top-level frame's field 7 action card and its
+// field-12 mirror. It returns nil when the frame carries no action card. The
+// mapping is the same one the web client uses (see FastAPI wire/activity.py):
+// branch 1 has a list of thinking titles at index 5, branches 2/3 put
+// [tool_id, meta, state] at index 1 with meta[2]=title and meta[5]=status
+// template.
+func parseActionStatus(frame []any) *ActionStatus {
+	actionArr, _ := jspbSubField(jspbIndex(frame, 2), 6).([]any)
 	if len(actionArr) == 0 {
-		if mirror, ok := jspbSubField(c, 11).([]any); ok {
+		if mirror, ok := jspbIndex(frame, 11).([]any); ok {
 			actionArr, _ = jspbSubField(mirror, 0).([]any)
 		}
 	}

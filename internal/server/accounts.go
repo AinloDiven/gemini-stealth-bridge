@@ -1820,7 +1820,7 @@ func (s *Server) prepareGeneration(
 	curPrompt := fullPrompt
 	cacheKey := ""
 	cacheSplit := 0
-	if bindingSplit >= 0 {
+	if bindingSplit >= 0 && !opts.Temporary {
 		opts.Metadata = append([]any(nil), binding.Meta...)
 		cacheKey = sessionKey
 		cacheSplit = bindingSplit
