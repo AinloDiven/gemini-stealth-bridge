@@ -158,6 +158,38 @@ func TestAdminConfigPatchAndEnvFilePersistence(t *testing.T) {
 	}
 }
 
+func TestAdminRuntimeConfigSourceIsRuntime(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("BRIDGE_HOME", home)
+	t.Setenv("BRIDGE_DEFAULT_MODEL", "")
+	cfg := config.Load()
+	cfg.WebUI = true
+	srv := New(cfg)
+
+	raw, _ := json.Marshal(map[string]any{"defaultModel": "gemini-flash-lite"})
+	req := httptest.NewRequest(http.MethodPatch, "/v1/admin/config", bytes.NewReader(raw))
+	req.RemoteAddr = "127.0.0.1:41000"
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH /v1/admin/config failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	get := httptest.NewRequest(http.MethodGet, "/v1/admin/config", nil)
+	get.RemoteAddr = "127.0.0.1:41000"
+	getRec := httptest.NewRecorder()
+	srv.ServeHTTP(getRec, get)
+	var payload struct {
+		Sources map[string]string `json:"sources"`
+	}
+	if err := json.Unmarshal(getRec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Sources["defaultModel"] != "runtime" {
+		t.Fatalf("expected runtime source, got %q", payload.Sources["defaultModel"])
+	}
+}
+
 func TestAdminAccountLifecycleAndWriteOnlyCookies(t *testing.T) {
 	home := t.TempDir()
 	cfg := config.Load()

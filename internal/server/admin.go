@@ -566,7 +566,9 @@ func (s *Server) handleAdminPatchConfig(w http.ResponseWriter, body map[string]a
 	for k := range envUpdates {
 		if persist {
 			cfg.FieldSources[k] = "file"
-		} else if cfg.FieldSources[k] == "" {
+		} else {
+			// A runtime PATCH replaces the effective value regardless of whether
+			// the previous value came from the process env or a default.
 			cfg.FieldSources[k] = "runtime"
 		}
 	}
