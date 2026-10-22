@@ -1772,6 +1772,12 @@ func (s *Server) prepareGeneration(
 			}
 		}
 	}
+	// An explicit session is authoritative even when the caller sends only the
+	// current turn (no local history). In that case there is no prefix to match;
+	// continue from the stored cid/rid/context and send the current message.
+	if binding != nil && bindingSplit < 0 && len(messages) > 0 {
+		bindingSplit = len(messages) - 1
+	}
 
 	if err := s.checkPreFlightQuota(account, *model, mid); err != nil {
 		if scope.AccountID == "" {

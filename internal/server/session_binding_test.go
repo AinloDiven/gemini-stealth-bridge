@@ -77,6 +77,57 @@ func TestExplicitSessionBindingReusesContinuation(t *testing.T) {
 	}
 }
 
+// TestExplicitSessionBindingWithoutLocalHistory proves that a caller which sends
+// only the current turn (the bot does this) still continues the bound conversation.
+func TestExplicitSessionBindingWithoutLocalHistory(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	var mu sync.Mutex
+	var prompts []string
+	var metas [][]any
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		mu.Lock()
+		prompts = append(prompts, prompt)
+		metas = append(metas, append([]any(nil), opts.Metadata...))
+		turn := len(prompts)
+		mu.Unlock()
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "cid-1", RID: "rid-1", ContextToken: "ctx-1",
+			AnsweredModelID: testModel.ModelID,
+			Frames:          []gemini.Frame{makeFrame(fmt.Sprintf("answer %d", turn), "", true, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		return &gemini.StreamResponse{Status: 200, CID: "cid-1", RID: "rid-1"}, nil
+	}}
+	acct.Client = client
+	scope := AuthScope{OK: true, AccountID: "acct", Token: "acct", SessionID: "sess-no-history"}
+
+	first := map[string]any{
+		"model":    testModel.ModelName,
+		"messages": []any{map[string]any{"role": "user", "content": "one"}},
+	}
+	rec1 := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec1, first, scope)
+	if rec1.Code != 200 {
+		t.Fatalf("turn 1 failed: %d %s", rec1.Code, rec1.Body.String())
+	}
+	second := map[string]any{
+		"model":    testModel.ModelName,
+		"messages": []any{map[string]any{"role": "user", "content": "two"}},
+	}
+	rec2 := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec2, second, scope)
+	if rec2.Code != 200 {
+		t.Fatalf("turn 2 failed: %d %s", rec2.Code, rec2.Body.String())
+	}
+	if len(metas[1]) == 0 {
+		t.Fatal("expected the explicit session to continue without local history, got no metadata")
+	}
+	if !strings.Contains(prompts[1], "two") || strings.Contains(prompts[1], "one") {
+		t.Fatalf("expected only the current message in the continuation prompt, got %q", prompts[1])
+	}
+}
+
 // TestExplicitSessionBindingSurvivesModelChange preserves the same upstream
 // conversation when the caller switches models; an upstream rejection still
 // falls back to the full prompt through the normal retry path.
