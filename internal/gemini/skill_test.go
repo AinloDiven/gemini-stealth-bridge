@@ -33,6 +33,29 @@ func TestBuildInnerRequestArmsSkillSlot81(t *testing.T) {
 	}
 }
 
+func TestSkillCacheValidRequiresSameTargetAndPageSession(t *testing.T) {
+	const handle = "0123456789abcdef0123456789abcdef"
+	if !skillCacheValid(handle, "伊珂丝", "fsid-1", "伊珂丝", "fsid-1") {
+		t.Fatal("expected a confirmed handle to survive an empty listing")
+	}
+	for _, tc := range []struct {
+		name    string
+		handle  string
+		cached  string
+		fsid    string
+		target  string
+		current string
+	}{
+		{name: "missing handle", cached: "伊珂丝", fsid: "fsid-1", target: "伊珂丝", current: "fsid-1"},
+		{name: "different skill", handle: handle, cached: "eksie", fsid: "fsid-1", target: "伊珂丝", current: "fsid-1"},
+		{name: "page session changed", handle: handle, cached: "伊珂丝", fsid: "fsid-1", target: "伊珂丝", current: "fsid-2"},
+	} {
+		if skillCacheValid(tc.handle, tc.cached, tc.fsid, tc.target, tc.current) {
+			t.Fatalf("%s: stale handle must not be reused", tc.name)
+		}
+	}
+}
+
 func TestExtractSkillRecordsAndMatch(t *testing.T) {
 	handle := "0123456789abcdef0123456789abcdef"
 	payload := []any{

@@ -102,6 +102,9 @@ type AccountClient struct {
 	accountGroup     string
 	proxyURL         string
 	skill            string
+	skillHandle      string
+	skillName        string
+	skillFSid        string
 	surfaces         map[string]string
 	locale           string
 	blOverride       string
@@ -1153,12 +1156,20 @@ func (ac *AccountClient) nextReqID() int64 {
 // BindSkillRuntime resolves a configured cloud Skill name to the server-issued
 // runtime handle that StreamGenerate carries in inner[81]. The cCSu7 RPC is
 // called per turn (matching the web client, which does not cache the handle
-// across turns), with one retry when the listing comes back empty.
+// across turns), with one retry when the listing comes back empty. A handle
+// confirmed earlier for the same page session is kept when the listing is
+// transiently empty, which is the web client's empty-list fallback.
 func (ac *AccountClient) BindSkillRuntime(ctx context.Context, name string) (string, error) {
 	target := normalizeSkillName(name)
 	if target == "" {
 		return "", nil
 	}
+
+	ac.mu.RLock()
+	cachedHandle, cachedName, cachedFSid, currentFSid := ac.skillHandle, ac.skillName, ac.skillFSid, ac.fSid
+	ac.mu.RUnlock()
+	cachedValid := skillCacheValid(cachedHandle, cachedName, cachedFSid, target, currentFSid)
+
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		_, entries, err := ac.BatchExec(ctx, "cCSu7", "[]")
@@ -1175,10 +1186,19 @@ func (ac *AccountClient) BindSkillRuntime(ctx context.Context, name string) (str
 				continue
 			}
 			if handle, _ := rec[0].(string); handle != "" {
+				ac.mu.Lock()
+				ac.skillHandle, ac.skillName, ac.skillFSid = handle, target, ac.fSid
+				ac.mu.Unlock()
 				return handle, nil
 			}
 		}
+		ac.mu.Lock()
+		ac.skillHandle, ac.skillName, ac.skillFSid = "", "", ""
+		ac.mu.Unlock()
 		return "", fmt.Errorf("cloud Skill %q is not available on this account", name)
+	}
+	if cachedValid {
+		return cachedHandle, nil
 	}
 	return "", lastErr
 }
@@ -1191,6 +1211,13 @@ var skillAliases = map[string]bool{
 
 func normalizeSkillName(name string) string {
 	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "/")))
+}
+
+// skillCacheValid reports whether a previously confirmed handle can stand in
+// for an empty cCSu7 listing. The handle is page-session scoped and only valid
+// for the same configured skill.
+func skillCacheValid(handle, cachedName, cachedFSid, target, currentFSid string) bool {
+	return handle != "" && cachedName == target && cachedFSid == currentFSid
 }
 
 // extractSkillRecords mirrors the web client's cCSu7 decoder: the records are
