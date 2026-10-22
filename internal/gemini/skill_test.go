@@ -2,7 +2,10 @@ package gemini
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
+
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 )
 
 func TestBuildInnerRequestArmsSkillSlot81(t *testing.T) {
@@ -50,5 +53,19 @@ func TestExtractSkillRecordsAndMatch(t *testing.T) {
 	}
 	if skillRecordMatches(records[0], "missing") {
 		t.Fatal("unexpected match")
+	}
+}
+
+func TestPersistStateKeepsAccountSkill(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "account.json")
+	ac := NewAccountClient("acct", "SID=value", path, nil, nil)
+	ac.skill = "/伊珂丝"
+	ac.persistState()
+	rec, _, err := cookies.LoadAccountFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Skill != "/伊珂丝" {
+		t.Fatalf("expected account skill to survive cookie rotation, got %q", rec.Skill)
 	}
 }

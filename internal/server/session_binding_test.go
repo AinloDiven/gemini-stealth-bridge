@@ -174,6 +174,25 @@ func TestSessionHeaderValidation(t *testing.T) {
 	}
 }
 
+func TestDefaultModelFallsBackWhenUnavailable(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.DefaultModel = "missing-model"
+	var got string
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		got = opts.Model.ModelName
+		_ = onFrame(&gemini.LineParseResult{CID: "c", RID: "r", AnsweredModelID: opts.Model.ModelID, Frames: []gemini.Frame{makeFrame("ok", "", true, opts.Model.ModelID)}})
+		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
+	}}
+	acct.Client = client
+	rec := runChat(t, srv, acct, client, map[string]any{"model": ""})
+	if rec.Code != 200 {
+		t.Fatalf("default-model fallback failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if got != testModel.ModelName {
+		t.Fatalf("expected fallback to %q, got %q", testModel.ModelName, got)
+	}
+}
+
 func TestDefaultModelUsedWhenRequestOmitsModel(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
 	alt := testModel

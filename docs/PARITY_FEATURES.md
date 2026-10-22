@@ -85,9 +85,12 @@ PATCH /v1/admin/config
 ```
 
 `persist: true` writes `BRIDGE_DEFAULT_MODEL` to `$BRIDGE_HOME/config.env`.
-An explicit request `model` still wins. An empty configured value keeps the
-old behaviour (first model advertised by the selected account). The
-`/v1/admin/config` payload exposes `defaultModel` and its source.
+An explicit request `model` still wins. If the configured default is not
+advertised by any usable account, gsb logs the condition and falls back to the
+selected account's first model; an explicit request model keeps the strict
+`model_not_found` path. An empty configured value keeps the old behaviour (first
+model advertised by the selected account). The `/v1/admin/config` payload
+exposes `defaultModel` and its source.
 
 ## 4. Thinking stream extensions
 

@@ -101,6 +101,7 @@ type AccountClient struct {
 	disabled         bool
 	accountGroup     string
 	proxyURL         string
+	skill            string
 	surfaces         map[string]string
 	locale           string
 	blOverride       string
@@ -152,6 +153,7 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 	ac.disabled = rec.Disabled
 	ac.accountGroup = rec.AccountGroup
 	ac.proxyURL = rec.ProxyURL
+	ac.skill = rec.Skill
 	if len(rec.Surfaces) > 0 {
 		for k, v := range rec.Surfaces {
 			ac.surfaces[k] = v
@@ -285,6 +287,7 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	}
 	ac.quarantined = rec.Quarantined
 	ac.quarantineReason = rec.QuarantineReason
+	ac.skill = rec.Skill
 	ac.fileMtimeMs = mtime
 	if changed {
 		ac.cookieGen.Add(1)
@@ -419,6 +422,7 @@ func (ac *AccountClient) persistState() {
 		Disabled:         ac.disabled,
 		AccountGroup:     ac.accountGroup,
 		ProxyURL:         ac.proxyURL,
+		Skill:            ac.skill,
 		Surfaces:         surfCopy,
 	}
 	ac.mu.Unlock()

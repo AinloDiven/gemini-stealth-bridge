@@ -1645,6 +1645,7 @@ func (s *Server) prepareGeneration(
 	toolChoiceRaw any,
 ) (*preparedGeneration, error) {
 	rawModel, _ := body["model"].(string)
+	modelFromDefault := strings.TrimSpace(rawModel) == "" && strings.TrimSpace(s.Cfg.DefaultModel) != ""
 	if strings.TrimSpace(rawModel) == "" {
 		rawModel = strings.TrimSpace(s.Cfg.DefaultModel)
 	}
@@ -1675,6 +1676,16 @@ func (s *Server) prepareGeneration(
 	}
 
 	account := s.resolveChatAccount(accts, scope, requested, hasher)
+	if account == nil && modelFromDefault {
+		// A configured default that no account advertises must not take the
+		// whole pool down; fall back to the account's own first model. An
+		// explicit request model keeps the strict model_not_found path.
+		if fallback := s.resolveChatAccount(accts, scope, "", hasher); fallback != nil {
+			log.Printf("configured default model %q is unavailable; using account default", s.Cfg.DefaultModel)
+			requested = ""
+			account = fallback
+		}
+	}
 	if account == nil {
 		for _, a := range accts {
 			a.mu.RLock()
@@ -1727,6 +1738,13 @@ func (s *Server) prepareGeneration(
 	}
 
 	model := resolveModelOnAccount(account, requested)
+	if model == nil && modelFromDefault {
+		if fallback := resolveModelOnAccount(account, ""); fallback != nil {
+			log.Printf("configured default model %q is unavailable on account %s; using account default", s.Cfg.DefaultModel, account.ID)
+			requested = ""
+			model = fallback
+		}
+	}
 	if model == nil {
 		reqLabel := requested
 		if reqLabel == "" {
