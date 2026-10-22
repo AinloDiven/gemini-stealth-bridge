@@ -254,11 +254,11 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 	}
 	if acctID, ok := s.tokenToAcct[token]; ok && token != "" {
 		s.mu.RUnlock()
-		return AuthScope{OK: true, AccountID: acctID}
+		return AuthScope{OK: true, AccountID: acctID, Token: token}
 	}
 	if group, ok := s.tokenToGroup[token]; ok && token != "" {
 		s.mu.RUnlock()
-		return AuthScope{OK: true, Group: group}
+		return AuthScope{OK: true, Group: group, Token: token}
 	}
 	explicitTokens := len(s.Cfg.AccountTokens) > 0
 	s.mu.RUnlock()
@@ -282,7 +282,7 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 			acctID, ok := s.tokenToAcct[token]
 			s.mu.RUnlock()
 			if ok {
-				return AuthScope{OK: true, AccountID: acctID}
+				return AuthScope{OK: true, AccountID: acctID, Token: token}
 			}
 		}
 	}
@@ -291,9 +291,9 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 
 	if isPoolKey {
 		if len(s.accounts) == 1 {
-			return AuthScope{OK: true, AccountID: s.accounts[0].ID}
+			return AuthScope{OK: true, AccountID: s.accounts[0].ID, Token: token}
 		}
-		return AuthScope{OK: true, Admin: true}
+		return AuthScope{OK: true, Admin: true, Token: token}
 	}
 	return AuthScope{OK: false}
 }

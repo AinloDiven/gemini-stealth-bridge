@@ -81,6 +81,23 @@ func (m *mockUpstream) RotateCookies(ctx context.Context) (*cookies.RotateResult
 func (m *mockUpstream) ReloadFromDiskIfNewer() bool { return false }
 func (m *mockUpstream) InvalidateAuth()             {}
 
+func TestResolveAuthScopePreservesTokenForPerKeyFeatures(t *testing.T) {
+	srv, _ := newTestHarness(false, true)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer audit")
+	scope := srv.ResolveAuthScope(req)
+	if !scope.OK || scope.AccountID != "acct" || scope.Token != "audit" {
+		t.Fatalf("expected account scope to retain its token, got %+v", scope)
+	}
+
+	poolReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	poolReq.Header.Set("Authorization", "Bearer public")
+	poolScope := srv.ResolveAuthScope(poolReq)
+	if !poolScope.OK || poolScope.Token != "public" {
+		t.Fatalf("expected pool scope to retain its token, got %+v", poolScope)
+	}
+}
+
 func newTestHarness(relaxed, sessionCache bool) (*Server, *AccountState) {
 	cfg := config.Load()
 	cfg.HomeDir = "/synthetic"
