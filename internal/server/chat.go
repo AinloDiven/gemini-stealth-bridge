@@ -113,6 +113,11 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	eagerStream := strings.EqualFold(s.Cfg.StreamBufferMode, "eager")
 
 	headersSent := false
+	// handlerDone is set before the handler returns. Keepalive and early-SSE
+	// goroutines outlive the handler, and net/http nils the response writer once
+	// the handler returns; writing or flushing past that point dereferences a nil
+	// bufio.Writer and crashes the whole daemon.
+	var handlerDone atomic.Bool
 	var ttftMs atomic.Int64
 	var headerMs, identityMs atomic.Int64
 	var firstReasoningMs, firstContentMs, firstToolMs atomic.Int64
@@ -173,6 +178,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		}
 		streamMu.Lock()
 		defer streamMu.Unlock()
+		if handlerDone.Load() {
+			return
+		}
 		chunk := sseChatChunk{
 			ID:      cmplID,
 			Object:  "chat.completion.chunk",
@@ -197,16 +205,19 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		}
 	}
 
-	var keepaliveStop chan struct{}
+	var pinger *streamPinger
+	var pingerMu sync.Mutex
 	stopKeepalive := func() {
-		streamMu.Lock()
-		if keepaliveStop != nil {
-			close(keepaliveStop)
-			keepaliveStop = nil
-		}
-		streamMu.Unlock()
+		pingerMu.Lock()
+		p := pinger
+		pinger = nil
+		pingerMu.Unlock()
+		p.Stop()
 	}
 	defer stopKeepalive()
+	// Defers run LIFO, so this runs before stopKeepalive: the pinger sees
+	// handlerDone and exits instead of writing after the handler returns.
+	defer handlerDone.Store(true)
 
 	// streamStarted closes as soon as the response headers are flushed, so the
 	// grace timer below does not keep a goroutine alive after streaming begins.
@@ -216,7 +227,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 	startStreamWith := func(early bool, attempt, upstreamStatus int, retryReason string) {
 		streamMu.Lock()
-		if headersSent || ctx.Err() != nil {
+		if headersSent || ctx.Err() != nil || handlerDone.Load() {
 			streamMu.Unlock()
 			return
 		}
@@ -234,31 +245,17 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		if flusher != nil {
 			flusher.Flush()
 		}
-		keepaliveStop = make(chan struct{})
-		kaCh := keepaliveStop
 		streamMu.Unlock()
 
+		pingerMu.Lock()
+		if pinger == nil && !handlerDone.Load() {
+			pinger = startStreamPinger(&streamMu, w, flusher, defaultKeepaliveInterval, func() {
+				emit(map[string]any{"role": "assistant"}, nil, nil)
+			})
+		}
+		pingerMu.Unlock()
+
 		emit(map[string]any{"role": "assistant", "content": ""}, nil, nil)
-		go func() {
-			ticker := time.NewTicker(15 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-kaCh:
-					return
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					streamMu.Lock()
-					_, _ = io.WriteString(w, ": ping\n\n")
-					if flusher != nil {
-						flusher.Flush()
-					}
-					streamMu.Unlock()
-					emit(map[string]any{"role": "assistant"}, nil, nil)
-				}
-			}
-		}()
 	}
 
 	// startStream reads the caller-owned attempt diagnostics, so it must only be
@@ -622,6 +619,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					errCode == "upstream_connect_timeout" ||
 					errCode == "upstream_stalled" ||
 					errCode == "upstream_timeout" ||
+					errCode == "upstream_degraded" ||
 					errCode == "model_identity_unknown" ||
 					errCode == "model_identity_conflict"))) && !payloadCommitted()
 			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
@@ -719,6 +717,32 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 							continue
 						}
 					}
+				}
+				if errCode == "upstream_degraded" {
+					// Gemini Web failed the turn on its side while the account still
+					// has quota. Prefer a different account; if the request is pinned
+					// or the pool is spent, retry once on a fresh socket.
+					lastRetryReason = errCode
+					if scope.AccountID == "" {
+						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
+							triedAccounts[nextAcct.ID] = true
+							assignAccount(nextAcct)
+							model = nextModel
+							opts.Model = nextModel
+							opts.Metadata = nil
+							opts.Files = nil
+							curPrompt = fullPrompt
+							attachmentParts = fullAttachmentParts
+							continue
+						}
+					}
+					freshSocketNext = true
+					rebootstrapNext = true
+					opts.Metadata = nil
+					opts.Files = nil
+					curPrompt = fullPrompt
+					attachmentParts = fullAttachmentParts
+					continue
 				}
 				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" {
 					lastRetryReason = errCode

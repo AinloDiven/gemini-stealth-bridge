@@ -1585,6 +1585,61 @@ func TestSoftBlockNoAmplification(t *testing.T) {
 	}
 }
 
+func TestUpstreamDegradedFailsOverToAnotherAccount(t *testing.T) {
+	cfg := config.Load()
+	cfg.HomeDir = "/synthetic"
+	cfg.MaxAttempts = 3
+	srv := New(cfg)
+
+	var acct1Calls atomic.Int32
+	var acct2Calls atomic.Int32
+
+	// 1185 means Gemini Web failed the turn upstream while the account still had
+	// quota, so the pool must fail over instead of surfacing a bare error code.
+	c1 := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			acct1Calls.Add(1)
+			return nil, transport.NewUpstreamError("upstream error code 1185", 502, "upstream_degraded", nil, nil)
+		},
+	}
+	c2 := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			acct2Calls.Add(1)
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c1",
+				RID:             "r1",
+				AnsweredModelID: testModel.ModelID,
+				Frames:          []gemini.Frame{makeFrame("recovered", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+
+	a1 := &AccountState{ID: "acct1", Email: "1@e.com", Client: c1, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	a2 := &AccountState{ID: "acct2", Email: "2@e.com", Client: c2, Models: []gemini.ModelInfo{testModel}, ModelsAt: time.Now()}
+	srv.SetAccounts([]*AccountState{a1, a2})
+
+	rec := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec, map[string]any{
+		"model":    "gemini-pro",
+		"stream":   true,
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	}, AuthScope{OK: true, Admin: true})
+
+	if acct1Calls.Load() != 1 {
+		t.Fatalf("expected exactly 1 call on the degraded account, got %d", acct1Calls.Load())
+	}
+	if acct2Calls.Load() != 1 {
+		t.Fatalf("expected failover to the healthy account, got %d calls", acct2Calls.Load())
+	}
+	if !strings.Contains(rec.Body.String(), "recovered") {
+		t.Fatalf("expected the healthy account's answer, got: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "upstream_degraded") {
+		t.Fatalf("expected the failure to be retried, not surfaced: %s", rec.Body.String())
+	}
+}
+
 func TestQuarantineOn403TOSViolation(t *testing.T) {
 	cfg := config.Load()
 	cfg.HomeDir = "/synthetic"
