@@ -101,6 +101,10 @@ type AccountClient struct {
 	disabled         bool
 	accountGroup     string
 	proxyURL         string
+	skill            string
+	skillHandle      string
+	skillName        string
+	skillFSid        string
 	surfaces         map[string]string
 	locale           string
 	blOverride       string
@@ -152,6 +156,7 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 	ac.disabled = rec.Disabled
 	ac.accountGroup = rec.AccountGroup
 	ac.proxyURL = rec.ProxyURL
+	ac.skill = rec.Skill
 	if len(rec.Surfaces) > 0 {
 		for k, v := range rec.Surfaces {
 			ac.surfaces[k] = v
@@ -285,6 +290,7 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	}
 	ac.quarantined = rec.Quarantined
 	ac.quarantineReason = rec.QuarantineReason
+	ac.skill = rec.Skill
 	ac.fileMtimeMs = mtime
 	if changed {
 		ac.cookieGen.Add(1)
@@ -419,6 +425,7 @@ func (ac *AccountClient) persistState() {
 		Disabled:         ac.disabled,
 		AccountGroup:     ac.accountGroup,
 		ProxyURL:         ac.proxyURL,
+		Skill:            ac.skill,
 		Surfaces:         surfCopy,
 	}
 	ac.mu.Unlock()
@@ -1144,6 +1151,128 @@ func normalizeRFC3339(raw string) string {
 
 func (ac *AccountClient) nextReqID() int64 {
 	return ac.reqCounter.Add(100000)
+}
+
+// BindSkillRuntime resolves a configured cloud Skill name to the server-issued
+// runtime handle that StreamGenerate carries in inner[81]. The cCSu7 RPC is
+// called per turn (matching the web client, which does not cache the handle
+// across turns), with one retry when the listing comes back empty. A handle
+// confirmed earlier for the same page session is kept when the listing is
+// transiently empty, which is the web client's empty-list fallback.
+func (ac *AccountClient) BindSkillRuntime(ctx context.Context, name string) (string, error) {
+	target := normalizeSkillName(name)
+	if target == "" {
+		return "", nil
+	}
+
+	ac.mu.RLock()
+	cachedHandle, cachedName, cachedFSid, currentFSid := ac.skillHandle, ac.skillName, ac.skillFSid, ac.fSid
+	ac.mu.RUnlock()
+	cachedValid := skillCacheValid(cachedHandle, cachedName, cachedFSid, target, currentFSid)
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		_, entries, err := ac.BatchExec(ctx, "cCSu7", "[]")
+		if err != nil {
+			return "", err
+		}
+		records := extractSkillRecords(findBatchPayload(entries, "cCSu7"))
+		if len(records) == 0 {
+			lastErr = fmt.Errorf("cloud Skill list is empty")
+			continue
+		}
+		for _, rec := range records {
+			if !skillRecordMatches(rec, target) {
+				continue
+			}
+			if handle, _ := rec[0].(string); handle != "" {
+				ac.mu.Lock()
+				ac.skillHandle, ac.skillName, ac.skillFSid = handle, target, ac.fSid
+				ac.mu.Unlock()
+				return handle, nil
+			}
+		}
+		ac.mu.Lock()
+		ac.skillHandle, ac.skillName, ac.skillFSid = "", "", ""
+		ac.mu.Unlock()
+		return "", fmt.Errorf("cloud Skill %q is not available on this account", name)
+	}
+	if cachedValid {
+		return cachedHandle, nil
+	}
+	return "", lastErr
+}
+
+var skillHandleRe = regexp.MustCompile(`^[0-9a-fA-F-]{20,40}$`)
+
+var skillAliases = map[string]bool{
+	"伊珂丝": true, "eksie": true, "eks": true, "ex": true, "エクス": true,
+}
+
+func normalizeSkillName(name string) string {
+	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "/")))
+}
+
+// skillCacheValid reports whether a previously confirmed handle can stand in
+// for an empty cCSu7 listing. The handle is page-session scoped and only valid
+// for the same configured skill.
+func skillCacheValid(handle, cachedName, cachedFSid, target, currentFSid string) bool {
+	return handle != "" && cachedName == target && cachedFSid == currentFSid
+}
+
+// extractSkillRecords mirrors the web client's cCSu7 decoder: the records are
+// nested one or more levels deep and the first record's first element is the
+// runtime handle.
+func extractSkillRecords(payload any) [][]any {
+	node := payload
+	for depth := 0; depth < 6; depth++ {
+		arr, ok := node.([]any)
+		if !ok || len(arr) == 0 {
+			return nil
+		}
+		first, ok := arr[0].([]any)
+		if !ok || len(first) == 0 {
+			return nil
+		}
+		if handle, ok := first[0].(string); ok && skillHandleRe.MatchString(handle) {
+			out := make([][]any, 0, len(arr))
+			for _, item := range arr {
+				rec, ok := item.([]any)
+				if !ok || len(rec) == 0 {
+					continue
+				}
+				if _, ok := rec[0].(string); ok {
+					out = append(out, rec)
+				}
+			}
+			return out
+		}
+		node = first
+	}
+	return nil
+}
+
+func skillRecordMatches(rec []any, target string) bool {
+	if target == "" {
+		return false
+	}
+	for _, idx := range []int{0, 1} {
+		if idx >= len(rec) {
+			continue
+		}
+		raw, ok := rec[idx].(string)
+		if !ok {
+			continue
+		}
+		candidate := normalizeSkillName(raw)
+		if candidate == target {
+			return true
+		}
+		if skillAliases[candidate] && skillAliases[target] {
+			return true
+		}
+	}
+	return false
 }
 
 func findBatchPayload(entries []BatchEntry, rpcID string) any {

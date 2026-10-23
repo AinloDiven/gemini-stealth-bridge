@@ -44,6 +44,87 @@ type sseDeltaReasoning struct {
 
 type sseDeltaEmpty struct{}
 
+// sseExtensionChunk is an additive, versioned Gemini extension frame carried
+// inside the OpenAI-compatible chat SSE stream. choices is always [] on these
+// frames; existing OpenAI clients ignore them.
+type sseExtensionChunk struct {
+	Object          string          `json:"object"`
+	Choices         []sseChatChoice `json:"choices"`
+	ProtocolVersion int             `json:"x_gemini_protocol_version"`
+	Reasoning       map[string]any  `json:"x_gemini_reasoning,omitempty"`
+	ActionStatus    map[string]any  `json:"x_gemini_action_status,omitempty"`
+}
+
+// buildActionStatusPayload projects one upstream action card into the
+// x_gemini_action_status contract. It only relays values that came from the
+// wire: progress_detail is the thinking/tool title and provider/status_template
+// are the tool id and logo template. No title or icon is synthesized.
+func buildActionStatusPayload(operationID string, a *gemini.ActionStatus) map[string]any {
+	if a == nil {
+		return nil
+	}
+	sourceType := "thinking_progress"
+	phase := "thinking"
+	progress := strings.TrimSpace(a.ThinkingTitle)
+	if progress == "" {
+		sourceType = "tool_progress"
+		progress = strings.TrimSpace(a.ToolTitle)
+		if progress == "" {
+			progress = stripToolLogoPlaceholder(a.BranchTitle)
+		}
+		switch a.ToolID {
+		case "web_search":
+			sourceType = "web_search"
+			phase = "searching"
+		case "image_generation", "video_generation":
+			phase = "generating_media"
+		}
+	}
+	template := strings.TrimSpace(a.StatusTemplate)
+	if !strings.Contains(template, "{tool_logo_placeholder}") {
+		template = ""
+	}
+	if progress == "" && template == "" {
+		return nil
+	}
+	// A tool/thinking card is a progress observation, not the generation's
+	// terminal signal. The web client keeps the turn active after a tool card
+	// completes, and the bot treats a terminal frame as final for the whole
+	// operation, so these cards are always non-terminal.
+	state := "active"
+	terminal := false
+	leaseSeconds := 300
+	if phase == "generating_media" {
+		leaseSeconds = 1020
+	}
+	payload := map[string]any{
+		"operation_id":       operationID + ":generation",
+		"type":               "generation",
+		"source_type":        sourceType,
+		"state":              state,
+		"phase":              phase,
+		"text":               progress,
+		"progress_detail":    progress,
+		"terminal":           terminal,
+		"lease_seconds":      leaseSeconds,
+		"turn_admitted":      false,
+		"artifacts_expected": 0,
+		"artifacts_ready":    0,
+		"artifacts_failed":   0,
+	}
+	if a.ToolID != "" {
+		payload["provider"] = a.ToolID
+	}
+	if template != "" {
+		payload["status_template"] = template
+	}
+	return payload
+}
+
+func stripToolLogoPlaceholder(s string) string {
+	return strings.TrimSpace(strings.ReplaceAll(s, "{tool_logo_placeholder}", ""))
+}
+
 // HandleChat executes an OpenAI-compatible /v1/chat/completions request.
 func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map[string]any, scope AuthScope) {
 	if body == nil {
@@ -133,6 +214,49 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	lastRetryReason := ""
 	var streamMu sync.Mutex
 	flusher, _ := w.(http.Flusher)
+	reasoningOpen := false
+	reasoningDeltas := 0
+	reasoningText := ""
+
+	writeExtensionLocked := func(ext sseExtensionChunk) {
+		b, err := json.Marshal(&ext)
+		if err != nil {
+			return
+		}
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	closeReasoningLocked := func() {
+		if !reasoningOpen {
+			return
+		}
+		reasoningOpen = false
+		writeExtensionLocked(sseExtensionChunk{
+			Object:          "chat.completion.chunk",
+			Choices:         []sseChatChoice{},
+			ProtocolVersion: 3,
+			Reasoning: map[string]any{
+				"id":          "rs_0",
+				"index":       0,
+				"status":      "completed",
+				"event":       "done",
+				"text":        reasoningText,
+				"delta_count": reasoningDeltas,
+			},
+		})
+	}
+	// Error paths after headers must still close a started reasoning lifecycle.
+	defer func() {
+		streamMu.Lock()
+		if headersSent {
+			closeReasoningLocked()
+		}
+		streamMu.Unlock()
+	}()
 
 	// markPhase records a phase timestamp once, in milliseconds from request
 	// start. A value stays -1 until that phase is actually observed.
@@ -181,6 +305,28 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		if handlerDone.Load() {
 			return
 		}
+		if r, ok := delta.(sseDeltaReasoning); ok && r.ReasoningContent != "" {
+			if !reasoningOpen {
+				reasoningOpen = true
+				reasoningDeltas = 0
+				reasoningText = ""
+				writeExtensionLocked(sseExtensionChunk{
+					Object:          "chat.completion.chunk",
+					Choices:         []sseChatChoice{},
+					ProtocolVersion: 3,
+					Reasoning: map[string]any{
+						"id":     "rs_0",
+						"index":  0,
+						"status": "in_progress",
+						"event":  "start",
+					},
+				})
+			}
+		} else if c, ok := delta.(sseDeltaContent); ok && c.Content != "" {
+			closeReasoningLocked()
+		} else if m, ok := delta.(map[string]any); ok && hasToolCallDelta(m) {
+			closeReasoningLocked()
+		}
 		chunk := sseChatChunk{
 			ID:      cmplID,
 			Object:  "chat.completion.chunk",
@@ -203,6 +349,79 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		if flusher != nil {
 			flusher.Flush()
 		}
+		if r, ok := delta.(sseDeltaReasoning); ok && r.ReasoningContent != "" {
+			reasoningText += r.ReasoningContent
+			reasoningDeltas++
+			writeExtensionLocked(sseExtensionChunk{
+				Object:          "chat.completion.chunk",
+				Choices:         []sseChatChoice{},
+				ProtocolVersion: 3,
+				Reasoning: map[string]any{
+					"id":     "rs_0",
+					"index":  0,
+					"status": "in_progress",
+					"event":  "delta",
+					"delta":  r.ReasoningContent,
+				},
+			})
+		}
+	}
+
+	var pendingAction *gemini.ActionStatus
+	actionSeq := 0
+	lastActionSig := ""
+	emitActionStatus := func(a *gemini.ActionStatus) {
+		payload := buildActionStatusPayload(cmplID, a)
+		if payload == nil {
+			return
+		}
+		sigBytes, _ := json.Marshal(payload)
+		sig := string(sigBytes)
+		streamMu.Lock()
+		if !headersSent {
+			pendingAction = a
+			streamMu.Unlock()
+			return
+		}
+		if sig == lastActionSig {
+			streamMu.Unlock()
+			return
+		}
+		lastActionSig = sig
+		actionSeq++
+		payload["sequence"] = actionSeq
+		writeExtensionLocked(sseExtensionChunk{
+			Object:          "chat.completion.chunk",
+			Choices:         []sseChatChoice{},
+			ProtocolVersion: 3,
+			ActionStatus:    payload,
+		})
+		streamMu.Unlock()
+	}
+	queueActionStatus := func(a *gemini.ActionStatus) {
+		if a == nil {
+			return
+		}
+		streamMu.Lock()
+		sent := headersSent
+		if !sent {
+			pendingAction = a
+		}
+		streamMu.Unlock()
+		if sent {
+			emitActionStatus(a)
+		}
+	}
+	flushPendingAction := func() {
+		streamMu.Lock()
+		a := pendingAction
+		if a == nil || !headersSent {
+			streamMu.Unlock()
+			return
+		}
+		pendingAction = nil
+		streamMu.Unlock()
+		emitActionStatus(a)
 	}
 
 	var pinger *streamPinger
@@ -417,6 +636,10 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 				if stream && buffered && ctx.Err() == nil && identityVerifiedNow {
 					startStream(false)
+					flushPendingAction()
+				}
+				if update.Action != nil {
+					queueActionStatus(update.Action)
 				}
 
 				if update.CID != "" {
@@ -493,6 +716,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if identityVerified {
 							startStream(false)
+							flushPendingAction()
 						}
 						if identityVerified && s.Cfg.LiveThoughts {
 							if hasTools && !s.Cfg.KeepToolPreamble && sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) {
@@ -525,8 +749,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
 								sentText = text
 								lastActiveKeepaliveAt = time.Now()
-						} else if hasTools && !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
-							if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
+							} else if hasTools && !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
+								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
 									startStream(false)
 									emit(sseDeltaContent{Content: safePrefix[len(sentText):]}, nil, nil)
 									sentText = safePrefix
@@ -536,6 +760,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 					}
 				}
+				flushPendingAction()
 				return nil
 			})
 			account.mu.Lock()
@@ -592,6 +817,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			}
 			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 				s.deleteSessionCache(cacheKey)
+				s.deleteSessionBinding(prep.sessionBindingKey)
 				cacheKey = ""
 			}
 
@@ -981,7 +1207,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		}
 
 		if !opts.Temporary {
-			s.saveSessionContinuation(account.ID, mid, messages, toolsRaw, toolChoiceRaw, content, oaCalls, lastCID, lastRID, candidateID, lastContextToken)
+			s.saveSessionContinuation(account.ID, mid, messages, toolsRaw, toolChoiceRaw, content, oaCalls, lastCID, lastRID, candidateID, lastContextToken, prep.sessionBindingKey)
 		}
 
 		if stream {
@@ -1006,6 +1232,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			if served != nil && servedID != model.ModelID {
 				emit(map[string]any{"model_served": served}, nil, nil)
 			}
+			streamMu.Lock()
+			closeReasoningLocked()
+			streamMu.Unlock()
 			emit(sseDeltaEmpty{}, finish, usage)
 			streamMu.Lock()
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")

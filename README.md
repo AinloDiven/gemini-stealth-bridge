@@ -292,6 +292,12 @@ Gemini Web conversations are continued with internal metadata (`cid`, `rid`, `rc
 - Disabled with `BRIDGE_SESSION_CACHE=0`
 - Bypassed for `temporary: true` requests
 
+An explicit `X-GSB-Session` binding is a second, opt-in layer: it is keyed by
+the caller's API key plus that id, lives in `$BRIDGE_HOME/session-bindings.json`,
+defaults to a 24-hour TTL (`BRIDGE_SESSION_BINDING_TTL_MS`), and pins the
+account/model so a bot can trim history without losing the Gemini conversation.
+See [PARITY_FEATURES.md](docs/PARITY_FEATURES.md).
+
 Uploaded images and offloaded text attachments are cached separately for **25 minutes** (maximum 128 entries) so repeated turns do not re-upload the same bytes.
 
 `BRIDGE_HISTORY_OFFLOAD=1` (default) uploads older conversation turns as text attachments when the inline prompt budget is exceeded. Setting it to `0` forces inline compaction instead.
@@ -804,7 +810,7 @@ Accepted fields:
 
 | Field | Notes |
 |---|---|
-| `model` | Optional; empty uses the first model on the selected account. Supports router prefixes and `@think=` |
+| `model` | Optional; empty uses `BRIDGE_DEFAULT_MODEL` when set, otherwise the first model on the selected account. Supports router prefixes and `@think=` |
 | `messages` | Required, non-empty array. Roles: `system`, `developer`, `user`, `assistant`, `tool`, `function` |
 | `stream` | Boolean; SSE when true |
 | `tools` | Array of `{"type":"function","function":{name,description,parameters}}`. Tool names match `^[A-Za-z0-9_.:-]{1,128}$`; duplicates are rejected |
@@ -819,6 +825,16 @@ Accepted fields:
 | `output_config` | `effort` |
 
 Sampling parameters such as `temperature`, `top_p`, `max_tokens`, and `stop` are accepted but ignored.
+
+Optional request header `X-GSB-Session: <id>` binds this turn and later turns
+with the same id to the saved Gemini conversation (account, model, `cid`/`rid`/
+`rcid`/context token), even if the client trims the message history. The binding
+survives restarts under `$BRIDGE_HOME/session-bindings.json`; see
+[PARITY_FEATURES.md](docs/PARITY_FEATURES.md).
+
+A fixed cloud Skill can be configured with `BRIDGE_SKILL` (or per account/key);
+when present, gsb resolves the server handle, arms StreamGenerate slot 81, and
+puts the same `/skill` prefix at byte 0 of the per-turn prompt.
 
 Message content can be a string or an array of parts. Supported image shapes:
 
@@ -849,6 +865,10 @@ Wire format:
 - a first role-only delta (`{"role":"assistant","content":""}`)
 - text in `choices[0].delta.content`
 - reasoning in `choices[0].delta.reasoning_content` when extracted and enabled
+- reasoning lifecycle in `x_gemini_reasoning` frames (`start`/`delta`/`done`) and
+  upstream action titles/icons in `x_gemini_action_status` frames (both are
+  additive `choices:[]` envelopes with `x_gemini_protocol_version:3`; see
+  [PARITY_FEATURES.md](docs/PARITY_FEATURES.md))
 - tool calls in `choices[0].delta.tool_calls`
 - a final chunk with `finish_reason` (`stop` or `tool_calls`) and `usage`
 - `data: [DONE]`
@@ -1247,6 +1267,11 @@ An unknown value falls back to `chrome_150_psk`. User-Agent and `Sec-CH-UA*` ver
 | Variable | Default | Meaning |
 |---|---|---|
 | `BRIDGE_DEFAULT_THINKING` | `low` | Effort applied when a request sends none: `low`, `medium`, `high` |
+| `BRIDGE_DEFAULT_MODEL` | Empty | Model used when a request omits `model`; switchable at runtime via `PATCH /v1/admin/config` `{"defaultModel":…,"persist":true}` |
+| `BRIDGE_SKILL` | Empty | Fixed cloud Skill slash command (for example `/伊珂丝`); arms StreamGenerate slot 81 |
+| `BRIDGE_SKILL_PER_KEY` | Empty | `token:skill` overrides for `BRIDGE_SKILL` |
+| `BRIDGE_SESSION_BINDING_TTL_MS` | `86400000` | Lifetime of an explicit `X-GSB-Session` binding |
+| `BRIDGE_SESSION_BINDING_MAX` | `1024` | Maximum live explicit session bindings |
 | `BRIDGE_LIVE_THOUGHTS` | `true` | Include separately extracted reasoning in API output |
 | `BRIDGE_TEMPORARY` | `false` | Request temporary Gemini conversations; skips continuation-cache reuse |
 | `BRIDGE_SESSION_CACHE` | `true` | Persist and reuse conversation continuation metadata |
@@ -1313,6 +1338,7 @@ $BRIDGE_HOME/                     # default ~/.gemini-stealth-bridge
 ├── .lock                         # single-writer lock (pid + start time)
 ├── config.env                    # UI/admin-persisted runtime settings, mode 0600
 ├── session-cache.json            # continuation metadata, mode 0600
+├── session-bindings.json         # explicit X-GSB-Session bindings, mode 0600
 ├── reference-fingerprint.json    # only after --capture-reference
 ├── web-credentials.json          # legacy single-account credential file
 └── accounts/
@@ -1322,9 +1348,9 @@ $BRIDGE_HOME/                     # default ~/.gemini-stealth-bridge
 
 Account file fields include:
 
-`kind`, `name`, `email`, `cookies`, `at`, `bl`, `fSid`, `capturedAt`, `rotatedAt`, `cookieDb`, `importedFrom`, `profileId`, `tokenFetchedAt`, `tokenSource`, `lastReqId`, `quarantined`, `quarantineReason`, `disabled`, `accountGroup`, `proxyUrl`, `surfaces`.
+`kind`, `name`, `email`, `cookies`, `at`, `bl`, `fSid`, `capturedAt`, `rotatedAt`, `cookieDb`, `importedFrom`, `profileId`, `tokenFetchedAt`, `tokenSource`, `lastReqId`, `quarantined`, `quarantineReason`, `disabled`, `accountGroup`, `proxyUrl`, `skill`, `surfaces`.
 
-Account files and `session-cache.json` contain credentials or sensitive continuation metadata. They are written with mode `0600` on POSIX systems. Protect the whole data directory with OS permissions and exclude it from version control and shared backups. On Windows, use filesystem ACLs rather than relying on POSIX mode bits.
+Account files, `session-cache.json`, and `session-bindings.json` contain credentials or sensitive continuation metadata. They are written with mode `0600` on POSIX systems. Protect the whole data directory with OS permissions and exclude it from version control and shared backups. On Windows, use filesystem ACLs rather than relying on POSIX mode bits.
 
 Only one daemon may use a `BRIDGE_HOME` at a time. A second instance exits with a lock error naming the owning PID.
 

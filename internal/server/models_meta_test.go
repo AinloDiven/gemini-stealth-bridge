@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"encoding/base64"
 	"testing"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
@@ -105,5 +107,89 @@ func TestModelsPayloadFallsBackToConfiguredLimits(t *testing.T) {
 	}
 	if got := capsOf(t, entry)["limitsSource"]; got != "config" {
 		t.Fatalf("limitsSource = %v, want config", got)
+	}
+}
+
+func TestModelsPayloadAdvertisesMultimodalInputCapabilities(t *testing.T) {
+	cfg := config.Config{}
+	entry := payloadFor(t, cfg, gemini.ModelInfo{ModelName: "gemini-pro", DisplayName: "3.1 Pro"})
+	arch, ok := entry["architecture"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing architecture: %#v", entry)
+	}
+	mods, ok := arch["input_modalities"].([]string)
+	if !ok || len(mods) != 5 {
+		t.Fatalf("input_modalities = %#v, want [text image audio file video]", arch["input_modalities"])
+	}
+	caps := capsOf(t, entry)
+	for _, k := range []string{"vision", "pdf", "audioInput", "videoInput"} {
+		if caps[k] != true {
+			t.Fatalf("capabilities.%s = %v, want true", k, caps[k])
+		}
+	}
+}
+
+func TestChatAndResponsesUploadPDFAndAudioAttachments(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	var uploadedTypes []string
+	var uploadedNames []string
+	var lastOpts gemini.StreamOptions
+	up := &mockUpstream{
+		uploadFn: func(ctx context.Context, data []byte, filename, contentType string) (gemini.UploadedFile, error) {
+			uploadedTypes = append(uploadedTypes, contentType)
+			uploadedNames = append(uploadedNames, filename)
+			return gemini.UploadedFile{Path: "/contrib_service/ttl_1d/" + filename, Filename: filename}, nil
+		},
+		streamFn: func(ctx context.Context, promptText string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			lastOpts = opts
+			_ = onFrame(&gemini.LineParseResult{
+				AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{
+					{RCID: "rc1", Text: "Parsed PDF and audio", Done: true, AnsweredModelID: testModel.ModelID},
+				},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	acct.Client = up
+
+	pdfB64 := base64.StdEncoding.EncodeToString([]byte("%PDF-1.7\nhello pdf\n"))
+	oggB64 := base64.StdEncoding.EncodeToString([]byte("OggS\x00\x02voice\x00"))
+
+	rec := runChat(t, srv, acct, up, map[string]any{
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "Summarize both"},
+					map[string]any{
+						"type": "file",
+						"file": map[string]any{
+							"filename":  "paper.pdf",
+							"file_data": "data:application/pdf;base64," + pdfB64,
+						},
+					},
+					map[string]any{
+						"type": "input_audio",
+						"input_audio": map[string]any{
+							"data":   oggB64,
+							"format": "ogg",
+						},
+					},
+				},
+			},
+		},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("expected HTTP 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(uploadedTypes) != 2 || uploadedTypes[0] != "application/pdf" || uploadedTypes[1] != "audio/ogg" {
+		t.Fatalf("unexpected uploaded content types: %v", uploadedTypes)
+	}
+	if len(uploadedNames) != 2 || uploadedNames[0] != "paper.pdf" || uploadedNames[1] != "audio_2.ogg" {
+		t.Fatalf("unexpected uploaded filenames: %v", uploadedNames)
+	}
+	if len(lastOpts.Files) != 2 || lastOpts.Files[0].Filename != "paper.pdf" || lastOpts.Files[1].Filename != "audio_2.ogg" {
+		t.Fatalf("unexpected StreamOptions.Files: %+v", lastOpts.Files)
 	}
 }

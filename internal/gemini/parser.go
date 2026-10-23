@@ -31,6 +31,26 @@ type GeneratedVideo struct {
 	MimeType     string `json:"mimeType,omitempty"`
 }
 
+// ActionStatus is the pass-through view of one Gemini Web action card from
+// candidate slot 2 (field 7) or its slot-11 mirror. It deliberately contains
+// only values that were present on the wire; labels/icons are never invented.
+type ActionStatus struct {
+	// ThinkingTitle is branch 1's short micro-step title (field 7[5]).
+	ThinkingTitle string
+	// ToolID is branch 2/3's wire tool id (field 7[1][0]); the UI derives its
+	// icon from this id, never from a URL or a locally invented mapping.
+	ToolID string
+	// ToolTitle is branch 2/3's title (field 7[1][1][2]).
+	ToolTitle string
+	// StatusTemplate is field 7[1][1][5] when it still carries Gemini Web's
+	// {tool_logo_placeholder} token.
+	StatusTemplate string
+	// BranchTitle is field 7[0], the branch 3 display title.
+	BranchTitle string
+	// State is the normalized tool lifecycle state (active/complete/failed).
+	State string
+}
+
 // Frame is a single parsed candidate frame from a wrb.fr envelope.
 type Frame struct {
 	RCID               string            `json:"rcid"`
@@ -57,6 +77,10 @@ type LineParseResult struct {
 	StreamEnd          bool
 	Frames             []Frame
 	GroundingSources   []GroundingSource
+	// Action is the top-level action card carried by this line (field 7 or
+	// its field-12 mirror). It can arrive on a status-only line with no
+	// candidate frames, which is why it does not belong to Frame.
+	Action *ActionStatus
 }
 
 var (
@@ -753,6 +777,9 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 		if err := json.Unmarshal([]byte(innerStr), &pj); err != nil {
 			return nil, transport.NewUpstreamError("malformed upstream frame payload", 502, "upstream_parse_error", nil, err)
 		}
+		if action := parseActionStatus(pj); action != nil {
+			res.Action = action
+		}
 
 		if len(pj) > 1 {
 			if ids, ok := pj[1].([]any); ok {
@@ -872,6 +899,29 @@ func jspbSubField(parent any, index int) any {
 	return nil
 }
 
+// jspbIndex is jspbSubField for a positional slot on a frame whose trailing
+// element may be a sparse dictionary. Unlike jspbField it prefers the dense
+// position even when the slot happens to be the last element, which is how a
+// status-only frame ([null, ids, {"7":...}]) encodes its action card.
+func jspbIndex(parent any, index int) any {
+	if parent == nil {
+		return nil
+	}
+	if arr, ok := parent.([]any); ok {
+		if index >= 0 && index < len(arr) {
+			return arr[index]
+		}
+		if lastMap, ok := arr[len(arr)-1].(map[string]any); ok {
+			return lastMap[strconv.Itoa(index+1)]
+		}
+		return nil
+	}
+	if m, ok := parent.(map[string]any); ok {
+		return m[strconv.Itoa(index+1)]
+	}
+	return nil
+}
+
 func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool) {
 	var rcid string
 	if len(c) > 0 {
@@ -961,6 +1011,102 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		GeneratedVideos:    videos,
 		GroundingSources:   grounding,
 	}, true
+}
+
+// parseActionStatus reads the top-level frame's field 7 action card and its
+// field-12 mirror. It returns nil when the frame carries no action card. The
+// mapping is the same one the web client uses (see FastAPI wire/activity.py):
+// branch 1 has a list of thinking titles at index 5, branches 2/3 put
+// [tool_id, meta, state] at index 1 with meta[2]=title and meta[5]=status
+// template.
+func parseActionStatus(frame []any) *ActionStatus {
+	primary := actionArray(frame, 2, 6)
+	mirror := actionArray(frame, 11, 0)
+	if len(primary) == 0 && len(mirror) == 0 {
+		return nil
+	}
+	out := &ActionStatus{}
+	if title := firstActionString(jspbField(primary, 5)); title != "" {
+		out.ThinkingTitle = title
+	} else if title := firstActionString(jspbField(mirror, 5)); title != "" {
+		out.ThinkingTitle = title
+	}
+
+	// Tool cards may live in the primary slot or only in the mirror. Resolve the
+	// action array and its tool cell together so action[0] stays consistent.
+	toolAction := primary
+	toolArr, _ := jspbField(primary, 1).([]any)
+	if len(toolArr) == 0 {
+		toolAction = mirror
+		toolArr, _ = jspbField(mirror, 1).([]any)
+	}
+	if len(toolArr) > 0 {
+		out.ToolID = firstActionString(jspbField(toolArr, 0))
+		if meta, ok := jspbField(toolArr, 1).([]any); ok {
+			out.ToolTitle = firstActionString(jspbField(meta, 2))
+			out.StatusTemplate = firstActionString(jspbField(meta, 5))
+		}
+		out.State = normalizeActionState(jspbField(toolArr, 2))
+		out.BranchTitle = firstActionString(jspbField(toolAction, 0))
+	}
+	if out.BranchTitle == "" {
+		out.BranchTitle = firstActionString(jspbField(primary, 0))
+	}
+	if out.BranchTitle == "" {
+		out.BranchTitle = firstActionString(jspbField(mirror, 0))
+	}
+	if out.ThinkingTitle == "" && out.ToolID == "" && out.ToolTitle == "" && out.StatusTemplate == "" && out.BranchTitle == "" {
+		return nil
+	}
+	return out
+}
+
+func actionArray(frame []any, slot, field int) []any {
+	arr, _ := jspbSubField(jspbIndex(frame, slot), field).([]any)
+	return arr
+}
+
+func firstActionString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeActionState(value any) string {
+	switch v := value.(type) {
+	case float64:
+		switch int(v) {
+		case 1:
+			return "active"
+		case 4:
+			return "complete"
+		}
+	case int:
+		switch v {
+		case 1:
+			return "active"
+		case 4:
+			return "complete"
+		}
+	case string:
+		switch strings.ToLower(v) {
+		case "1", "started", "active":
+			return "active"
+		case "4", "complete", "completed", "settled":
+			return "complete"
+		case "failed", "error":
+			return "failed"
+		}
+	}
+	return "active"
 }
 
 // ParseConversationPollResponse parses an hNvQHb batchexecute response payload
