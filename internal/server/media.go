@@ -373,6 +373,15 @@ func (s *Server) runMediaGenerationOnAccount(
 				}
 			}
 			s.rewriteFrameMedia(ctx, account.ID, &f)
+			if len(f.GeneratedImages) == 0 && len(lastFrame.GeneratedImages) > 0 {
+				f.GeneratedImages = lastFrame.GeneratedImages
+			}
+			if len(f.GeneratedVideos) == 0 && len(lastFrame.GeneratedVideos) > 0 {
+				f.GeneratedVideos = lastFrame.GeneratedVideos
+			}
+			if f.Done && (len(f.GeneratedImages) > 0 || len(f.GeneratedVideos) > 0) {
+				f.Text = gemini.AppendGeneratedMediaMarkdown(f.Text, f.GeneratedImages, f.GeneratedVideos)
+			}
 			lastFrame = f
 			hasFrame = true
 		}

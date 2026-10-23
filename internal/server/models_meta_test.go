@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/base64"
+	"strings"
 	"testing"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/config"
@@ -191,5 +192,64 @@ func TestChatAndResponsesUploadPDFAndAudioAttachments(t *testing.T) {
 	}
 	if len(lastOpts.Files) != 2 || lastOpts.Files[0].Filename != "paper.pdf" || lastOpts.Files[1].Filename != "audio_2.ogg" {
 		t.Fatalf("unexpected StreamOptions.Files: %+v", lastOpts.Files)
+	}
+}
+
+func TestStreamingMediaInIntermediateFrameDoesNotTriggerUpstreamRevision(t *testing.T) {
+	srv, acct := newTestHarness(true, false)
+	up := &mockUpstream{
+		streamFn: func(ctx context.Context, promptText string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			img := gemini.GeneratedImage{
+				URL:   "https://lh3.googleusercontent.com/gg-dl/stream-cat=s0-d",
+				Title: "Stream Cat",
+			}
+			// Frame 1 (done=false): emits initial text + structured GeneratedImages without markdown in Text
+			if err := onFrame(&gemini.LineParseResult{
+				CID:             "c_stream",
+				RID:             "r_stream",
+				AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{
+					{
+						RCID:            "rc_stream",
+						Text:            "前半句 ",
+						Done:            false,
+						AnsweredModelID: testModel.ModelID,
+						GeneratedImages: []gemini.GeneratedImage{img},
+					},
+				},
+			}); err != nil {
+				return nil, err
+			}
+			// Frame 2 (done=true): continues text after image frame
+			if err := onFrame(&gemini.LineParseResult{
+				CID:             "c_stream",
+				RID:             "r_stream",
+				AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{
+					{
+						RCID:            "rc_stream",
+						Text:            "前半句 后半句",
+						Done:            true,
+						AnsweredModelID: testModel.ModelID,
+					},
+				},
+			}); err != nil {
+				return nil, err
+			}
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	rec := runChat(t, srv, acct, up, map[string]any{
+		"stream": true,
+	})
+	if rec.Code != 200 {
+		t.Fatalf("expected HTTP 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	bodyStr := rec.Body.String()
+	if strings.Contains(bodyStr, "upstream_revision") {
+		t.Fatalf("unexpected upstream_revision error in SSE stream:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "后半句") || !strings.Contains(bodyStr, "/v1/media/") {
+		t.Fatalf("expected streamed body to include continuation text and proxied /v1/media/ link, got:\n%s", bodyStr)
 	}
 }
