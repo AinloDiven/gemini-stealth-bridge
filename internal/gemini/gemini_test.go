@@ -624,3 +624,55 @@ func TestExtractStreamEnvelopesSingleArrayNoNewlines(t *testing.T) {
 		t.Fatalf("expected ['di',...] to mark StreamEnd=true, got %+v err=%v", pEnd, err)
 	}
 }
+
+func TestParseCandidateSliceDefersMediaMarkdownUntilDoneAndPreservesPrefix(t *testing.T) {
+	imgItem := []any{
+		[]any{
+			nil, nil, nil,
+			[]any{nil, float64(1024), float64(1024), "https://lh3.googleusercontent.com/gg-dl/test-cat-id=s512"},
+		},
+		nil, nil,
+		[]any{nil, nil, nil, nil, nil, []any{"A cyberpunk cat"}, "Cyberpunk Cat"},
+	}
+	mediaSlot := map[string]any{
+		"13": map[string]any{
+			"8": []any{[]any{imgItem}},
+		},
+	}
+
+	c1 := []any{
+		"rc_1",
+		[]any{"前半句 "},
+		nil, nil, nil, nil, nil, nil,
+		[]any{float64(1)}, // done = false
+		mediaSlot,
+	}
+	f1, ok := parseCandidateSlice(c1, "id1", "Pro")
+	if !ok {
+		t.Fatal("expected parseCandidateSlice c1 ok")
+	}
+	if len(f1.GeneratedImages) != 1 {
+		t.Fatalf("expected 1 generated image on intermediate frame, got %d", len(f1.GeneratedImages))
+	}
+	if f1.Text != "前半句 " {
+		t.Fatalf("expected intermediate frame Text to remain untouched %q without markdown suffix, got %q", "前半句 ", f1.Text)
+	}
+
+	c2 := []any{
+		"rc_1",
+		[]any{"前半句 后半句 "},
+		nil, nil, nil, nil, nil, nil,
+		[]any{float64(2)}, // done = true
+		mediaSlot,
+	}
+	f2, ok := parseCandidateSlice(c2, "id1", "Pro")
+	if !ok {
+		t.Fatal("expected parseCandidateSlice c2 ok")
+	}
+	if !strings.HasPrefix(f2.Text, f1.Text) {
+		t.Fatalf("expected final frame Text (%q) to have intermediate frame Text (%q) as strict prefix", f2.Text, f1.Text)
+	}
+	if !strings.Contains(f2.Text, "![Cyberpunk Cat](https://lh3.googleusercontent.com/gg-dl/test-cat-id=s0-d)") {
+		t.Fatalf("expected final frame Text to append image markdown, got %q", f2.Text)
+	}
+}

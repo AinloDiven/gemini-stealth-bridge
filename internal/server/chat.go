@@ -688,6 +688,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 					thoughts = mergeStreamedThoughts(thoughts, frame.Thoughts)
 					done = frame.Done
+					if done && (len(lastImages) > 0 || len(lastVideos) > 0) {
+						text = gemini.AppendGeneratedMediaMarkdown(text, lastImages, lastVideos)
+					}
 					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 					attemptStateMu.Unlock()
 					if frameMismatch {

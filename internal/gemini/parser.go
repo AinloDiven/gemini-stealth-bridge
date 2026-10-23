@@ -963,41 +963,8 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 
 	grounding := extractGroundingSources(c)
 
-	var mdParts []string
-	for _, img := range images {
-		if strings.Contains(text, img.URL) {
-			continue
-		}
-		alt := img.Title
-		if alt == "" {
-			alt = img.Alt
-		}
-		if alt == "" {
-			alt = "Generated Image"
-		}
-		mdParts = append(mdParts, fmt.Sprintf("![%s](%s)\n\n[Download Image (%s)](%s)", alt, img.URL, alt, img.URL))
-	}
-	for _, vid := range videos {
-		if strings.Contains(text, vid.URL) {
-			continue
-		}
-		title := vid.Title
-		if title == "" {
-			title = "Generated Video"
-		}
-		if vid.ThumbnailURL != "" {
-			mdParts = append(mdParts, fmt.Sprintf("[![%s](%s)](%s)\n\n[Download Video (%s)](%s)", title, vid.ThumbnailURL, vid.URL, title, vid.URL))
-		} else {
-			mdParts = append(mdParts, fmt.Sprintf("[Download Video (%s)](%s)", title, vid.URL))
-		}
-	}
-	if len(mdParts) > 0 {
-		joined := strings.Join(mdParts, "\n\n")
-		if strings.TrimSpace(text) == "" {
-			text = joined
-		} else {
-			text = strings.TrimSpace(text) + "\n\n" + joined
-		}
+	if done {
+		text = AppendGeneratedMediaMarkdown(text, images, videos)
 	}
 
 	return Frame{
@@ -1011,6 +978,53 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		GeneratedVideos:    videos,
 		GroundingSources:   grounding,
 	}, true
+}
+
+// AppendGeneratedMediaMarkdown appends Markdown links for generated images and
+// videos not already present in text, preserving text as an exact byte prefix.
+func AppendGeneratedMediaMarkdown(text string, images []GeneratedImage, videos []GeneratedVideo) string {
+	var mdParts []string
+	for _, img := range images {
+		if img.URL == "" || strings.Contains(text, img.URL) {
+			continue
+		}
+		alt := img.Title
+		if alt == "" {
+			alt = img.Alt
+		}
+		if alt == "" {
+			alt = "Generated Image"
+		}
+		mdParts = append(mdParts, fmt.Sprintf("![%s](%s)\n\n[Download Image (%s)](%s)", alt, img.URL, alt, img.URL))
+	}
+	for _, vid := range videos {
+		if vid.URL == "" || strings.Contains(text, vid.URL) {
+			continue
+		}
+		title := vid.Title
+		if title == "" {
+			title = "Generated Video"
+		}
+		if vid.ThumbnailURL != "" {
+			mdParts = append(mdParts, fmt.Sprintf("[![%s](%s)](%s)\n\n[Download Video (%s)](%s)", title, vid.ThumbnailURL, vid.URL, title, vid.URL))
+		} else {
+			mdParts = append(mdParts, fmt.Sprintf("[Download Video (%s)](%s)", title, vid.URL))
+		}
+	}
+	if len(mdParts) == 0 {
+		return text
+	}
+	joined := strings.Join(mdParts, "\n\n")
+	if strings.TrimSpace(text) == "" {
+		return text + joined
+	}
+	if strings.HasSuffix(text, "\n\n") {
+		return text + joined
+	}
+	if strings.HasSuffix(text, "\n") {
+		return text + "\n" + joined
+	}
+	return text + "\n\n" + joined
 }
 
 // parseActionStatus reads the top-level frame's field 7 action card and its
