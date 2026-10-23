@@ -543,11 +543,15 @@ func (s *Server) uploadCached(ctx context.Context, acctID string, c UpstreamClie
 		if cachedURL, okURL := s.getUploadCache(urlKey); okURL {
 			return cachedURL, nil
 		}
+		origName := att.Filename
 		fetched, err := prompt.FetchRemoteImage(ctx, att.RemoteURL, 0)
 		if err != nil {
 			return gemini.UploadedFile{}, err
 		}
 		att = *fetched
+		if origName != "" && !prompt.IsDefaultAttachmentFilename(origName) {
+			att.Filename = origName
+		}
 		uf, err := s.uploadCachedBytes(ctx, acctID, c, att)
 		if err != nil {
 			return gemini.UploadedFile{}, err

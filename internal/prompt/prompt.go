@@ -26,7 +26,8 @@ import (
 )
 
 var (
-	dataURLImageRe          = regexp.MustCompile(`^data:(image/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$`)
+	dataURLImageRe          = regexp.MustCompile(`^data:([a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+)(?:;[a-zA-Z0-9_.+-]+=[^;,]+)*;base64,([A-Za-z0-9+/=\s_-]+)$`)
+	defaultFilenameRe       = regexp.MustCompile(`^(?:image|audio|video|file)_\d+\.[a-z0-9]+$`)
 	nonAlphaNumRe           = regexp.MustCompile(`[^a-z0-9]`)
 	fencedToolCallRe        = regexp.MustCompile("(?is)```(?:json)?\\s*\\{\\s*\"(?:tool_calls|toolCalls|function_call)\"[\\s\\S]*?```")
 	trailingToolCallRe      = regexp.MustCompile(`(?s)\{\s*"(?:tool_calls|toolCalls|function_call)"[\s\S]*$`)
@@ -48,10 +49,11 @@ func isContextNote(s string) bool {
 	return strings.HasPrefix(s, "[Context note:") || strings.HasPrefix(s, "Instruction: [")
 }
 
-// DetectImageMIME infers the MIME type and file extension of an image from its magic bytes.
+// DetectImageMIME infers the MIME type and file extension of an attachment from its magic bytes or fallback MIME.
 func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string) {
-	if fallback == "" {
-		fallback = "image/png"
+	fbLower := strings.ToLower(strings.TrimSpace(strings.Split(fallback, ";")[0]))
+	if fbLower == "" {
+		fbLower = "image/png"
 	}
 	switch {
 	case len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}):
@@ -62,10 +64,25 @@ func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string)
 		return "image/gif", "gif"
 	case len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WEBP")):
 		return "image/webp", "webp"
+	case len(data) >= 12 && bytes.Equal(data[:4], []byte("RIFF")) && bytes.Equal(data[8:12], []byte("WAVE")):
+		return "audio/wav", "wav"
 	case len(data) >= 2 && data[0] == 'B' && data[1] == 'M':
 		return "image/bmp", "bmp"
 	case len(data) >= 4 && (bytes.Equal(data[:4], []byte{'I', 'I', '*', 0x00}) || bytes.Equal(data[:4], []byte{'M', 'M', 0x00, '*'})):
 		return "image/tiff", "tiff"
+	case len(data) >= 5 && bytes.Equal(data[:5], []byte("%PDF-")):
+		return "application/pdf", "pdf"
+	case len(data) >= 4 && bytes.Equal(data[:4], []byte("OggS")):
+		return "audio/ogg", "ogg"
+	case len(data) >= 4 && bytes.Equal(data[:4], []byte("fLaC")):
+		return "audio/flac", "flac"
+	case (len(data) >= 3 && bytes.Equal(data[:3], []byte("ID3"))) || (len(data) >= 2 && data[0] == 0xff && (data[1]&0xe0) == 0xe0 && (data[1]&0x18) != 0x08):
+		return "audio/mpeg", "mp3"
+	case len(data) >= 4 && bytes.Equal(data[:4], []byte{0x1a, 0x45, 0xdf, 0xa3}):
+		if strings.HasPrefix(fbLower, "audio/") {
+			return "audio/webm", "webm"
+		}
+		return "video/webm", "webm"
 	case len(data) >= 12 && bytes.Equal(data[4:8], []byte("ftyp")):
 		brand := string(data[8:12])
 		switch brand {
@@ -73,10 +90,61 @@ func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string)
 			return "image/avif", "avif"
 		case "heic", "heix", "hevc", "hevx":
 			return "image/heic", "heic"
+		case "M4A ", "M4B ":
+			return "audio/mp4", "m4a"
+		case "qt  ":
+			return "video/quicktime", "mov"
+		case "isom", "iso2", "mp41", "mp42", "M4V ", "dash":
+			if strings.HasPrefix(fbLower, "audio/") {
+				return "audio/mp4", "m4a"
+			}
+			return "video/mp4", "mp4"
 		}
 	}
-	ext = "png"
-	if parts := strings.Split(strings.ToLower(fallback), "/"); len(parts) > 1 {
+	return normalizeFallbackMIME(fbLower)
+}
+
+func normalizeFallbackMIME(fbLower string) (string, string) {
+	switch fbLower {
+	case "image/jpeg", "image/jpg":
+		return "image/jpeg", "jpg"
+	case "image/svg+xml":
+		return "image/svg+xml", "svg"
+	case "application/pdf":
+		return "application/pdf", "pdf"
+	case "audio/mpeg", "audio/mp3":
+		return "audio/mpeg", "mp3"
+	case "audio/wav", "audio/x-wav", "audio/wave":
+		return "audio/wav", "wav"
+	case "audio/ogg", "audio/opus":
+		return "audio/ogg", "ogg"
+	case "audio/flac", "audio/x-flac":
+		return "audio/flac", "flac"
+	case "audio/mp4", "audio/m4a", "audio/x-m4a":
+		return "audio/mp4", "m4a"
+	case "audio/aac":
+		return "audio/aac", "aac"
+	case "audio/webm":
+		return "audio/webm", "webm"
+	case "video/mp4":
+		return "video/mp4", "mp4"
+	case "video/webm":
+		return "video/webm", "webm"
+	case "video/quicktime":
+		return "video/quicktime", "mov"
+	case "text/plain":
+		return "text/plain", "txt"
+	case "text/markdown", "text/x-markdown":
+		return "text/markdown", "md"
+	case "text/csv":
+		return "text/csv", "csv"
+	case "application/json":
+		return "application/json", "json"
+	case "application/octet-stream":
+		return "application/octet-stream", "bin"
+	}
+	ext := "png"
+	if parts := strings.Split(fbLower, "/"); len(parts) > 1 {
 		cleaned := nonAlphaNumRe.ReplaceAllString(parts[1], "")
 		if cleaned != "" {
 			if cleaned == "jpeg" {
@@ -86,7 +154,140 @@ func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string)
 			}
 		}
 	}
-	return strings.ToLower(fallback), ext
+	return fbLower, ext
+}
+
+func defaultAttachmentFilename(mimeType, ext string, index int) string {
+	if index < 0 {
+		index = 0
+	}
+	if ext == "" {
+		ext = "bin"
+	}
+	m := strings.ToLower(strings.TrimSpace(mimeType))
+	switch {
+	case strings.HasPrefix(m, "image/"):
+		return fmt.Sprintf("image_%d.%s", index+1, ext)
+	case strings.HasPrefix(m, "audio/"):
+		return fmt.Sprintf("audio_%d.%s", index+1, ext)
+	case strings.HasPrefix(m, "video/"):
+		return fmt.Sprintf("video_%d.%s", index+1, ext)
+	default:
+		return fmt.Sprintf("file_%d.%s", index+1, ext)
+	}
+}
+
+// IsDefaultAttachmentFilename reports whether name matches an auto-generated attachment filename.
+func IsDefaultAttachmentFilename(name string) bool {
+	return defaultFilenameRe.MatchString(strings.ToLower(strings.TrimSpace(name)))
+}
+
+func sanitizeAttachmentFilename(rawName, ext string) string {
+	s := strings.TrimSpace(rawName)
+	if s == "" {
+		return ""
+	}
+	if idx := strings.LastIndexAny(s, `/\`); idx >= 0 {
+		s = s[idx+1:]
+	}
+	s = strings.TrimSpace(s)
+	if s == "" || s == "." || s == ".." {
+		return ""
+	}
+	if !strings.Contains(s, ".") && ext != "" {
+		s = s + "." + ext
+	}
+	return s
+}
+
+func inferMIMEFromFilename(filename, fallback string) string {
+	if strings.TrimSpace(fallback) != "" {
+		return strings.TrimSpace(fallback)
+	}
+	lower := strings.ToLower(strings.TrimSpace(filename))
+	switch {
+	case strings.HasSuffix(lower, ".pdf"):
+		return "application/pdf"
+	case strings.HasSuffix(lower, ".mp3"):
+		return "audio/mpeg"
+	case strings.HasSuffix(lower, ".wav"):
+		return "audio/wav"
+	case strings.HasSuffix(lower, ".ogg"), strings.HasSuffix(lower, ".opus"):
+		return "audio/ogg"
+	case strings.HasSuffix(lower, ".flac"):
+		return "audio/flac"
+	case strings.HasSuffix(lower, ".m4a"):
+		return "audio/mp4"
+	case strings.HasSuffix(lower, ".aac"):
+		return "audio/aac"
+	case strings.HasSuffix(lower, ".mp4"):
+		return "video/mp4"
+	case strings.HasSuffix(lower, ".webm"):
+		return "video/webm"
+	case strings.HasSuffix(lower, ".mov"):
+		return "video/quicktime"
+	case strings.HasSuffix(lower, ".txt"), strings.HasSuffix(lower, ".log"):
+		return "text/plain"
+	case strings.HasSuffix(lower, ".md"):
+		return "text/markdown"
+	case strings.HasSuffix(lower, ".csv"):
+		return "text/csv"
+	case strings.HasSuffix(lower, ".json"):
+		return "application/json"
+	case strings.HasSuffix(lower, ".png"):
+		return "image/png"
+	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+		return "image/jpeg"
+	case strings.HasSuffix(lower, ".webp"):
+		return "image/webp"
+	case strings.HasSuffix(lower, ".gif"):
+		return "image/gif"
+	}
+	return ""
+}
+
+func audioFormatToMIME(format string) string {
+	f := strings.ToLower(strings.TrimSpace(format))
+	if strings.Contains(f, "/") {
+		return f
+	}
+	switch f {
+	case "mp3", "mpeg":
+		return "audio/mpeg"
+	case "wav", "wave", "x-wav", "pcm16", "":
+		return "audio/wav"
+	case "ogg", "opus":
+		return "audio/ogg"
+	case "flac", "x-flac":
+		return "audio/flac"
+	case "m4a", "mp4", "x-m4a":
+		return "audio/mp4"
+	case "aac":
+		return "audio/aac"
+	case "webm":
+		return "audio/webm"
+	default:
+		return "audio/" + f
+	}
+}
+
+func decodeBase64Payload(raw string) ([]byte, error) {
+	b64Clean := whitespaceCollapse.ReplaceAllString(raw, "")
+	if b64Clean == "" {
+		return nil, fmt.Errorf("empty base64")
+	}
+	if strings.ContainsAny(b64Clean, "-_") {
+		if data, err := base64.URLEncoding.DecodeString(b64Clean); err == nil && len(data) > 0 {
+			return data, nil
+		}
+		if data, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(b64Clean, "=")); err == nil && len(data) > 0 {
+			return data, nil
+		}
+	}
+	if data, err := base64.StdEncoding.DecodeString(b64Clean); err == nil && len(data) > 0 {
+		return data, nil
+	}
+	return base64.RawStdEncoding.DecodeString(strings.TrimRight(b64Clean, "="))
 }
 
 // FlattenOptions configures FlattenMessages.
@@ -105,14 +306,13 @@ type FlattenStats struct {
 	ToolSchemaBytes int `json:"toolSchemaBytes"`
 }
 
-// ParseDataURLImage decodes a data:image/...;base64,... URL into an AttachmentPart.
+// ParseDataURLImage decodes a data:<mime>;base64,... URL into an AttachmentPart.
 func ParseDataURLImage(rawURL string, index int) *AttachmentPart {
 	m := dataURLImageRe.FindStringSubmatch(strings.TrimSpace(rawURL))
 	if len(m) < 3 {
 		return nil
 	}
-	b64Clean := whitespaceCollapse.ReplaceAllString(m[2], "")
-	data, err := base64.StdEncoding.DecodeString(b64Clean)
+	data, err := decodeBase64Payload(m[2])
 	if err != nil || len(data) == 0 {
 		return nil
 	}
@@ -120,7 +320,7 @@ func ParseDataURLImage(rawURL string, index int) *AttachmentPart {
 	return &AttachmentPart{
 		Data:        data,
 		ContentType: contentType,
-		Filename:    fmt.Sprintf("image_%d.%s", index+1, ext),
+		Filename:    defaultAttachmentFilename(contentType, ext, index),
 	}
 }
 
@@ -128,76 +328,233 @@ func extractSingleImagePart(part map[string]any, index int) *AttachmentPart {
 	if part == nil {
 		return nil
 	}
-	fromURL := func(rawURL, fallbackMIME string) *AttachmentPart {
+	withFilename := func(att *AttachmentPart, explicitName string) *AttachmentPart {
+		if att == nil {
+			return nil
+		}
+		if explicitName != "" {
+			_, ext := normalizeFallbackMIME(att.ContentType)
+			if clean := sanitizeAttachmentFilename(explicitName, ext); clean != "" {
+				att.Filename = clean
+			}
+		}
+		return att
+	}
+	fromURL := func(rawURL, fallbackMIME, explicitName string) *AttachmentPart {
 		u := strings.TrimSpace(rawURL)
 		if u == "" {
 			return nil
 		}
-		if strings.HasPrefix(strings.ToLower(u), "data:") {
-			return ParseDataURLImage(u, index)
+		fallbackMIME = inferMIMEFromFilename(explicitName, fallbackMIME)
+		lower := strings.ToLower(u)
+		if strings.HasPrefix(lower, "data:") {
+			return withFilename(ParseDataURLImage(u, index), explicitName)
 		}
-		if strings.HasPrefix(strings.ToLower(u), "https://") || strings.HasPrefix(strings.ToLower(u), "http://") {
+		if strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") {
 			mime, ext := DetectImageMIME(nil, fallbackMIME)
-			return &AttachmentPart{
+			return withFilename(&AttachmentPart{
 				RemoteURL:   u,
 				ContentType: mime,
-				Filename:    fmt.Sprintf("image_%d.%s", index+1, ext),
-			}
+				Filename:    defaultAttachmentFilename(mime, ext, index),
+			}, explicitName)
 		}
 		return nil
+	}
+	fromRawOrURL := func(rawData, fallbackMIME, explicitName string) *AttachmentPart {
+		s := strings.TrimSpace(rawData)
+		if s == "" {
+			return nil
+		}
+		lower := strings.ToLower(s)
+		if strings.HasPrefix(lower, "data:") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") {
+			return fromURL(s, fallbackMIME, explicitName)
+		}
+		fallbackMIME = inferMIMEFromFilename(explicitName, fallbackMIME)
+		if fallbackMIME == "" {
+			fallbackMIME = "application/octet-stream"
+		}
+		data, err := decodeBase64Payload(s)
+		if err != nil || len(data) == 0 {
+			return nil
+		}
+		contentType, ext := DetectImageMIME(data, fallbackMIME)
+		return withFilename(&AttachmentPart{
+			Data:        data,
+			ContentType: contentType,
+			Filename:    defaultAttachmentFilename(contentType, ext, index),
+		}, explicitName)
+	}
+	extractMIME := func(m map[string]any) string {
+		for _, k := range []string{"mime_type", "media_type", "content_type", "mediaType", "mimeType"} {
+			if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+		return ""
+	}
+	extractName := func(m map[string]any) string {
+		for _, k := range []string{"filename", "file_name", "name", "title"} {
+			if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
+				return strings.TrimSpace(v)
+			}
+		}
+		return ""
 	}
 
 	pType, _ := part["type"].(string)
 	switch pType {
 	case "image_url", "input_image":
-		var rawURL, mime string
+		var rawURL, mime, filename string
 		if s, ok := part["image_url"].(string); ok {
 			rawURL = s
 		} else if sub, ok := part["image_url"].(map[string]any); ok {
 			rawURL, _ = sub["url"].(string)
-			mime, _ = sub["mime_type"].(string)
+			mime = extractMIME(sub)
+			filename = extractName(sub)
 		}
 		if rawURL == "" {
 			rawURL, _ = part["url"].(string)
 		}
 		if mime == "" {
-			mime, _ = part["mime_type"].(string)
+			mime = extractMIME(part)
 		}
-		return fromURL(rawURL, mime)
+		if filename == "" {
+			filename = extractName(part)
+		}
+		return fromURL(rawURL, mime, filename)
 	case "image":
-		var rawURL string
+		var rawURL, dataStr string
+		mime := extractMIME(part)
+		filename := extractName(part)
 		if s, ok := part["image_url"].(string); ok {
 			rawURL = s
 		} else if sub, ok := part["image_url"].(map[string]any); ok {
 			rawURL, _ = sub["url"].(string)
+			if mime == "" {
+				mime = extractMIME(sub)
+			}
+			if filename == "" {
+				filename = extractName(sub)
+			}
+		} else if src, ok := part["source"].(map[string]any); ok {
+			rawURL, _ = src["url"].(string)
+			dataStr, _ = src["data"].(string)
+			if mime == "" {
+				mime = extractMIME(src)
+			}
 		}
 		if rawURL == "" {
 			rawURL, _ = part["url"].(string)
-		}
-		mime, _ := part["mediaType"].(string)
-		if mime == "" {
-			mime, _ = part["mimeType"].(string)
-		}
-		if mime == "" {
-			mime, _ = part["mime_type"].(string)
 		}
 		if rawURL != "" {
-			return fromURL(rawURL, mime)
+			return fromURL(rawURL, mime, filename)
 		}
-		if dataStr, ok := part["data"].(string); ok && dataStr != "" {
-			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(dataStr)), "data:") {
-				return fromURL(dataStr, mime)
-			}
+		if dataStr == "" {
+			dataStr, _ = part["data"].(string)
+		}
+		if dataStr != "" {
 			if mime == "" {
 				mime = "image/png"
 			}
-			return fromURL(fmt.Sprintf("data:%s;base64,%s", mime, dataStr), mime)
+			return fromRawOrURL(dataStr, mime, filename)
+		}
+	case "input_audio", "audio":
+		var rawURL, dataStr, formatStr string
+		mime := extractMIME(part)
+		filename := extractName(part)
+		for _, subKey := range []string{"input_audio", "audio"} {
+			if sub, ok := part[subKey].(map[string]any); ok && sub != nil {
+				if dataStr == "" {
+					dataStr, _ = sub["data"].(string)
+				}
+				if rawURL == "" {
+					rawURL, _ = sub["url"].(string)
+				}
+				if formatStr == "" {
+					formatStr, _ = sub["format"].(string)
+				}
+				if mime == "" {
+					mime = extractMIME(sub)
+				}
+				if filename == "" {
+					filename = extractName(sub)
+				}
+			}
+		}
+		if dataStr == "" {
+			dataStr, _ = part["data"].(string)
+		}
+		if rawURL == "" {
+			rawURL, _ = part["url"].(string)
+		}
+		if formatStr == "" {
+			formatStr, _ = part["format"].(string)
+		}
+		if mime == "" {
+			if formatStr != "" {
+				mime = audioFormatToMIME(formatStr)
+			} else {
+				mime = inferMIMEFromFilename(filename, "audio/wav")
+			}
+		}
+		if rawURL != "" {
+			return fromURL(rawURL, mime, filename)
+		}
+		if dataStr != "" {
+			return fromRawOrURL(dataStr, mime, filename)
+		}
+	case "file", "input_file", "document":
+		var rawURL, dataStr string
+		mime := extractMIME(part)
+		filename := extractName(part)
+		for _, subKey := range []string{"file", "input_file", "source"} {
+			if sub, ok := part[subKey].(map[string]any); ok && sub != nil {
+				if dataStr == "" {
+					dataStr, _ = sub["file_data"].(string)
+				}
+				if dataStr == "" {
+					dataStr, _ = sub["data"].(string)
+				}
+				if rawURL == "" {
+					rawURL, _ = sub["file_url"].(string)
+				}
+				if rawURL == "" {
+					rawURL, _ = sub["url"].(string)
+				}
+				if mime == "" {
+					mime = extractMIME(sub)
+				}
+				if filename == "" {
+					filename = extractName(sub)
+				}
+			}
+		}
+		if dataStr == "" {
+			dataStr, _ = part["file_data"].(string)
+		}
+		if dataStr == "" {
+			dataStr, _ = part["data"].(string)
+		}
+		if rawURL == "" {
+			rawURL, _ = part["file_url"].(string)
+		}
+		if rawURL == "" {
+			rawURL, _ = part["url"].(string)
+		}
+		if mime == "" {
+			mime = inferMIMEFromFilename(filename, "application/pdf")
+		}
+		if rawURL != "" {
+			return fromURL(rawURL, mime, filename)
+		}
+		if dataStr != "" {
+			return fromRawOrURL(dataStr, mime, filename)
 		}
 	}
 	return nil
 }
 
-// ExtractImageParts extracts all inline base64 or remote http(s) images from OpenAI/Anthropic message arrays.
+// ExtractImageParts extracts all inline base64 or remote http(s) attachments from OpenAI/Anthropic message arrays.
 func ExtractImageParts(messages []map[string]any) []AttachmentPart {
 	var images []AttachmentPart
 	for _, m := range messages {
@@ -221,7 +578,7 @@ func ExtractImageParts(messages []map[string]any) []AttachmentPart {
 	return images
 }
 
-// FetchRemoteImage downloads an http(s) image URL with SSRF protection, a 20MB cap,
+// FetchRemoteImage downloads an http(s) attachment URL with SSRF protection, a 20MB cap,
 // and magic-byte MIME detection.
 func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*AttachmentPart, error) {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
@@ -273,7 +630,7 @@ func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*Attachmen
 		return nil, transport.NewUpstreamError("invalid remote image request", 400, "invalid_request_error", nil, err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+	req.Header.Set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,application/pdf,audio/*,video/*,*/*;q=0.8")
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -299,7 +656,7 @@ func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*Attachmen
 	return &AttachmentPart{
 		Data:        data,
 		ContentType: mime,
-		Filename:    fmt.Sprintf("image_%d.%s", index+1, ext),
+		Filename:    defaultAttachmentFilename(mime, ext, index),
 	}, nil
 }
 
@@ -1014,6 +1371,24 @@ func normalizeMessageForHash(m map[string]any) any {
 	return entry
 }
 
+func formatAttachmentPlaceholder(att *AttachmentPart, num int) string {
+	if att == nil {
+		return fmt.Sprintf("[Attached image #%d]", num)
+	}
+	ct := strings.ToLower(strings.TrimSpace(att.ContentType))
+	switch {
+	case strings.HasPrefix(ct, "image/"):
+		return fmt.Sprintf("[Attached image #%d]", num)
+	case strings.HasPrefix(ct, "audio/"):
+		return fmt.Sprintf("[Attached audio #%d]", num)
+	default:
+		if att.Filename != "" {
+			return fmt.Sprintf("[Attached file #%d: %s]", num, att.Filename)
+		}
+		return fmt.Sprintf("[Attached file #%d]", num)
+	}
+}
+
 func contentToText(content any, imageCounter *int) string {
 	switch c := content.(type) {
 	case nil:
@@ -1030,9 +1405,9 @@ func contentToText(content any, imageCounter *int) string {
 			} else if m, ok := item.(map[string]any); ok && m != nil {
 				if t, ok := m["text"].(string); ok && t != "" {
 					parts = append(parts, t)
-				} else if extractSingleImagePart(m, *imageCounter) != nil {
+				} else if att := extractSingleImagePart(m, *imageCounter); att != nil {
 					*imageCounter++
-					parts = append(parts, fmt.Sprintf("[Attached image #%d]", *imageCounter))
+					parts = append(parts, formatAttachmentPlaceholder(att, *imageCounter))
 				}
 			}
 		}

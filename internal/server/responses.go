@@ -198,7 +198,7 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 					}
 					continue
 
-				case "input_text", "input_image", "image":
+				case "input_text", "input_image", "image", "input_file", "file", "input_audio", "audio", "document":
 					flushPendingAssistant()
 					messages = append(messages, map[string]any{
 						"role":    "user",

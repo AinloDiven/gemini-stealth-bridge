@@ -1,6 +1,7 @@
 package prompt
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 )
@@ -193,5 +194,81 @@ func TestFlattenMessagesContinuationIncludesRequiredToolArgsInReminder(t *testin
 	}
 	if !strings.Contains(cont, "todo(op, i)") {
 		t.Fatalf("expected continuation reminder to include required parameter names todo(op, i), got:\n%s", cont)
+	}
+}
+
+func TestExtractImagePartsAndPlaceholdersSupportPDFAndAudioModalities(t *testing.T) {
+	pdfBytes := []byte("%PDF-1.7\n1 0 obj\n<<>>\nendobj\n")
+	oggBytes := []byte("OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00")
+	wavBytes := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+
+	pdfB64 := base64.StdEncoding.EncodeToString(pdfBytes)
+	oggB64 := base64.StdEncoding.EncodeToString(oggBytes)
+	wavB64 := base64.StdEncoding.EncodeToString(wavBytes)
+
+	messages := []map[string]any{
+		{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Analyze these attachments"},
+				map[string]any{
+					"type": "file",
+					"file": map[string]any{
+						"filename":  "spec.pdf",
+						"file_data": "data:application/pdf;base64," + pdfB64,
+					},
+				},
+				map[string]any{
+					"type": "input_audio",
+					"input_audio": map[string]any{
+						"data":   oggB64,
+						"format": "ogg",
+					},
+				},
+				map[string]any{
+					"type": "image_url",
+					"image_url": map[string]any{
+						"url": "data:audio/ogg;codecs=opus;base64," + wavB64,
+					},
+				},
+				map[string]any{
+					"type":      "input_file",
+					"filename":  "manual.pdf",
+					"file_data": pdfB64,
+				},
+			},
+		},
+	}
+
+	parts := ExtractImageParts(messages)
+	if len(parts) != 4 {
+		t.Fatalf("expected 4 extracted attachment parts, got %d", len(parts))
+	}
+	if parts[0].ContentType != "application/pdf" || parts[0].Filename != "spec.pdf" {
+		t.Fatalf("unexpected part[0]: %+v", parts[0])
+	}
+	if parts[1].ContentType != "audio/ogg" || parts[1].Filename != "audio_2.ogg" {
+		t.Fatalf("unexpected part[1]: %+v", parts[1])
+	}
+	if parts[2].ContentType != "audio/wav" || parts[2].Filename != "audio_3.wav" {
+		t.Fatalf("unexpected part[2] (magic byte WAV over ogg data URL): %+v", parts[2])
+	}
+	if parts[3].ContentType != "application/pdf" || parts[3].Filename != "manual.pdf" {
+		t.Fatalf("unexpected part[3]: %+v", parts[3])
+	}
+
+	flattened, _, err := FlattenMessages(messages, nil, nil, FlattenOptions{})
+	if err != nil {
+		t.Fatalf("FlattenMessages failed: %v", err)
+	}
+	for _, want := range []string{
+		"[Attached file #1: spec.pdf]",
+		"[Attached audio #2]",
+		"[Attached audio #3]",
+		"[Attached file #4: manual.pdf]",
+	} {
+		if !strings.Contains(flattened, want) {
+			t.Fatalf("expected flattened prompt to contain %q, got:\n%s", want, flattened)
+		}
 	}
 }
