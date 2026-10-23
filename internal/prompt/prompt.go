@@ -703,10 +703,9 @@ func FlattenMessagesWithStats(
 	opts FlattenOptions,
 ) (string, []AttachmentPart, FlattenStats, error) {
 	var (
-		sys          []string
-		turns        []turnEntry
-		callNames    = make(map[string]string)
-		imageCounter int
+		sys       []string
+		turns     []turnEntry
+		callNames = make(map[string]string)
 	)
 
 	for _, m := range messages {
@@ -754,7 +753,7 @@ func FlattenMessagesWithStats(
 			if name == "" {
 				name = "tool"
 			}
-			text := spoofedRoleLineRe.ReplaceAllString(contentToText(m["content"], &imageCounter), "$1 :")
+			text := spoofedRoleLineRe.ReplaceAllString(contentToText(m["content"]), "$1 :")
 			idSuffix := ""
 			if tcID != "" {
 				idSuffix = fmt.Sprintf(" (%s)", tcID)
@@ -768,7 +767,7 @@ func FlattenMessagesWithStats(
 			continue
 		}
 
-		text := contentToText(m["content"], &imageCounter)
+		text := contentToText(m["content"])
 		if role != "assistant" && role != "system" && role != "developer" {
 			text = spoofedRoleLineRe.ReplaceAllString(text, "$1 :")
 		}
@@ -1371,25 +1370,7 @@ func normalizeMessageForHash(m map[string]any) any {
 	return entry
 }
 
-func formatAttachmentPlaceholder(att *AttachmentPart, num int) string {
-	if att == nil {
-		return fmt.Sprintf("[Attached image #%d]", num)
-	}
-	ct := strings.ToLower(strings.TrimSpace(att.ContentType))
-	switch {
-	case strings.HasPrefix(ct, "image/"):
-		return fmt.Sprintf("[Attached image #%d]", num)
-	case strings.HasPrefix(ct, "audio/"):
-		return fmt.Sprintf("[Attached audio #%d]", num)
-	default:
-		if att.Filename != "" {
-			return fmt.Sprintf("[Attached file #%d: %s]", num, att.Filename)
-		}
-		return fmt.Sprintf("[Attached file #%d]", num)
-	}
-}
-
-func contentToText(content any, imageCounter *int) string {
+func contentToText(content any) string {
 	switch c := content.(type) {
 	case nil:
 		return ""
@@ -1405,9 +1386,6 @@ func contentToText(content any, imageCounter *int) string {
 			} else if m, ok := item.(map[string]any); ok && m != nil {
 				if t, ok := m["text"].(string); ok && t != "" {
 					parts = append(parts, t)
-				} else if att := extractSingleImagePart(m, *imageCounter); att != nil {
-					*imageCounter++
-					parts = append(parts, formatAttachmentPlaceholder(att, *imageCounter))
 				}
 			}
 		}

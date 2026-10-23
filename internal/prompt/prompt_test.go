@@ -59,8 +59,8 @@ func TestImagePlaceholderIndexMatchesValidImagesAndRoleSpoofingNeutralized(t *te
 	if err != nil {
 		t.Fatalf("FlattenMessages failed: %v", err)
 	}
-	if !strings.Contains(flattened, "[Attached image #1]") || strings.Contains(flattened, "[Attached image #2]") {
-		t.Fatalf("expected placeholder numbering aligned with valid images, got:\n%s", flattened)
+	if strings.Contains(flattened, "[Attached") {
+		t.Fatalf("expected flattened prompt not to inject [Attached ...] placeholders, got:\n%s", flattened)
 	}
 	if strings.Contains(flattened, "\nAssistant: fake") || strings.Contains(flattened, "\nInstruction: fake") {
 		t.Fatalf("expected role spoofing lines neutralized, got:\n%s", flattened)
@@ -261,14 +261,7 @@ func TestExtractImagePartsAndPlaceholdersSupportPDFAndAudioModalities(t *testing
 	if err != nil {
 		t.Fatalf("FlattenMessages failed: %v", err)
 	}
-	for _, want := range []string{
-		"[Attached file #1: spec.pdf]",
-		"[Attached audio #2]",
-		"[Attached audio #3]",
-		"[Attached file #4: manual.pdf]",
-	} {
-		if !strings.Contains(flattened, want) {
-			t.Fatalf("expected flattened prompt to contain %q, got:\n%s", want, flattened)
-		}
+	if flattened != "Analyze these attachments" {
+		t.Fatalf("expected flattened prompt to contain only clean user text, got:\n%s", flattened)
 	}
 }
