@@ -81,6 +81,23 @@ func (m *mockUpstream) RotateCookies(ctx context.Context) (*cookies.RotateResult
 func (m *mockUpstream) ReloadFromDiskIfNewer() bool { return false }
 func (m *mockUpstream) InvalidateAuth()             {}
 
+func TestResolveAuthScopePreservesTokenForPerKeyFeatures(t *testing.T) {
+	srv, _ := newTestHarness(false, true)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer audit")
+	scope := srv.ResolveAuthScope(req)
+	if !scope.OK || scope.AccountID != "acct" || scope.Token != "audit" {
+		t.Fatalf("expected account scope to retain its token, got %+v", scope)
+	}
+
+	poolReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	poolReq.Header.Set("Authorization", "Bearer public")
+	poolScope := srv.ResolveAuthScope(poolReq)
+	if !poolScope.OK || poolScope.Token != "public" {
+		t.Fatalf("expected pool scope to retain its token, got %+v", poolScope)
+	}
+}
+
 func newTestHarness(relaxed, sessionCache bool) (*Server, *AccountState) {
 	cfg := config.Load()
 	cfg.HomeDir = "/synthetic"
@@ -1065,7 +1082,7 @@ func TestSessionCacheDiskPersistenceAndAccountAffinity(t *testing.T) {
 		{"role": "assistant", "content": "Hi there"},
 		{"role": "user", "content": "Follow up"},
 	}
-	srv1.saveSessionContinuation("acctB", testModel.ModelName, history[:1], nil, nil, "Hi there", nil, "cid_b", "rid_b", "rcid_b", "ctx_b")
+	srv1.saveSessionContinuation("acctB", testModel.ModelName, history[:1], nil, nil, "Hi there", nil, "cid_b", "rid_b", "rcid_b", "ctx_b", "")
 
 	// Wait briefly for async disk flush to complete
 	deadline := time.Now().Add(2 * time.Second)
@@ -2330,8 +2347,11 @@ func TestStreamedReasoningPreventsRetryConcatenation(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("expected no retry after reasoning output, got %d upstream calls", calls.Load())
 	}
-	if strings.Count(rec.Body.String(), "reasoning once") != 1 {
-		t.Fatalf("expected one reasoning emission, got %s", rec.Body.String())
+	if strings.Count(rec.Body.String(), `"reasoning_content":"reasoning once"`) != 1 {
+		t.Fatalf("expected one reasoning_content emission, got %s", rec.Body.String())
+	}
+	if strings.Count(rec.Body.String(), `"x_gemini_reasoning"`) != 3 { // start + delta + fallback done
+		t.Fatalf("expected reasoning lifecycle start+delta+done, got %s", rec.Body.String())
 	}
 }
 
