@@ -104,44 +104,74 @@ func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string)
 	return normalizeFallbackMIME(fbLower)
 }
 
+// mimeSpec is the single source of truth for MIME aliases, filename
+// extensions, and audio format spellings. Detection by magic bytes stays in
+// DetectImageMIME; everything name- or hint-based goes through this table.
+type mimeSpec struct {
+	MIME         string
+	Ext          string
+	Aliases      []string
+	Extensions   []string
+	AudioFormats []string
+}
+
+var mimeSpecs = []mimeSpec{
+	{MIME: "image/png", Ext: "png", Extensions: []string{"png"}},
+	{MIME: "image/jpeg", Ext: "jpg", Aliases: []string{"image/jpg"}, Extensions: []string{"jpg", "jpeg"}},
+	{MIME: "image/gif", Ext: "gif", Extensions: []string{"gif"}},
+	{MIME: "image/webp", Ext: "webp", Extensions: []string{"webp"}},
+	{MIME: "image/svg+xml", Ext: "svg"},
+	{MIME: "application/pdf", Ext: "pdf", Extensions: []string{"pdf"}},
+	{MIME: "audio/mpeg", Ext: "mp3", Aliases: []string{"audio/mp3"}, Extensions: []string{"mp3"}, AudioFormats: []string{"mp3", "mpeg"}},
+	{MIME: "audio/wav", Ext: "wav", Aliases: []string{"audio/x-wav", "audio/wave"}, Extensions: []string{"wav"}, AudioFormats: []string{"wav", "wave", "x-wav", "pcm16", ""}},
+	{MIME: "audio/ogg", Ext: "ogg", Aliases: []string{"audio/opus"}, Extensions: []string{"ogg", "opus"}, AudioFormats: []string{"ogg", "opus"}},
+	{MIME: "audio/flac", Ext: "flac", Aliases: []string{"audio/x-flac"}, Extensions: []string{"flac"}, AudioFormats: []string{"flac", "x-flac"}},
+	{MIME: "audio/mp4", Ext: "m4a", Aliases: []string{"audio/m4a", "audio/x-m4a"}, Extensions: []string{"m4a"}, AudioFormats: []string{"m4a", "mp4", "x-m4a"}},
+	{MIME: "audio/aac", Ext: "aac", Extensions: []string{"aac"}, AudioFormats: []string{"aac"}},
+	{MIME: "audio/webm", Ext: "webm", AudioFormats: []string{"webm"}},
+	{MIME: "video/mp4", Ext: "mp4", Extensions: []string{"mp4"}},
+	{MIME: "video/webm", Ext: "webm", Extensions: []string{"webm"}},
+	{MIME: "video/quicktime", Ext: "mov", Extensions: []string{"mov"}},
+	{MIME: "text/plain", Ext: "txt", Extensions: []string{"txt", "log"}},
+	{MIME: "text/markdown", Ext: "md", Aliases: []string{"text/x-markdown"}, Extensions: []string{"md"}},
+	{MIME: "text/csv", Ext: "csv", Extensions: []string{"csv"}},
+	{MIME: "application/json", Ext: "json", Extensions: []string{"json"}},
+	{MIME: "application/octet-stream", Ext: "bin", Extensions: []string{"bin"}},
+}
+
+type mimeIndexes struct {
+	byAlias map[string]mimeSpec
+	byExt   map[string]mimeSpec
+	byAudio map[string]mimeSpec
+}
+
+var mimeIndex = func() mimeIndexes {
+	idx := mimeIndexes{
+		byAlias: make(map[string]mimeSpec),
+		byExt:   make(map[string]mimeSpec),
+		byAudio: make(map[string]mimeSpec),
+	}
+	for _, spec := range mimeSpecs {
+		idx.byAlias[spec.MIME] = spec
+		for _, alias := range spec.Aliases {
+			idx.byAlias[alias] = spec
+		}
+		for _, ext := range spec.Extensions {
+			idx.byExt[ext] = spec
+		}
+		for _, format := range spec.AudioFormats {
+			idx.byAudio[format] = spec
+		}
+	}
+	return idx
+}()
+
 func normalizeFallbackMIME(fbLower string) (string, string) {
-	switch fbLower {
-	case "image/jpeg", "image/jpg":
-		return "image/jpeg", "jpg"
-	case "image/svg+xml":
-		return "image/svg+xml", "svg"
-	case "application/pdf":
-		return "application/pdf", "pdf"
-	case "audio/mpeg", "audio/mp3":
-		return "audio/mpeg", "mp3"
-	case "audio/wav", "audio/x-wav", "audio/wave":
-		return "audio/wav", "wav"
-	case "audio/ogg", "audio/opus":
-		return "audio/ogg", "ogg"
-	case "audio/flac", "audio/x-flac":
-		return "audio/flac", "flac"
-	case "audio/mp4", "audio/m4a", "audio/x-m4a":
-		return "audio/mp4", "m4a"
-	case "audio/aac":
-		return "audio/aac", "aac"
-	case "audio/webm":
-		return "audio/webm", "webm"
-	case "video/mp4":
-		return "video/mp4", "mp4"
-	case "video/webm":
-		return "video/webm", "webm"
-	case "video/quicktime":
-		return "video/quicktime", "mov"
-	case "text/plain":
-		return "text/plain", "txt"
-	case "text/markdown", "text/x-markdown":
-		return "text/markdown", "md"
-	case "text/csv":
-		return "text/csv", "csv"
-	case "application/json":
-		return "application/json", "json"
-	case "application/octet-stream":
-		return "application/octet-stream", "bin"
+	if spec, ok := mimeIndex.byAlias[fbLower]; ok {
+		return spec.MIME, spec.Ext
+	}
+	if fbLower == "" {
+		return "image/png", "png"
 	}
 	ext := "png"
 	if parts := strings.Split(fbLower, "/"); len(parts) > 1 {
@@ -205,43 +235,12 @@ func inferMIMEFromFilename(filename, fallback string) string {
 		return strings.TrimSpace(fallback)
 	}
 	lower := strings.ToLower(strings.TrimSpace(filename))
-	switch {
-	case strings.HasSuffix(lower, ".pdf"):
-		return "application/pdf"
-	case strings.HasSuffix(lower, ".mp3"):
-		return "audio/mpeg"
-	case strings.HasSuffix(lower, ".wav"):
-		return "audio/wav"
-	case strings.HasSuffix(lower, ".ogg"), strings.HasSuffix(lower, ".opus"):
-		return "audio/ogg"
-	case strings.HasSuffix(lower, ".flac"):
-		return "audio/flac"
-	case strings.HasSuffix(lower, ".m4a"):
-		return "audio/mp4"
-	case strings.HasSuffix(lower, ".aac"):
-		return "audio/aac"
-	case strings.HasSuffix(lower, ".mp4"):
-		return "video/mp4"
-	case strings.HasSuffix(lower, ".webm"):
-		return "video/webm"
-	case strings.HasSuffix(lower, ".mov"):
-		return "video/quicktime"
-	case strings.HasSuffix(lower, ".txt"), strings.HasSuffix(lower, ".log"):
-		return "text/plain"
-	case strings.HasSuffix(lower, ".md"):
-		return "text/markdown"
-	case strings.HasSuffix(lower, ".csv"):
-		return "text/csv"
-	case strings.HasSuffix(lower, ".json"):
-		return "application/json"
-	case strings.HasSuffix(lower, ".png"):
-		return "image/png"
-	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
-		return "image/jpeg"
-	case strings.HasSuffix(lower, ".webp"):
-		return "image/webp"
-	case strings.HasSuffix(lower, ".gif"):
-		return "image/gif"
+	idx := strings.LastIndex(lower, ".")
+	if idx < 0 || idx == len(lower)-1 {
+		return ""
+	}
+	if spec, ok := mimeIndex.byExt[lower[idx+1:]]; ok {
+		return spec.MIME
 	}
 	return ""
 }
@@ -251,24 +250,10 @@ func audioFormatToMIME(format string) string {
 	if strings.Contains(f, "/") {
 		return f
 	}
-	switch f {
-	case "mp3", "mpeg":
-		return "audio/mpeg"
-	case "wav", "wave", "x-wav", "pcm16", "":
-		return "audio/wav"
-	case "ogg", "opus":
-		return "audio/ogg"
-	case "flac", "x-flac":
-		return "audio/flac"
-	case "m4a", "mp4", "x-m4a":
-		return "audio/mp4"
-	case "aac":
-		return "audio/aac"
-	case "webm":
-		return "audio/webm"
-	default:
-		return "audio/" + f
+	if spec, ok := mimeIndex.byAudio[f]; ok {
+		return spec.MIME
 	}
+	return "audio/" + f
 }
 
 func decodeBase64Payload(raw string) ([]byte, error) {
