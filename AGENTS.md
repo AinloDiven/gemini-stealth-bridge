@@ -401,15 +401,15 @@ Accepted body fields:
 Ignored: `temperature`, `top_p`, `max_tokens`, `stop`, and other sampling controls. Do not present them as working output limits.
 
 Optional header `X-GSB-Session: <id>` binds the turn to a persisted Gemini
-conversation (same account/model, saved `cid`/`rid`/`rcid`/context token) so a
-bot can continue the same conversation after trimming history. The binding lives
-in `$BRIDGE_HOME/session-bindings.json`; `BRIDGE_SESSION_BINDING_TTL_MS` and
-`BRIDGE_SESSION_BINDING_MAX` bound it. An empty `model` uses
-`BRIDGE_DEFAULT_MODEL` when configured. A fixed cloud Skill can be set with
-`BRIDGE_SKILL` (per-key `BRIDGE_SKILL_PER_KEY`, or `"skill"` in the account
-file); gsb resolves the `cCSu7` runtime handle, writes StreamGenerate slot 81,
-and prepends the `/skill` command at byte 0 of each turn's prompt. See
-[`docs/PARITY_FEATURES.md`](docs/PARITY_FEATURES.md).
+conversation (same account, saved `cid`/`rid`/`rcid`/context token; the model
+may change) so a bot can continue the same conversation after trimming history.
+The binding lives in `$BRIDGE_HOME/session-bindings.json`;
+`BRIDGE_SESSION_BINDING_TTL_MS` and `BRIDGE_SESSION_BINDING_MAX` bound it. An
+empty `model` uses `BRIDGE_DEFAULT_MODEL` when configured. A fixed cloud Skill
+can be set with `BRIDGE_SKILL` (per-key `BRIDGE_SKILL_PER_KEY`, or `"skill"` in
+the account file); gsb resolves the `cCSu7` runtime handle, writes
+StreamGenerate slot 81, and prepends the `/skill` command at byte 0 of each
+turn's prompt. See [`docs/PARITY_FEATURES.md`](docs/PARITY_FEATURES.md).
 
 Streaming also carries additive frames: `x_gemini_reasoning`
 (`start`/`delta`/`done`) for thinking detail, and `x_gemini_action_status` for

@@ -47,8 +47,6 @@ type ActionStatus struct {
 	StatusTemplate string
 	// BranchTitle is field 7[0], the branch 3 display title.
 	BranchTitle string
-	// State is the normalized tool lifecycle state (active/complete/failed).
-	State string
 }
 
 // Frame is a single parsed candidate frame from a wrb.fr envelope.
@@ -1060,7 +1058,6 @@ func parseActionStatus(frame []any) *ActionStatus {
 			out.ToolTitle = firstActionString(jspbField(meta, 2))
 			out.StatusTemplate = firstActionString(jspbField(meta, 5))
 		}
-		out.State = normalizeActionState(jspbField(toolArr, 2))
 		out.BranchTitle = firstActionString(jspbField(toolAction, 0))
 	}
 	if out.BranchTitle == "" {
@@ -1092,35 +1089,6 @@ func firstActionString(value any) string {
 		}
 	}
 	return ""
-}
-
-func normalizeActionState(value any) string {
-	switch v := value.(type) {
-	case float64:
-		switch int(v) {
-		case 1:
-			return "active"
-		case 4:
-			return "complete"
-		}
-	case int:
-		switch v {
-		case 1:
-			return "active"
-		case 4:
-			return "complete"
-		}
-	case string:
-		switch strings.ToLower(v) {
-		case "1", "started", "active":
-			return "active"
-		case "4", "complete", "completed", "settled":
-			return "complete"
-		case "failed", "error":
-			return "failed"
-		}
-	}
-	return "active"
 }
 
 // ParseConversationPollResponse parses an hNvQHb batchexecute response payload

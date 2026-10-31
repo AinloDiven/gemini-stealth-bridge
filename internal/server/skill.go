@@ -68,22 +68,6 @@ func formatSkillPrompt(text, skill string) string {
 	if stripped == "" {
 		return prefix
 	}
-	if strings.HasPrefix(stripped, "<|im_start|>") {
-		return text
-	}
-	if strings.Contains(text, "【用户消息】") {
-		idx := strings.Index(text, "【用户消息】") + len("【用户消息】")
-		header := text[:idx]
-		body := stripLeadingSkillPrefix(strings.TrimLeft(text[idx:], "\n "), prefix)
-		clean := strings.TrimSpace(header)
-		if body != "" {
-			clean = header + "\n" + body
-		}
-		if skillPrefixAtFront(strings.TrimSpace(clean), prefix) {
-			return clean
-		}
-		return prependSkillPrefix(strings.TrimSpace(clean), prefix)
-	}
 	if skillPrefixAtFront(stripped, prefix) {
 		return text
 	}
