@@ -1727,6 +1727,12 @@ func (s *Server) prepareGeneration(
 			account = preferred
 		}
 	}
+	// The continuation belongs to one account. If that account is no longer
+	// eligible, start from a clean prompt on the replacement instead of sending
+	// account A's cid/rid/context metadata through account B's transport.
+	if binding != nil && binding.AccountID != account.ID {
+		binding = nil
+	}
 
 	if err := s.checkAccountRateLimit(account); err != nil {
 		if scope.AccountID == "" {

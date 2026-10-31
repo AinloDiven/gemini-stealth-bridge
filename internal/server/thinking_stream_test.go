@@ -66,7 +66,6 @@ func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 				ToolID:         "skills",
 				ToolTitle:      "Skill Title",
 				StatusTemplate: "{tool_logo_placeholder} Skills: Eksie",
-				State:          "complete",
 			},
 			Frames: []gemini.Frame{makeFrame("answer", "", true, testModel.ModelID)},
 		}); err != nil {

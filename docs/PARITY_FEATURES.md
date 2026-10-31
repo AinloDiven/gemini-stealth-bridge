@@ -22,10 +22,13 @@ Rules:
   scope plus the session id. Later turns with the same header continue that
   Gemini conversation even when the client's message history is shortened.
 - The binding stores the account ID, model ID, message count and the hash of
-  the saved history. Reuse therefore requires the same account and model, and
-  the incoming history must still match the saved prefix. A mismatch falls back
-  to the normal content-hash continuation or a full prompt, then overwrites the
-  binding after a successful turn.
+  the saved history. The bound account must still be selected; if it is no
+  longer eligible, the binding is discarded rather than sent through another
+  account. The model may change: the saved prefix is validated against the
+  model recorded in the binding. Without a matching prefix (including a
+  history-trimmed request) only the current turn is sent over the bound
+  conversation, and an upstream rejection falls back to a full prompt before
+  the binding is overwritten after a successful turn.
 - The bound account is preferred when the pool has it healthy, not busy, and
   able to serve the model. Failover still applies if it is unavailable.
 - Upstream rejection of a continuation deletes both the content hash entry and

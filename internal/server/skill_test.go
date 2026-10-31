@@ -28,6 +28,8 @@ func TestFormatSkillPromptIsIdempotentAndKeepsByteZero(t *testing.T) {
 		{"/伊珂丝hi", "/伊珂丝 hi"},
 		{"/伊珂丝", "/伊珂丝"},
 		{"", "/伊珂丝"},
+		{"【用户消息】\nhi", "/伊珂丝 【用户消息】\nhi"},
+		{"<|im_start|>user\nhi", "/伊珂丝 <|im_start|>user\nhi"},
 	}
 	for _, tc := range cases {
 		if got := formatSkillPrompt(tc.text, "伊珂丝"); got != tc.want {

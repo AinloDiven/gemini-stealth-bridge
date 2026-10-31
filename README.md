@@ -310,8 +310,8 @@ Gemini Web conversations are continued with internal metadata (`cid`, `rid`, `rc
 An explicit `X-GSB-Session` binding is a second, opt-in layer: it is keyed by
 the caller's API key plus that id, lives in `$BRIDGE_HOME/session-bindings.json`,
 defaults to a 24-hour TTL (`BRIDGE_SESSION_BINDING_TTL_MS`), and pins the
-account/model so a bot can trim history without losing the Gemini conversation.
-See [PARITY_FEATURES.md](docs/PARITY_FEATURES.md).
+account; the model may change while continuing the bound conversation. See
+[PARITY_FEATURES.md](docs/PARITY_FEATURES.md).
 
 Uploaded images and offloaded text attachments are cached separately for **25 minutes** (maximum 128 entries) so repeated turns do not re-upload the same bytes.
 
@@ -847,9 +847,10 @@ Accepted fields:
 Sampling parameters such as `temperature`, `top_p`, `max_tokens`, and `stop` are accepted but ignored.
 
 Optional request header `X-GSB-Session: <id>` binds this turn and later turns
-with the same id to the saved Gemini conversation (account, model, `cid`/`rid`/
-`rcid`/context token), even if the client trims the message history. The binding
-survives restarts under `$BRIDGE_HOME/session-bindings.json`; see
+with the same id to the saved Gemini conversation (account, `cid`/`rid`/`rcid`/
+context token), even if the client trims the message history. The bound account
+must remain eligible; the model may change while continuing that conversation.
+The binding survives restarts under `$BRIDGE_HOME/session-bindings.json`; see
 [PARITY_FEATURES.md](docs/PARITY_FEATURES.md).
 
 A fixed cloud Skill can be configured with `BRIDGE_SKILL` (or per account/key);

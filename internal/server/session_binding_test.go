@@ -128,6 +128,60 @@ func TestExplicitSessionBindingWithoutLocalHistory(t *testing.T) {
 	}
 }
 
+// TestExplicitSessionBindingDoesNotCrossAccounts proves that a continuation
+// saved on account A is not sent through account B when A becomes unavailable.
+func TestExplicitSessionBindingDoesNotCrossAccounts(t *testing.T) {
+	srv, acctA := newTestHarness(false, true)
+	acctA.ID = "acctA"
+	acctA.Email = "a@example.com"
+	acctB := &AccountState{
+		ID:       "acctB",
+		Email:    "b@example.com",
+		Models:   []gemini.ModelInfo{testModel},
+		Capacity: 2,
+	}
+	srv.SetAccounts([]*AccountState{acctA, acctB})
+
+	var mu sync.Mutex
+	var metas [][]any
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		mu.Lock()
+		metas = append(metas, append([]any(nil), opts.Metadata...))
+		mu.Unlock()
+		_ = onFrame(&gemini.LineParseResult{CID: "c", RID: "r", ContextToken: "ctx", AnsweredModelID: testModel.ModelID, Frames: []gemini.Frame{makeFrame("answer", "", true, testModel.ModelID)}})
+		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
+	}}
+	acctA.Client = client
+	acctB.Client = client
+	scope := AuthScope{OK: true, Admin: true, Token: "pool", SessionID: "sess-cross-account"}
+
+	first := map[string]any{"model": testModel.ModelName, "messages": []any{map[string]any{"role": "user", "content": "one"}}}
+	rec1 := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec1, first, scope)
+	if rec1.Code != 200 {
+		t.Fatalf("turn 1 failed: %d %s", rec1.Code, rec1.Body.String())
+	}
+	if b := srv.getSessionBinding(sessionBindingKey(scope, scope.SessionID)); b == nil || len(b.Meta) == 0 {
+		t.Fatal("expected turn 1 to persist a binding")
+	}
+
+	acctA.mu.Lock()
+	acctA.Disabled = true
+	acctA.mu.Unlock()
+	second := map[string]any{"model": testModel.ModelName, "messages": []any{map[string]any{"role": "user", "content": "two"}}}
+	rec2 := httptest.NewRecorder()
+	srv.HandleChat(context.Background(), rec2, second, scope)
+	if rec2.Code != 200 {
+		t.Fatalf("turn 2 failed: %d %s", rec2.Code, rec2.Body.String())
+	}
+	if len(metas) < 2 {
+		t.Fatalf("expected two upstream calls, got %d", len(metas))
+	}
+	if len(metas[1]) != 0 {
+		t.Fatalf("must not send account A's continuation on account B, got %#v", metas[1])
+	}
+}
+
 // TestExplicitSessionBindingSurvivesModelChange preserves the same upstream
 // conversation when the caller switches models; an upstream rejection still
 // falls back to the full prompt through the normal retry path.

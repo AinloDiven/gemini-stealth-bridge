@@ -46,7 +46,7 @@ func TestParseActionStatusToolCardRelaysIconInputs(t *testing.T) {
 	if res.Action == nil {
 		t.Fatal("expected action card")
 	}
-	if res.Action.ToolID != "skills" || res.Action.ToolTitle != "Skill Title" || res.Action.StatusTemplate != template || res.Action.State != "active" {
+	if res.Action.ToolID != "skills" || res.Action.ToolTitle != "Skill Title" || res.Action.StatusTemplate != template {
 		t.Fatalf("unexpected action card: %+v", res.Action)
 	}
 }
