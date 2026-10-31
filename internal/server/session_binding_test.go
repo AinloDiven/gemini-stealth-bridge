@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 )
@@ -179,6 +180,103 @@ func TestExplicitSessionBindingDoesNotCrossAccounts(t *testing.T) {
 	}
 	if len(metas[1]) != 0 {
 		t.Fatalf("must not send account A's continuation on account B, got %#v", metas[1])
+	}
+}
+
+func TestSessionBindingKeyScopesByAPIKeyAndScope(t *testing.T) {
+	base := AuthScope{OK: true, Token: "key-a", SessionID: "same-session"}
+	key := sessionBindingKey(base, base.SessionID)
+
+	for _, other := range []AuthScope{
+		{OK: true, Token: "key-b", SessionID: base.SessionID},
+		{OK: true, Token: "key-a", AccountID: "other", SessionID: base.SessionID},
+		{OK: true, Token: "key-a", Group: "other", SessionID: base.SessionID},
+	} {
+		if got := sessionBindingKey(other, other.SessionID); got == key {
+			t.Fatalf("binding key must isolate %+v from %+v", other, base)
+		}
+	}
+	if got := sessionBindingKey(base, "other-session"); got == key {
+		t.Fatal("different session ids must not share a binding key")
+	}
+}
+
+func TestSessionBindingTTLAndLRUEviction(t *testing.T) {
+	srv, _ := newTestHarness(false, true)
+	srv.Cfg.HomeDir = ""
+	srv.Cfg.SessionBindingTTL = time.Hour
+	expiredKey := "sid:expired"
+	srv.putSessionBinding(sessionBinding{
+		Key: expiredKey, AccountID: "acct", Model: testModel.ModelName,
+		Meta: []any{"cid", "rid", "rcid", nil, nil, nil, nil, nil, nil, "ctx"},
+	})
+	srv.mu.Lock()
+	expired := srv.sessionBindings[expiredKey]
+	expired.At = time.Now().Add(-2 * time.Hour)
+	srv.sessionBindings[expiredKey] = expired
+	srv.mu.Unlock()
+	if got := srv.getSessionBinding(expiredKey); got != nil {
+		t.Fatalf("expired binding must not be returned, got %+v", got)
+	}
+
+	srv.Cfg.SessionBindingMax = 2
+	now := time.Now()
+	for i, key := range []string{"sid:a", "sid:b", "sid:c"} {
+		srv.putSessionBinding(sessionBinding{
+			Key: key, AccountID: "acct", Model: testModel.ModelName,
+			Meta: []any{"cid", "rid", "rcid", nil, nil, nil, nil, nil, nil, "ctx"},
+		})
+		srv.mu.Lock()
+		b := srv.sessionBindings[key]
+		b.At = now.Add(time.Duration(i) * time.Second)
+		srv.sessionBindings[key] = b
+		srv.mu.Unlock()
+	}
+	srv.putSessionBinding(sessionBinding{
+		Key: "sid:d", AccountID: "acct", Model: testModel.ModelName,
+		Meta: []any{"cid", "rid", "rcid", nil, nil, nil, nil, nil, nil, "ctx"},
+	})
+	if got := srv.getSessionBinding("sid:a"); got != nil {
+		t.Fatalf("oldest binding should have been evicted, got %+v", got)
+	}
+	if got := srv.getSessionBinding("sid:d"); got == nil {
+		t.Fatal("newest binding must remain after LRU eviction")
+	}
+}
+
+func TestResponsesExplicitSessionBindingReusesContinuation(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	var mu sync.Mutex
+	var metas [][]any
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		mu.Lock()
+		metas = append(metas, append([]any(nil), opts.Metadata...))
+		mu.Unlock()
+		_ = onFrame(&gemini.LineParseResult{
+			CID: "resp-cid", RID: "resp-rid", ContextToken: "resp-ctx",
+			AnsweredModelID: testModel.ModelID,
+			Frames:          []gemini.Frame{makeFrame("answer", "", true, testModel.ModelID)},
+		})
+		return &gemini.StreamResponse{Status: 200, CID: "resp-cid", RID: "resp-rid"}, nil
+	}}
+	acct.Client = client
+	scope := AuthScope{OK: true, AccountID: "acct", Token: "acct", SessionID: "responses-session"}
+
+	for i, input := range []string{"one", "two"} {
+		rec := httptest.NewRecorder()
+		srv.HandleResponses(context.Background(), rec, map[string]any{
+			"model": testModel.ModelName,
+			"input": input,
+		}, scope)
+		if rec.Code != 200 {
+			t.Fatalf("responses turn %d failed: %d %s", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	if len(metas) != 2 {
+		t.Fatalf("expected two upstream calls, got %d", len(metas))
+	}
+	if len(metas[1]) == 0 {
+		t.Fatal("responses turn 2 must reuse the explicit session binding")
 	}
 }
 

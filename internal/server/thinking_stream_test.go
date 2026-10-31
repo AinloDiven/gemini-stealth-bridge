@@ -52,6 +52,16 @@ func TestThinkingStreamEmitsReasoningLifecycleAndActionTitle(t *testing.T) {
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("expected stream terminator, got:\n%s", body)
 	}
+
+	start := strings.Index(body, `"event":"start"`)
+	delta := strings.Index(body, `"event":"delta"`)
+	done := strings.Index(body, `"event":"done"`)
+	action := strings.Index(body, `"x_gemini_action_status"`)
+	finish := strings.Index(body, `"finish_reason"`)
+	terminator := strings.Index(body, "data: [DONE]")
+	if start < 0 || delta < 0 || done < 0 || action < 0 || finish < 0 || !(start < delta && delta < done && action < terminator && finish < terminator) {
+		t.Fatalf("invalid SSE ordering: start=%d delta=%d done=%d action=%d finish=%d terminator=%d\n%s", start, delta, done, action, finish, terminator, body)
+	}
 }
 
 // TestThinkingActionToolCardKeepsIconInputs verifies that a tool card relays
