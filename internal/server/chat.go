@@ -183,7 +183,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	curPrompt := prep.curPrompt
 	flattenStats := prep.flattenStats
 	overflowParts := prep.overflowParts
-	imageParts := prep.imageParts
+	messageParts := prep.messageParts
 	fullAttachmentParts := prep.fullAttachmentParts
 	attachmentParts := prep.attachmentParts
 	hasher := prep.hasher
@@ -1021,9 +1021,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								AllowOverflow:   s.Cfg.HistoryOffload,
 							}); cErr == nil {
 								curPrompt = appendErrorReplyRecoveryNote(compacted, hasTools)
-								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(imageParts))
+								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(messageParts))
 								attachmentParts = append(attachmentParts, extraOverflow...)
-								attachmentParts = append(attachmentParts, imageParts...)
+								attachmentParts = append(attachmentParts, messageParts...)
 								continue
 							}
 						}

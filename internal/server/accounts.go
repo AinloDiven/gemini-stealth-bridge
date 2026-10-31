@@ -1617,7 +1617,7 @@ type preparedGeneration struct {
 	curPrompt           string
 	flattenStats        prompt.FlattenStats
 	overflowParts       []prompt.AttachmentPart
-	imageParts          []prompt.AttachmentPart
+	messageParts        []prompt.AttachmentPart
 	fullAttachmentParts []prompt.AttachmentPart
 	attachmentParts     []prompt.AttachmentPart
 	hasher              *prompt.HistoryHasher
@@ -1778,10 +1778,10 @@ func (s *Server) prepareGeneration(
 		return nil, err
 	}
 
-	imageParts := prompt.ExtractImageParts(messages)
-	fullAttachmentParts := make([]prompt.AttachmentPart, 0, len(overflowParts)+len(imageParts))
+	messageParts := prompt.ExtractAttachmentParts(messages)
+	fullAttachmentParts := make([]prompt.AttachmentPart, 0, len(overflowParts)+len(messageParts))
 	fullAttachmentParts = append(fullAttachmentParts, overflowParts...)
-	fullAttachmentParts = append(fullAttachmentParts, imageParts...)
+	fullAttachmentParts = append(fullAttachmentParts, messageParts...)
 	attachmentParts := fullAttachmentParts
 
 	hasTools := len(contract.Tools) > 0 && contract.ChoiceMode != "none"
@@ -1859,7 +1859,7 @@ func (s *Server) prepareGeneration(
 		curPrompt:           curPrompt,
 		flattenStats:        flattenStats,
 		overflowParts:       overflowParts,
-		imageParts:          imageParts,
+		messageParts:        messageParts,
 		fullAttachmentParts: fullAttachmentParts,
 		attachmentParts:     attachmentParts,
 		hasher:              hasher,
@@ -1981,7 +1981,7 @@ func (s *Server) flattenContinuation(messages []map[string]any, toolsRaw, toolCh
 	if err != nil {
 		return "", nil, false
 	}
-	return text, prompt.ExtractImageParts(messages[start:]), true
+	return text, prompt.ExtractAttachmentParts(messages[start:]), true
 }
 
 func isLightweightTitleRequest(messages []map[string]any) bool {
