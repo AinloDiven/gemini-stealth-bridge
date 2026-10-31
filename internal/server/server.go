@@ -250,7 +250,7 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 	s.mu.RLock()
 	if s.Cfg.AdminKey != "" && token != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.Cfg.AdminKey)) == 1 {
 		s.mu.RUnlock()
-		return AuthScope{OK: true, Admin: true}
+		return AuthScope{OK: true, Admin: true, Token: token}
 	}
 	if acctID, ok := s.tokenToAcct[token]; ok && token != "" {
 		s.mu.RUnlock()
@@ -313,7 +313,6 @@ func (s *Server) requireAuthScope(w http.ResponseWriter, r *http.Request) (AuthS
 		sendJSON(w, 401, map[string]any{"error": map[string]any{"message": "invalid api key", "type": "authentication_error"}}, nil)
 		return AuthScope{}, false
 	}
-	scope.Token = extractRequestToken(r)
 	if sid := strings.TrimSpace(r.Header.Get("X-GSB-Session")); sid != "" {
 		if !reSafeSession.MatchString(sid) {
 			sendJSON(w, 400, map[string]any{"error": map[string]any{"message": "invalid X-GSB-Session; expected 1-128 characters from [A-Za-z0-9._:-]", "type": "invalid_request_error"}}, nil)

@@ -1376,17 +1376,7 @@ func (s *Server) preferBindingAccount(accts []*AccountState, requested, accountI
 		if a == nil || a.ID != accountID {
 			continue
 		}
-		a.mu.RLock()
-		unavailable := a.Quarantined || a.Disabled
-		a.mu.RUnlock()
-		if unavailable {
-			return nil
-		}
-		m := resolveModelOnAccount(a, requested)
-		if m == nil {
-			return nil
-		}
-		if err := s.checkPreFlightQuotaInternal(a, *m, m.ModelName, true); err != nil {
+		if _, ok := s.accountReady(a, requested); !ok {
 			return nil
 		}
 		if s.isAccountBusy(a.ID) {
@@ -1861,15 +1851,9 @@ func (s *Server) prepareGeneration(
 		opts.Metadata = append([]any(nil), binding.Meta...)
 		cacheKey = sessionKey
 		cacheSplit = bindingSplit
-		deltaPrompt, _, dErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
-			StartIndex:      bindingSplit,
-			MaxPromptChars:  s.Cfg.MaxPromptChars,
-			MaxOldToolChars: s.Cfg.MaxOldToolChars,
-			AllowOverflow:   false,
-		})
-		if dErr == nil {
-			curPrompt = deltaPrompt
-			attachmentParts = prompt.ExtractImageParts(messages[bindingSplit:])
+		if text, parts, ok := s.flattenContinuation(messages, toolsRaw, toolChoiceRaw, bindingSplit); ok {
+			curPrompt = text
+			attachmentParts = parts
 		}
 	}
 	if len(opts.Metadata) == 0 && s.Cfg.SessionCache && !opts.Temporary && hasher != nil {
@@ -1878,15 +1862,9 @@ func (s *Server) prepareGeneration(
 			opts.Metadata = cachedMeta
 			cacheKey = selectedKey
 			cacheSplit = split
-			deltaPrompt, _, dErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
-				StartIndex:      split,
-				MaxPromptChars:  s.Cfg.MaxPromptChars,
-				MaxOldToolChars: s.Cfg.MaxOldToolChars,
-				AllowOverflow:   false,
-			})
-			if dErr == nil {
-				curPrompt = deltaPrompt
-				attachmentParts = prompt.ExtractImageParts(messages[split:])
+			if text, parts, ok := s.flattenContinuation(messages, toolsRaw, toolChoiceRaw, split); ok {
+				curPrompt = text
+				attachmentParts = parts
 			}
 		}
 	}
@@ -1929,6 +1907,22 @@ func (s *Server) prepareGeneration(
 
 var lightweightTitleRe = regexp.MustCompile(`(?i)\b(?:generate\s+a\s+(?:concise|short|brief)[,\s]+(?:single[- ]line\s+)?(?:task\s+|session\s+|chat\s+|conversation\s+)?title|write\s+a\s+(?:concise|short|brief)\s+(?:3[-–]6\s+word\s+)?title\s+for\s+this|summarize\s+this\s+(?:conversation|message|chat)\s+(?:in|into)\s+a\s+short\s+title)\b`)
 
+func (s *Server) flattenContinuation(messages []map[string]any, toolsRaw, toolChoiceRaw any, start int) (string, []prompt.AttachmentPart, bool) {
+	if start < 0 || start >= len(messages) {
+		return "", nil, false
+	}
+	text, _, err := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
+		StartIndex:      start,
+		MaxPromptChars:  s.Cfg.MaxPromptChars,
+		MaxOldToolChars: s.Cfg.MaxOldToolChars,
+		AllowOverflow:   false,
+	})
+	if err != nil {
+		return "", nil, false
+	}
+	return text, prompt.ExtractImageParts(messages[start:]), true
+}
+
 func isLightweightTitleRequest(messages []map[string]any) bool {
 	if len(messages) == 0 || len(messages) > 4 {
 		return false
@@ -1942,95 +1936,4 @@ func isLightweightTitleRequest(messages []map[string]any) bool {
 		}
 	}
 	return false
-}
-
-// skillTargetFor resolves the fixed cloud Skill for this request:
-// per-key override > account file override > global BRIDGE_SKILL.
-func (s *Server) skillTargetFor(scope AuthScope, account *AccountState) string {
-	s.mu.RLock()
-	perKey := s.Cfg.SkillPerKey[scope.Token]
-	global := strings.TrimSpace(s.Cfg.Skill)
-	s.mu.RUnlock()
-	if strings.TrimSpace(perKey) != "" {
-		return strings.TrimSpace(perKey)
-	}
-	if account != nil {
-		account.mu.RLock()
-		accountSkill := strings.TrimSpace(account.Skill)
-		account.mu.RUnlock()
-		if accountSkill != "" {
-			return accountSkill
-		}
-	}
-	return global
-}
-
-func normalizeSkillCommand(skill string) string {
-	cmd := strings.TrimSpace(skill)
-	if cmd == "" {
-		return ""
-	}
-	if !strings.HasPrefix(cmd, "/") {
-		cmd = "/" + cmd
-	}
-	return cmd
-}
-
-func stripLeadingSkillPrefix(value, prefix string) string {
-	if prefix == "" || !strings.HasPrefix(value, prefix) {
-		return value
-	}
-	return strings.TrimLeft(value[len(prefix):], " \t\r\n")
-}
-
-func skillPrefixAtFront(value, prefix string) bool {
-	if prefix == "" {
-		return false
-	}
-	return strings.HasPrefix(value, prefix+" ") || strings.HasPrefix(value, prefix+"\n") || value == prefix
-}
-
-func prependSkillPrefix(value, prefix string) string {
-	remainder := stripLeadingSkillPrefix(value, prefix)
-	if remainder == "" {
-		return prefix
-	}
-	return prefix + " " + remainder
-}
-
-// formatSkillPrompt places the configured cloud Skill command at byte 0,
-// idempotently and without changing any other character (the browser sends the
-// same text projection beside inner[81]).
-func formatSkillPrompt(text, skill string) string {
-	prefix := normalizeSkillCommand(skill)
-	if prefix == "" {
-		return text
-	}
-	stripped := strings.TrimSpace(text)
-	if stripped == "" {
-		return prefix
-	}
-	if strings.HasPrefix(stripped, "<|im_start|>") {
-		return text
-	}
-	if strings.Contains(text, "【用户消息】") {
-		idx := strings.Index(text, "【用户消息】") + len("【用户消息】")
-		header := text[:idx]
-		body := stripLeadingSkillPrefix(strings.TrimLeft(text[idx:], "\n "), prefix)
-		clean := strings.TrimSpace(header)
-		if body != "" {
-			clean = header + "\n" + body
-		}
-		if skillPrefixAtFront(strings.TrimSpace(clean), prefix) {
-			return clean
-		}
-		return prependSkillPrefix(strings.TrimSpace(clean), prefix)
-	}
-	if skillPrefixAtFront(stripped, prefix) {
-		return text
-	}
-	if strings.HasPrefix(stripped, prefix) {
-		return prependSkillPrefix(stripped, prefix)
-	}
-	return prefix + " " + text
 }
