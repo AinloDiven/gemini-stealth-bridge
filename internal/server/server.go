@@ -138,6 +138,8 @@ type Server struct {
 	cacheFlushMu      sync.Mutex
 	cacheFlushPending atomic.Bool
 	cacheFlushWG      sync.WaitGroup
+	bindingFlushPending atomic.Bool
+	bindingFlushWG      sync.WaitGroup
 	clientFactory     func(a *AccountState) UpstreamClient
 
 	// rotateMu guards the sticky rotation cursor used by the "rotate" strategy.

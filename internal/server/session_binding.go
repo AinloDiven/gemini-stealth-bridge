@@ -114,9 +114,8 @@ func (s *Server) getSessionBinding(key string) *sessionBinding {
 	b, ok := s.sessionBindings[key]
 	s.mu.RUnlock()
 	if !ok || now.Sub(b.At) >= s.sessionBindingTTL() {
-		if ok {
-			s.deleteSessionBinding(key)
-		}
+		// Expired entries are ignored here; the next put/load pass removes them.
+		// Reading a binding must not trigger disk I/O from prepareGeneration.
 		return nil
 	}
 	cp := b
@@ -175,10 +174,31 @@ func (s *Server) deleteSessionBinding(key string) {
 }
 
 func (s *Server) flushSessionBindings() {
+	if s.sessionBindingsDiskPath() == "" {
+		return
+	}
+	if !s.bindingFlushPending.CompareAndSwap(false, true) {
+		return
+	}
+	s.bindingFlushWG.Add(1)
+	go func() {
+		defer s.bindingFlushWG.Done()
+		s.flushSessionBindingsLocked()
+	}()
+}
+
+// flushSessionBindingsLocked writes the current binding snapshot. cacheFlushMu
+// serializes it with the continuation-cache writer so two concurrent turns
+// cannot install an older snapshot over a newer one.
+func (s *Server) flushSessionBindingsLocked() {
 	p := s.sessionBindingsDiskPath()
 	if p == "" {
 		return
 	}
+	s.cacheFlushMu.Lock()
+	defer s.cacheFlushMu.Unlock()
+	s.bindingFlushPending.Store(false)
+
 	s.mu.RLock()
 	entries := make([]persistedSessionBinding, 0, len(s.sessionBindings))
 	for _, b := range s.sessionBindings {
@@ -189,14 +209,5 @@ func (s *Server) flushSessionBindings() {
 	}
 	s.mu.RUnlock()
 	sort.Slice(entries, func(i, j int) bool { return entries[i].At.After(entries[j].At) })
-	raw, err := json.Marshal(entries)
-	if err != nil {
-		return
-	}
-	tmp := p + ".tmp-" + time.Now().Format("20060102T150405.000000000")
-	if err := os.WriteFile(tmp, raw, 0o600); err == nil {
-		if err := os.Rename(tmp, p); err != nil {
-			_ = os.Remove(tmp)
-		}
-	}
+	_ = writeJSONAtomically(p, entries)
 }
