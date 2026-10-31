@@ -1663,11 +1663,7 @@ func (s *Server) prepareGeneration(
 	toolChoiceRaw any,
 ) (*preparedGeneration, error) {
 	rawModel, _ := body["model"].(string)
-	modelFromDefault := strings.TrimSpace(rawModel) == "" && strings.TrimSpace(s.Cfg.DefaultModel) != ""
-	if strings.TrimSpace(rawModel) == "" {
-		rawModel = strings.TrimSpace(s.Cfg.DefaultModel)
-	}
-	requested, inlineThink := gemini.ParseModelRequest(rawModel)
+	requested, inlineThink, modelFromDefault := s.resolveGenerationRequestModel(rawModel)
 
 	// The scope decides which accounts this request may touch: an account key
 	// sees only its own account, a group key only its group, the pool key all
@@ -1693,17 +1689,7 @@ func (s *Server) prepareGeneration(
 		binding = s.getSessionBinding(sessionKey)
 	}
 
-	account := s.resolveChatAccount(accts, scope, requested, hasher)
-	if account == nil && modelFromDefault {
-		// A configured default that no account advertises must not take the
-		// whole pool down; fall back to the account's own first model. An
-		// explicit request model keeps the strict model_not_found path.
-		if fallback := s.resolveChatAccount(accts, scope, "", hasher); fallback != nil {
-			log.Printf("configured default model %q is unavailable; using account default", s.Cfg.DefaultModel)
-			requested = ""
-			account = fallback
-		}
-	}
+	account, requested := s.selectGenerationAccount(accts, scope, requested, hasher, modelFromDefault)
 	if account == nil {
 		for _, a := range accts {
 			a.mu.RLock()
@@ -1761,14 +1747,7 @@ func (s *Server) prepareGeneration(
 		return nil, mErr
 	}
 
-	model := resolveModelOnAccount(account, requested)
-	if model == nil && modelFromDefault {
-		if fallback := resolveModelOnAccount(account, ""); fallback != nil {
-			log.Printf("configured default model %q is unavailable on account %s; using account default", s.Cfg.DefaultModel, account.ID)
-			requested = ""
-			model = fallback
-		}
-	}
+	model, requested := s.selectGenerationModel(account, requested, modelFromDefault)
 	if model == nil {
 		reqLabel := requested
 		if reqLabel == "" {
@@ -1861,40 +1840,19 @@ func (s *Server) prepareGeneration(
 		PersonalContext: s.Cfg.PersonalContext,
 	}
 	skillTarget := s.skillTargetFor(scope, account)
-	if skillTarget != "" {
-		if binder, ok := account.Client.(skillRuntimeBinder); ok {
-			if handle, bindErr := binder.BindSkillRuntime(ctx, skillTarget); bindErr == nil {
-				opts.SkillRuntime = handle
-			} else {
-				log.Printf("cloud Skill %q could not be bound for account %s: %v; turn runs without slot 81", skillTarget, account.ID, bindErr)
-			}
-		}
-	}
+	opts.SkillRuntime = s.bindSkillRuntime(ctx, account, skillTarget)
 
-	curPrompt := fullPrompt
-	cacheKey := ""
-	cacheSplit := 0
-	if bindingSplit >= 0 && !opts.Temporary {
-		opts.Metadata = append([]any(nil), binding.Meta...)
-		cacheKey = sessionKey
-		cacheSplit = bindingSplit
-		if text, parts, ok := s.flattenContinuation(messages, toolsRaw, toolChoiceRaw, bindingSplit); ok {
-			curPrompt = text
-			attachmentParts = parts
-		}
-	}
-	if len(opts.Metadata) == 0 && s.Cfg.SessionCache && !opts.Temporary && hasher != nil {
-		selectedKey, cachedMeta, split := s.consumeSessionCacheForGeneration(account.ID, mid, hasher)
-		if len(cachedMeta) > 0 {
-			opts.Metadata = cachedMeta
-			cacheKey = selectedKey
-			cacheSplit = split
-			if text, parts, ok := s.flattenContinuation(messages, toolsRaw, toolChoiceRaw, split); ok {
-				curPrompt = text
-				attachmentParts = parts
-			}
-		}
-	}
+	continuation := s.selectContinuation(
+		messages, toolsRaw, toolChoiceRaw, hasher,
+		binding, bindingSplit, sessionKey,
+		account.ID, mid, opts.Temporary,
+		fullPrompt, attachmentParts,
+	)
+	opts.Metadata = continuation.Metadata
+	curPrompt := continuation.Prompt
+	attachmentParts = continuation.Parts
+	cacheKey := continuation.CacheKey
+	cacheSplit := continuation.CacheSplit
 	if len(overflowParts) > 0 && len(opts.Metadata) == 0 {
 		account.mu.Lock()
 		account.offloadRequests++
@@ -1933,6 +1891,103 @@ func (s *Server) prepareGeneration(
 }
 
 var lightweightTitleRe = regexp.MustCompile(`(?i)\b(?:generate\s+a\s+(?:concise|short|brief)[,\s]+(?:single[- ]line\s+)?(?:task\s+|session\s+|chat\s+|conversation\s+)?title|write\s+a\s+(?:concise|short|brief)\s+(?:3[-–]6\s+word\s+)?title\s+for\s+this|summarize\s+this\s+(?:conversation|message|chat)\s+(?:in|into)\s+a\s+short\s+title)\b`)
+
+func (s *Server) resolveGenerationRequestModel(raw string) (requested, inlineThink string, fromDefault bool) {
+	raw = strings.TrimSpace(raw)
+	fromDefault = raw == "" && strings.TrimSpace(s.Cfg.DefaultModel) != ""
+	if raw == "" {
+		raw = strings.TrimSpace(s.Cfg.DefaultModel)
+	}
+	requested, inlineThink = gemini.ParseModelRequest(raw)
+	return requested, inlineThink, fromDefault
+}
+
+func (s *Server) selectGenerationAccount(accts []*AccountState, scope AuthScope, requested string, hasher *prompt.HistoryHasher, modelFromDefault bool) (*AccountState, string) {
+	account := s.resolveChatAccount(accts, scope, requested, hasher)
+	if account == nil && modelFromDefault {
+		// A configured default that no account advertises must not take the
+		// whole pool down; fall back to the account's own first model. An
+		// explicit request model keeps the strict model_not_found path.
+		if fallback := s.resolveChatAccount(accts, scope, "", hasher); fallback != nil {
+			log.Printf("configured default model %q is unavailable; using account default", s.Cfg.DefaultModel)
+			return fallback, ""
+		}
+	}
+	return account, requested
+}
+
+func (s *Server) selectGenerationModel(account *AccountState, requested string, modelFromDefault bool) (*gemini.ModelInfo, string) {
+	model := resolveModelOnAccount(account, requested)
+	if model == nil && modelFromDefault {
+		if fallback := resolveModelOnAccount(account, ""); fallback != nil {
+			log.Printf("configured default model %q is unavailable on account %s; using account default", s.Cfg.DefaultModel, account.ID)
+			return fallback, ""
+		}
+	}
+	return model, requested
+}
+
+func (s *Server) bindSkillRuntime(ctx context.Context, account *AccountState, target string) string {
+	if target == "" {
+		return ""
+	}
+	binder, ok := account.Client.(skillRuntimeBinder)
+	if !ok {
+		return ""
+	}
+	handle, err := binder.BindSkillRuntime(ctx, target)
+	if err != nil {
+		log.Printf("cloud Skill %q could not be bound for account %s: %v; turn runs without slot 81", target, account.ID, err)
+		return ""
+	}
+	return handle
+}
+
+type continuationSelection struct {
+	Prompt     string
+	Parts      []prompt.AttachmentPart
+	Metadata   []any
+	CacheKey   string
+	CacheSplit int
+}
+
+// selectContinuation centralizes the precedence between an explicit session
+// binding and the content-addressed continuation cache.
+func (s *Server) selectContinuation(
+	messages []map[string]any,
+	toolsRaw, toolChoiceRaw any,
+	hasher *prompt.HistoryHasher,
+	binding *sessionBinding,
+	bindingSplit int,
+	sessionKey, accountID, model string,
+	temporary bool,
+	fullPrompt string,
+	fullParts []prompt.AttachmentPart,
+) continuationSelection {
+	selection := continuationSelection{Prompt: fullPrompt, Parts: fullParts}
+	if bindingSplit >= 0 && !temporary {
+		selection.Metadata = append([]any(nil), binding.Meta...)
+		selection.CacheKey = sessionKey
+		selection.CacheSplit = bindingSplit
+		if text, parts, ok := s.flattenContinuation(messages, toolsRaw, toolChoiceRaw, bindingSplit); ok {
+			selection.Prompt = text
+			selection.Parts = parts
+		}
+	}
+	if len(selection.Metadata) == 0 && s.Cfg.SessionCache && !temporary && hasher != nil {
+		key, meta, split := s.consumeSessionCacheForGeneration(accountID, model, hasher)
+		if len(meta) > 0 {
+			selection.Metadata = meta
+			selection.CacheKey = key
+			selection.CacheSplit = split
+			if text, parts, ok := s.flattenContinuation(messages, toolsRaw, toolChoiceRaw, split); ok {
+				selection.Prompt = text
+				selection.Parts = parts
+			}
+		}
+	}
+	return selection
+}
 
 func (s *Server) flattenContinuation(messages []map[string]any, toolsRaw, toolChoiceRaw any, start int) (string, []prompt.AttachmentPart, bool) {
 	if start < 0 || start >= len(messages) {
