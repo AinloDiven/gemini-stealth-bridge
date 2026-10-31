@@ -265,3 +265,49 @@ func TestExtractImagePartsAndPlaceholdersSupportPDFAndAudioModalities(t *testing
 		t.Fatalf("expected flattened prompt to contain only clean user text, got:\n%s", flattened)
 	}
 }
+
+func TestMIMEHintsShareOneCanonicalTable(t *testing.T) {
+	for _, tc := range []struct {
+		raw      string
+		wantMIME string
+		wantExt  string
+	}{
+		{raw: "image/jpg", wantMIME: "image/jpeg", wantExt: "jpg"},
+		{raw: "audio/x-wav", wantMIME: "audio/wav", wantExt: "wav"},
+		{raw: "text/x-markdown", wantMIME: "text/markdown", wantExt: "md"},
+		{raw: "application/octet-stream", wantMIME: "application/octet-stream", wantExt: "bin"},
+	} {
+		mimeType, ext := normalizeFallbackMIME(tc.raw)
+		if mimeType != tc.wantMIME || ext != tc.wantExt {
+			t.Fatalf("normalizeFallbackMIME(%q) = %q,%q; want %q,%q", tc.raw, mimeType, ext, tc.wantMIME, tc.wantExt)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{name: "report.pdf", want: "application/pdf"},
+		{name: "voice.opus", want: "audio/ogg"},
+		{name: "trace.log", want: "text/plain"},
+		{name: "clip.mov", want: "video/quicktime"},
+		{name: "unknown.xyz", want: ""},
+	} {
+		if got := inferMIMEFromFilename(tc.name, ""); got != tc.want {
+			t.Fatalf("inferMIMEFromFilename(%q) = %q; want %q", tc.name, got, tc.want)
+		}
+	}
+	for _, tc := range []struct {
+		format string
+		want   string
+	}{
+		{format: "", want: "audio/wav"},
+		{format: "mpeg", want: "audio/mpeg"},
+		{format: "pcm16", want: "audio/wav"},
+		{format: "x-m4a", want: "audio/mp4"},
+		{format: "audio/custom", want: "audio/custom"},
+	} {
+		if got := audioFormatToMIME(tc.format); got != tc.want {
+			t.Fatalf("audioFormatToMIME(%q) = %q; want %q", tc.format, got, tc.want)
+		}
+	}
+}
