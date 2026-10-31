@@ -289,6 +289,7 @@ func TestSessionBindingPersistsAcrossRestart(t *testing.T) {
 		Meta:    []any{"cid", "rid", "rcid", nil, nil, nil, nil, nil, nil, "ctx"},
 		NextLen: 2, HistoryHash: "hash",
 	})
+	srv.FlushSessionCacheNow()
 	restarted := New(srv.Cfg)
 	got := restarted.getSessionBinding(key)
 	if got == nil || got.AccountID != "acct" || got.NextLen != 2 || got.HistoryHash != "hash" {

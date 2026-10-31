@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -77,7 +76,9 @@ func (s *Server) loadSessionCacheFromDisk() {
 // still creating its temp file in a directory that may already be removed.
 func (s *Server) FlushSessionCacheNow() {
 	s.cacheFlushWG.Wait()
+	s.bindingFlushWG.Wait()
 	s.flushSessionCacheLocked()
+	s.flushSessionBindingsLocked()
 }
 
 // flushSessionCacheLocked performs the write without waiting on the wait group, so
@@ -106,16 +107,7 @@ func (s *Server) flushSessionCacheLocked() {
 	}
 	s.mu.RUnlock()
 
-	b, err := json.Marshal(entries)
-	if err != nil {
-		return
-	}
-	tmp := fmt.Sprintf("%s.tmp-%d", p, time.Now().UnixNano())
-	if err := os.WriteFile(tmp, b, 0o600); err == nil {
-		if err := os.Rename(tmp, p); err != nil {
-			_ = os.Remove(tmp)
-		}
-	}
+	_ = writeJSONAtomically(p, entries)
 }
 
 func (s *Server) flushSessionCacheToDisk() {
