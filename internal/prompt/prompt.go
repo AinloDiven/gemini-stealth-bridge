@@ -26,7 +26,7 @@ import (
 )
 
 var (
-	dataURLImageRe          = regexp.MustCompile(`^data:([a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+)(?:;[a-zA-Z0-9_.+-]+=[^;,]+)*;base64,([A-Za-z0-9+/=\s_-]+)$`)
+	dataURLAttachmentRe     = regexp.MustCompile(`^data:([a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+)(?:;[a-zA-Z0-9_.+-]+=[^;,]+)*;base64,([A-Za-z0-9+/=\s_-]+)$`)
 	defaultFilenameRe       = regexp.MustCompile(`^(?:image|audio|video|file)_\d+\.[a-z0-9]+$`)
 	nonAlphaNumRe           = regexp.MustCompile(`[^a-z0-9]`)
 	fencedToolCallRe        = regexp.MustCompile("(?is)```(?:json)?\\s*\\{\\s*\"(?:tool_calls|toolCalls|function_call)\"[\\s\\S]*?```")
@@ -49,8 +49,8 @@ func isContextNote(s string) bool {
 	return strings.HasPrefix(s, "[Context note:") || strings.HasPrefix(s, "Instruction: [")
 }
 
-// DetectImageMIME infers the MIME type and file extension of an attachment from its magic bytes or fallback MIME.
-func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string) {
+// DetectAttachmentMIME infers the MIME type and file extension of an attachment from its magic bytes or fallback MIME.
+func DetectAttachmentMIME(data []byte, fallback string) (mimeType string, ext string) {
 	fbLower := strings.ToLower(strings.TrimSpace(strings.Split(fallback, ";")[0]))
 	if fbLower == "" {
 		fbLower = "image/png"
@@ -106,7 +106,7 @@ func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string)
 
 // mimeSpec is the single source of truth for MIME aliases, filename
 // extensions, and audio format spellings. Detection by magic bytes stays in
-// DetectImageMIME; everything name- or hint-based goes through this table.
+// DetectAttachmentMIME; everything name- or hint-based goes through this table.
 type mimeSpec struct {
 	MIME         string
 	Ext          string
@@ -291,9 +291,9 @@ type FlattenStats struct {
 	ToolSchemaBytes int `json:"toolSchemaBytes"`
 }
 
-// ParseDataURLImage decodes a data:<mime>;base64,... URL into an AttachmentPart.
-func ParseDataURLImage(rawURL string, index int) *AttachmentPart {
-	m := dataURLImageRe.FindStringSubmatch(strings.TrimSpace(rawURL))
+// ParseDataURLAttachment decodes a data:<mime>;base64,... URL into an AttachmentPart.
+func ParseDataURLAttachment(rawURL string, index int) *AttachmentPart {
+	m := dataURLAttachmentRe.FindStringSubmatch(strings.TrimSpace(rawURL))
 	if len(m) < 3 {
 		return nil
 	}
@@ -301,7 +301,7 @@ func ParseDataURLImage(rawURL string, index int) *AttachmentPart {
 	if err != nil || len(data) == 0 {
 		return nil
 	}
-	contentType, ext := DetectImageMIME(data, strings.ToLower(m[1]))
+	contentType, ext := DetectAttachmentMIME(data, strings.ToLower(m[1]))
 	return &AttachmentPart{
 		Data:        data,
 		ContentType: contentType,
@@ -309,7 +309,7 @@ func ParseDataURLImage(rawURL string, index int) *AttachmentPart {
 	}
 }
 
-func extractSingleImagePart(part map[string]any, index int) *AttachmentPart {
+func extractSingleAttachmentPart(part map[string]any, index int) *AttachmentPart {
 	if part == nil {
 		return nil
 	}
@@ -333,10 +333,10 @@ func extractSingleImagePart(part map[string]any, index int) *AttachmentPart {
 		fallbackMIME = inferMIMEFromFilename(explicitName, fallbackMIME)
 		lower := strings.ToLower(u)
 		if strings.HasPrefix(lower, "data:") {
-			return withFilename(ParseDataURLImage(u, index), explicitName)
+			return withFilename(ParseDataURLAttachment(u, index), explicitName)
 		}
 		if strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") {
-			mime, ext := DetectImageMIME(nil, fallbackMIME)
+			mime, ext := DetectAttachmentMIME(nil, fallbackMIME)
 			return withFilename(&AttachmentPart{
 				RemoteURL:   u,
 				ContentType: mime,
@@ -362,7 +362,7 @@ func extractSingleImagePart(part map[string]any, index int) *AttachmentPart {
 		if err != nil || len(data) == 0 {
 			return nil
 		}
-		contentType, ext := DetectImageMIME(data, fallbackMIME)
+		contentType, ext := DetectAttachmentMIME(data, fallbackMIME)
 		return withFilename(&AttachmentPart{
 			Data:        data,
 			ContentType: contentType,
@@ -539,8 +539,8 @@ func extractSingleImagePart(part map[string]any, index int) *AttachmentPart {
 	return nil
 }
 
-// ExtractImageParts extracts all inline base64 or remote http(s) attachments from OpenAI/Anthropic message arrays.
-func ExtractImageParts(messages []map[string]any) []AttachmentPart {
+// ExtractAttachmentParts extracts all inline base64 or remote http(s) attachments from OpenAI/Anthropic message arrays.
+func ExtractAttachmentParts(messages []map[string]any) []AttachmentPart {
 	var images []AttachmentPart
 	for _, m := range messages {
 		if m == nil {
@@ -555,7 +555,7 @@ func ExtractImageParts(messages []map[string]any) []AttachmentPart {
 			if !ok || part == nil {
 				continue
 			}
-			if att := extractSingleImagePart(part, len(images)); att != nil {
+			if att := extractSingleAttachmentPart(part, len(images)); att != nil {
 				images = append(images, *att)
 			}
 		}
@@ -563,9 +563,9 @@ func ExtractImageParts(messages []map[string]any) []AttachmentPart {
 	return images
 }
 
-// FetchRemoteImage downloads an http(s) attachment URL with SSRF protection, a 20MB cap,
+// FetchRemoteAttachment downloads an http(s) attachment URL with SSRF protection, a 20MB cap,
 // and magic-byte MIME detection.
-func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*AttachmentPart, error) {
+func FetchRemoteAttachment(ctx context.Context, rawURL string, index int) (*AttachmentPart, error) {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return nil, transport.NewUpstreamError("invalid remote image URL", 400, "invalid_request_error", nil, err)
@@ -634,7 +634,7 @@ func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*Attachmen
 		return nil, transport.NewUpstreamError("remote image exceeds 20MB limit", 400, "invalid_request_error", nil, nil)
 	}
 	headerMIME := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
-	mime, ext := DetectImageMIME(data, headerMIME)
+	mime, ext := DetectAttachmentMIME(data, headerMIME)
 	if index < 0 {
 		index = 0
 	}
@@ -1296,7 +1296,7 @@ func normalizeMessageForHash(m map[string]any) any {
 			if pType == "text" || pType == "input_text" {
 				t, _ := p["text"].(string)
 				parts = append(parts, t)
-			} else if att := extractSingleImagePart(p, len(imgDigests)); att != nil {
+			} else if att := extractSingleAttachmentPart(p, len(imgDigests)); att != nil {
 				if att.RemoteURL != "" {
 					imgDigests = append(imgDigests, "url:"+att.RemoteURL)
 				} else if len(att.Data) > 0 {

@@ -51,7 +51,7 @@ func TestImagePlaceholderIndexMatchesValidImagesAndRoleSpoofingNeutralized(t *te
 			},
 		},
 	}
-	parts := ExtractImageParts(messages)
+	parts := ExtractAttachmentParts(messages)
 	if len(parts) != 1 {
 		t.Fatalf("expected 1 valid extracted image part, got %d", len(parts))
 	}
@@ -197,7 +197,7 @@ func TestFlattenMessagesContinuationIncludesRequiredToolArgsInReminder(t *testin
 	}
 }
 
-func TestExtractImagePartsAndPlaceholdersSupportPDFAndAudioModalities(t *testing.T) {
+func TestExtractAttachmentPartsAndPlaceholdersSupportPDFAndAudioModalities(t *testing.T) {
 	pdfBytes := []byte("%PDF-1.7\n1 0 obj\n<<>>\nendobj\n")
 	oggBytes := []byte("OggS\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00")
 	wavBytes := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
@@ -240,7 +240,7 @@ func TestExtractImagePartsAndPlaceholdersSupportPDFAndAudioModalities(t *testing
 		},
 	}
 
-	parts := ExtractImageParts(messages)
+	parts := ExtractAttachmentParts(messages)
 	if len(parts) != 4 {
 		t.Fatalf("expected 4 extracted attachment parts, got %d", len(parts))
 	}

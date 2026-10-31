@@ -353,7 +353,7 @@ func (s *Server) uploadCached(ctx context.Context, acctID string, c UpstreamClie
 			return cachedURL, nil
 		}
 		origName := att.Filename
-		fetched, err := prompt.FetchRemoteImage(ctx, att.RemoteURL, 0)
+		fetched, err := prompt.FetchRemoteAttachment(ctx, att.RemoteURL, 0)
 		if err != nil {
 			return gemini.UploadedFile{}, err
 		}
