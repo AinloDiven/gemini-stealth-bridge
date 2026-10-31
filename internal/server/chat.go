@@ -545,8 +545,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			servedID, servedLabel string
 			identityConflict      bool
 			mediaToolUsed         bool
-			lastImages            []gemini.GeneratedImage
-			lastVideos            []gemini.GeneratedVideo
+			media                 mediaAccumulator
 			lastCID, lastRID      string
 			lastContextToken      string
 			grounding             []gemini.GroundingSource
@@ -667,14 +666,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 					attemptStateMu.Lock()
 					s.rewriteFrameMedia(ctx, account.ID, &frame)
-					if len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0 {
+					media.Observe(frame)
+					if media.HasMedia() {
 						mediaToolUsed = true
-						if len(frame.GeneratedImages) > 0 {
-							lastImages = frame.GeneratedImages
-						}
-						if len(frame.GeneratedVideos) > 0 {
-							lastVideos = frame.GeneratedVideos
-						}
 					}
 					if mediaToolUsed {
 						servedID = model.ModelID
@@ -693,8 +687,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 					thoughts = mergeStreamedThoughts(thoughts, frame.Thoughts)
 					done = frame.Done
-					if done && (len(lastImages) > 0 || len(lastVideos) > 0) {
-						text = gemini.AppendGeneratedMediaMarkdown(text, lastImages, lastVideos)
+					if done {
+						text = media.AppendMarkdown(text)
 					}
 					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 					attemptStateMu.Unlock()
@@ -1133,8 +1127,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				continue
 			}
 			calls = clientCalls
-		} else if hasTools && len(calls) == 0 && (len(lastImages) > 0 || len(lastVideos) > 0) && serverMediaRounds < 2 && sentText == "" {
-			if promptAdd := formatDirectMediaToolContinuation(lastImages, lastVideos); promptAdd != "" {
+		} else if hasTools && len(calls) == 0 && media.HasMedia() && serverMediaRounds < 2 && sentText == "" {
+			if promptAdd := formatDirectMediaToolContinuation(media.Images(), media.Videos()); promptAdd != "" {
 				fullPrompt = fullPrompt + promptAdd
 				curPrompt = fullPrompt
 				opts.Metadata = nil
