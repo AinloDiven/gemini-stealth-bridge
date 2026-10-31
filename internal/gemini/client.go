@@ -1230,86 +1230,132 @@ func (ac *AccountClient) BindSkillRuntime(ctx context.Context, name string) (str
 	ac.mu.RUnlock()
 	cachedValid := skillCacheValid(cachedHandle, cachedName, cachedFSid, target, currentFSid)
 
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		_, entries, err := ac.BatchExec(ctx, "cCSu7", "[]")
-		if err != nil {
-			return "", err
+	records, listErr := ac.listSkillRecords(ctx)
+	if listErr != nil {
+		if cachedValid {
+			return cachedHandle, nil
 		}
-		records := extractSkillRecords(findBatchPayload(entries, "cCSu7"))
-		if len(records) == 0 {
-			lastErr = fmt.Errorf("cloud Skill list is empty")
+		return "", listErr
+	}
+	if len(records) == 0 {
+		if cachedValid {
+			return cachedHandle, nil
+		}
+		return "", fmt.Errorf("cloud Skill list is empty")
+	}
+	for _, rec := range records {
+		if !skillRecordMatches(rec, target) {
 			continue
 		}
-		for _, rec := range records {
-			if !skillRecordMatches(rec, target) {
-				continue
-			}
-			if handle, _ := rec[0].(string); handle != "" {
-				ac.mu.Lock()
-				ac.skillHandle, ac.skillName, ac.skillFSid = handle, target, ac.fSid
-				ac.mu.Unlock()
-				return handle, nil
-			}
+		handle, _ := rec[0].(string)
+		if handle == "" {
+			continue
 		}
 		ac.mu.Lock()
-		ac.skillHandle, ac.skillName, ac.skillFSid = "", "", ""
+		ac.skillHandle, ac.skillName, ac.skillFSid = handle, target, ac.fSid
 		ac.mu.Unlock()
-		return "", fmt.Errorf("cloud Skill %q is not available on this account", name)
+		return handle, nil
 	}
 	if cachedValid {
 		return cachedHandle, nil
 	}
-	return "", lastErr
+	ac.clearSkillCache()
+	return "", fmt.Errorf("cloud Skill %q is not available on this account", name)
+}
+
+// listSkillRecords performs the browser's empty-list retry without conflating
+// an RPC failure with an empty result. The caller owns cache fallback policy.
+func (ac *AccountClient) listSkillRecords(ctx context.Context) ([][]any, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		_, entries, err := ac.BatchExec(ctx, "cCSu7", "[]")
+		if err != nil {
+			return nil, err
+		}
+		records := extractSkillRecords(findBatchPayload(entries, "cCSu7"))
+		if len(records) > 0 {
+			return records, nil
+		}
+		lastErr = fmt.Errorf("cloud Skill list is empty")
+	}
+	return nil, lastErr
+}
+
+func (ac *AccountClient) clearSkillCache() {
+	ac.mu.Lock()
+	ac.skillHandle, ac.skillName, ac.skillFSid = "", "", ""
+	ac.mu.Unlock()
+}
+
+var skillAliases = map[string]bool{
+	"伊珂丝": true, "eksie": true, "eks": true, "ex": true, "エクス": true,
 }
 
 var skillHandleRe = regexp.MustCompile(`^[0-9a-fA-F-]{20,40}$`)
 
-var skillAliases = map[string]bool{
-	"伊珂丝": true, "eksie": true, "eks": true, "ex": true, "エクス": true,
+func isSkillHandle(value any) bool {
+	handle, ok := value.(string)
+	return ok && skillHandleRe.MatchString(handle)
 }
 
 func normalizeSkillName(name string) string {
 	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "/")))
 }
 
+// sameSkill compares configured names after normalization and treats the known
+// persona aliases as the same upstream skill.
+func sameSkill(a, b string) bool {
+	left, right := normalizeSkillName(a), normalizeSkillName(b)
+	if left == "" || right == "" {
+		return false
+	}
+	if left == right {
+		return true
+	}
+	return skillAliases[left] && skillAliases[right]
+}
+
 // skillCacheValid reports whether a previously confirmed handle can stand in
 // for an empty cCSu7 listing. The handle is page-session scoped and only valid
 // for the same configured skill.
 func skillCacheValid(handle, cachedName, cachedFSid, target, currentFSid string) bool {
-	return handle != "" && cachedName == target && cachedFSid == currentFSid
+	return handle != "" && sameSkill(cachedName, target) && cachedFSid == currentFSid
 }
 
-// extractSkillRecords mirrors the web client's cCSu7 decoder: the records are
-// nested one or more levels deep and the first record's first element is the
-// runtime handle.
+// extractSkillRecords mirrors the web client's cCSu7 decoder. Records can be
+// nested under wrapper arrays; scan sibling records instead of trusting only
+// the first entry so a malformed first record does not hide valid later ones.
 func extractSkillRecords(payload any) [][]any {
-	node := payload
-	for depth := 0; depth < 6; depth++ {
+	var walk func(any, int) [][]any
+	walk = func(node any, depth int) [][]any {
+		if depth > 6 {
+			return nil
+		}
 		arr, ok := node.([]any)
 		if !ok || len(arr) == 0 {
 			return nil
 		}
-		first, ok := arr[0].([]any)
-		if !ok || len(first) == 0 {
-			return nil
-		}
-		if handle, ok := first[0].(string); ok && skillHandleRe.MatchString(handle) {
-			out := make([][]any, 0, len(arr))
-			for _, item := range arr {
-				rec, ok := item.([]any)
-				if !ok || len(rec) == 0 {
-					continue
-				}
-				if _, ok := rec[0].(string); ok {
-					out = append(out, rec)
-				}
+		records := make([][]any, 0, len(arr))
+		for _, item := range arr {
+			rec, ok := item.([]any)
+			if !ok || len(rec) == 0 {
+				continue
 			}
-			return out
+			if isSkillHandle(rec[0]) {
+				records = append(records, rec)
+			}
 		}
-		node = first
+		if len(records) > 0 {
+			return records
+		}
+		for _, item := range arr {
+			if nested := walk(item, depth+1); len(nested) > 0 {
+				return nested
+			}
+		}
+		return nil
 	}
-	return nil
+	return walk(payload, 0)
 }
 
 func skillRecordMatches(rec []any, target string) bool {
@@ -1324,11 +1370,7 @@ func skillRecordMatches(rec []any, target string) bool {
 		if !ok {
 			continue
 		}
-		candidate := normalizeSkillName(raw)
-		if candidate == target {
-			return true
-		}
-		if skillAliases[candidate] && skillAliases[target] {
+		if sameSkill(raw, target) {
 			return true
 		}
 	}

@@ -38,6 +38,9 @@ func TestSkillCacheValidRequiresSameTargetAndPageSession(t *testing.T) {
 	if !skillCacheValid(handle, "伊珂丝", "fsid-1", "伊珂丝", "fsid-1") {
 		t.Fatal("expected a confirmed handle to survive an empty listing")
 	}
+	if !skillCacheValid(handle, "eksie", "fsid-1", "伊珂丝", "fsid-1") {
+		t.Fatal("a known alias must not invalidate a confirmed handle")
+	}
 	for _, tc := range []struct {
 		name    string
 		handle  string
@@ -47,7 +50,7 @@ func TestSkillCacheValidRequiresSameTargetAndPageSession(t *testing.T) {
 		current string
 	}{
 		{name: "missing handle", cached: "伊珂丝", fsid: "fsid-1", target: "伊珂丝", current: "fsid-1"},
-		{name: "different skill", handle: handle, cached: "eksie", fsid: "fsid-1", target: "伊珂丝", current: "fsid-1"},
+		{name: "different skill", handle: handle, cached: "other", fsid: "fsid-1", target: "伊珂丝", current: "fsid-1"},
 		{name: "page session changed", handle: handle, cached: "伊珂丝", fsid: "fsid-1", target: "伊珂丝", current: "fsid-2"},
 	} {
 		if skillCacheValid(tc.handle, tc.cached, tc.fsid, tc.target, tc.current) {
@@ -76,6 +79,23 @@ func TestExtractSkillRecordsAndMatch(t *testing.T) {
 	}
 	if skillRecordMatches(records[0], "missing") {
 		t.Fatal("unexpected match")
+	}
+}
+
+func TestExtractSkillRecordsSkipsMalformedFirstRecord(t *testing.T) {
+	handle := "0123456789abcdef0123456789abcdef"
+	payload := []any{
+		[]any{
+			[]any{"not-a-handle"},
+			[]any{handle, "伊珂丝"},
+		},
+	}
+	records := extractSkillRecords(payload)
+	if len(records) != 1 {
+		t.Fatalf("expected only the valid sibling record, got %#v", records)
+	}
+	if !skillRecordMatches(records[0], "伊珂丝") {
+		t.Fatal("expected the valid record after the malformed one to match")
 	}
 }
 
