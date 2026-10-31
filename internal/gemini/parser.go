@@ -961,10 +961,6 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 
 	grounding := extractGroundingSources(c)
 
-	if done {
-		text = AppendGeneratedMediaMarkdown(text, images, videos)
-	}
-
 	return Frame{
 		RCID:               rcid,
 		Text:               text,

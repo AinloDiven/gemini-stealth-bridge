@@ -625,7 +625,7 @@ func TestExtractStreamEnvelopesSingleArrayNoNewlines(t *testing.T) {
 	}
 }
 
-func TestParseCandidateSliceDefersMediaMarkdownUntilDoneAndPreservesPrefix(t *testing.T) {
+func TestParseCandidateSliceExposesStructuredMediaWithoutMarkdown(t *testing.T) {
 	imgItem := []any{
 		[]any{
 			nil, nil, nil,
@@ -672,7 +672,7 @@ func TestParseCandidateSliceDefersMediaMarkdownUntilDoneAndPreservesPrefix(t *te
 	if !strings.HasPrefix(f2.Text, f1.Text) {
 		t.Fatalf("expected final frame Text (%q) to have intermediate frame Text (%q) as strict prefix", f2.Text, f1.Text)
 	}
-	if !strings.Contains(f2.Text, "![Cyberpunk Cat](https://lh3.googleusercontent.com/gg-dl/test-cat-id=s0-d)") {
-		t.Fatalf("expected final frame Text to append image markdown, got %q", f2.Text)
+	if strings.Contains(f2.Text, "![Cyberpunk Cat]") {
+		t.Fatalf("decoder must expose media structurally, not append presentation markdown; got %q", f2.Text)
 	}
 }
