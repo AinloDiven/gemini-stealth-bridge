@@ -1463,8 +1463,46 @@ func skipInlineLinkSpan(s string, i int) int {
 	return -1
 }
 
+func skipClockBracket(s string, i int) int {
+	if i >= len(s) || s[i] != '[' {
+		return -1
+	}
+	colons, digits := 0, 0
+	for j := i + 1; j < len(s); j++ {
+		switch c := s[j]; {
+		case c >= '0' && c <= '9':
+			digits++
+		case c == ':':
+			if digits == 0 {
+				return -1
+			}
+			colons++
+			digits = 0
+		case c == ']':
+			if colons == 0 || digits == 0 {
+				return -1
+			}
+			return j + 1
+		default:
+			return -1
+		}
+	}
+	return -1
+}
+
+func skipStrippedClockSpan(s string, i int, nextFull byte, hasNextFull bool) int {
+	if i < len(s) && s[i] == ' ' {
+		return skipClockBracket(s, i+1)
+	}
+	end := skipClockBracket(s, i)
+	if end > i && end < len(s) && s[end] == ' ' && (!hasNextFull || nextFull != ' ') {
+		return end + 1
+	}
+	return end
+}
+
 func matchStreamPrefixWithLinkRewrites(full, sent string) (string, bool) {
-	if !strings.Contains(full, "[") {
+	if !strings.Contains(full, "[") && !strings.Contains(sent, "[") {
 		return "", false
 	}
 	fi, si := 0, 0
@@ -1480,11 +1518,25 @@ func matchStreamPrefixWithLinkRewrites(full, sent string) (string, bool) {
 				continue
 			}
 		}
-		if full[fi] != sent[si] {
-			return "", false
+		if full[fi] == sent[si] {
+			fi++
+			si++
+			continue
 		}
-		fi++
-		si++
+		if sNext := skipStrippedClockSpan(sent, si, full[fi], true); sNext > si {
+			si = sNext
+			matched = true
+			continue
+		}
+		return "", false
+	}
+	for si < len(sent) {
+		sNext := skipStrippedClockSpan(sent, si, 0, false)
+		if sNext <= si {
+			break
+		}
+		si = sNext
+		matched = true
 	}
 	if !matched || si < len(sent) {
 		return "", false
