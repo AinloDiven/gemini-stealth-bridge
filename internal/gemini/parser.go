@@ -154,7 +154,9 @@ var (
 	hex16Re                       = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
 	googleUserContentRe           = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
 	imageSizeSuffixRe             = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
-	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)https?://googleusercontent\.com/(?:image_generation_content|generated_video_content)/\S*`)
+	googleCardContentRe           = regexp.MustCompile(`(?i)^https?://googleusercontent\.com/card_content/\d+`)
+	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)[ \t]*\r?\n*https?://googleusercontent\.com/\w+/\S*`)
+	trailingAutoLinkRe            = regexp.MustCompile(`(?i)\[https?://[^\]\s]+\]\(https?://[^\)\s]+\)$`)
 	closedThinkBlockRe            = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
 	codeEventBlockRe              = regexp.MustCompile("(?is)```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+\\s*([\\s\\S]*?)```\\s*")
 	openThinkStartRe              = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
@@ -931,6 +933,13 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 			text, _ = tArr[0].(string)
 		}
 	}
+	if googleCardContentRe.MatchString(strings.TrimSpace(text)) {
+		if altArr, ok := jspbField(c, 22).([]any); ok && len(altArr) > 0 {
+			if altText, _ := altArr[0].(string); altText != "" {
+				text = altText
+			}
+		}
+	}
 	if googleGenContentPlaceholderRe.MatchString(text) {
 		text = strings.TrimSpace(googleGenContentPlaceholderRe.ReplaceAllString(text, ""))
 	}
@@ -948,6 +957,12 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 			if f, ok := stArr[0].(float64); ok && int(f) == 2 {
 				done = true
 			}
+		}
+	}
+
+	if !done && strings.HasSuffix(text, ")") {
+		if loc := trailingAutoLinkRe.FindStringIndex(text); len(loc) == 2 {
+			text = text[:loc[0]]
 		}
 	}
 
@@ -1062,10 +1077,22 @@ func parseActionStatus(frame []any) *ActionStatus {
 	if out.BranchTitle == "" {
 		out.BranchTitle = firstActionString(jspbField(mirror, 0))
 	}
+	out.StatusTemplate = interpolateToolNamePlaceholder(out.StatusTemplate, out.ToolTitle)
+	out.BranchTitle = interpolateToolNamePlaceholder(out.BranchTitle, out.ToolTitle)
+	if strings.Contains(out.ThinkingTitle, "{tool_logo_placeholder}") || strings.Contains(out.ThinkingTitle, "{tool_name_placeholder}") {
+		out.ThinkingTitle = ""
+	}
 	if out.ThinkingTitle == "" && out.ToolID == "" && out.ToolTitle == "" && out.StatusTemplate == "" && out.BranchTitle == "" {
 		return nil
 	}
 	return out
+}
+
+func interpolateToolNamePlaceholder(s, toolTitle string) string {
+	if !strings.Contains(s, "{tool_name_placeholder}") {
+		return s
+	}
+	return strings.TrimSpace(strings.ReplaceAll(s, "{tool_name_placeholder}", strings.TrimSpace(toolTitle)))
 }
 
 func actionArray(frame []any, slot, field int) []any {

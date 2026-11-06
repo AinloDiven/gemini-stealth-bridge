@@ -101,3 +101,59 @@ func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 		}
 	}
 }
+
+// TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision verifies
+// that when Gemini Web streams >240 bytes containing plain [00:00:16] timestamps
+// and retroactively rewrites them into [[00:16](https://www.youtube.com/watch?v=...)]
+// on the final frame (done=true), the stream completes cleanly without emitting an
+// upstream_revision error frame after the reply.
+func TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	padding := strings.Repeat("这是一段关于视频内容的详细解析文字。", 10)
+	streamingText := padding + "\n* **核心概念** [00:00:16]：打破传统固定思维。\n* **扩展模式** [00:01:29]：支持双人同打。"
+	finalText := padding + "\n* **核心概念** [[00:16](https://www.youtube.com/watch?v=DAn34l_YrUM&t=16)]：打破传统固定思维。\n* **扩展模式** [[01:29](https://www.youtube.com/watch?v=DAn34l_YrUM&t=89)]：支持双人同打。\n✅ 验证完毕。"
+
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r",
+			Action: &gemini.ActionStatus{
+				ToolID:         "youtube_tool",
+				ToolTitle:      "YouTube",
+				StatusTemplate: "正在连接 {tool_logo_placeholder} {tool_name_placeholder}",
+			},
+		}); err != nil {
+			return nil, err
+		}
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Frames: []gemini.Frame{makeFrame(streamingText, "", false, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Frames: []gemini.Frame{makeFrame(finalText, "", true, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
+	}}
+
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
+	body := rec.Body.String()
+
+	if strings.Contains(body, "upstream_revision") || strings.Contains(body, `"error"`) {
+		t.Fatalf("unexpected error in SSE stream after YouTube timestamp linkification:\n%s", body)
+	}
+	for _, want := range []string{
+		`"provider":"youtube_tool"`,
+		`"status_template":"正在连接 {tool_logo_placeholder} YouTube"`,
+		`✅ 验证完毕。`,
+		`data: [DONE]`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected SSE body to contain %s, got:\n%s", want, body)
+		}
+	}
+}
+

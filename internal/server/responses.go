@@ -956,15 +956,18 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					}
 
 					if stream && !buffered && ctx.Err() == nil {
-						if !strings.HasPrefix(text, sentText) || (s.Cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
+						tail, textOK := remainingStreamTail(text, sentText)
+						if !textOK || (s.Cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
 							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 						}
 						if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) {
 							emitReasoningDelta(thoughts[len(sentThought):])
 							sentThought = thoughts
 						}
-						if len(text) > len(sentText) {
-							emitTextDelta(text[len(sentText):])
+						if tail != "" {
+							emitTextDelta(tail)
+							sentText = text
+						} else if text != sentText {
 							sentText = text
 						}
 					} else if stream && buffered && ctx.Err() == nil && !done {
