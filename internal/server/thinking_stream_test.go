@@ -156,3 +156,52 @@ func TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision(t *te
 	}
 }
 
+// TestStreamTimestampStrippingDoesNotTriggerUpstreamRevision verifies that when
+// Gemini Web streams unlinked clock timestamps (e.g. " [00:00:30]") and strips
+// them on the final frame (done=true) because no video metadata is attached to
+// the turn, the stream completes cleanly without upstream_revision.
+func TestStreamTimestampStrippingDoesNotTriggerUpstreamRevision(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	padding := strings.Repeat("从医学和生理学角度来说，适度清理确实能让人身心放松、缓解压力。", 5)
+	streamingText := padding + "甚至对健康有一定的好处 [00:00:30]，完全属于正常需求。但如果在纯粹浪费体力了的说 [00:02:11]！"
+	finalText := padding + "甚至对健康有一定的好处，完全属于正常需求。但如果在纯粹浪费体力了的说！\n\n总之全凭个人习惯。"
+
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Frames: []gemini.Frame{makeFrame(streamingText, "", false, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Frames: []gemini.Frame{makeFrame(finalText, "", true, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
+	}}
+
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
+	body := rec.Body.String()
+
+	if strings.Contains(body, "upstream_revision") || strings.Contains(body, `"error"`) {
+		t.Fatalf("unexpected error in SSE stream after timestamp stripping:\n%s", body)
+	}
+	if !strings.Contains(body, "总之全凭个人习惯。") || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected final tail and stream terminator, got:\n%s", body)
+	}
+
+	if tail, ok := remainingStreamTail("This has benefits for health.", "This has benefits [00:00:30] for"); !ok || tail != " health." {
+		t.Fatalf("expected English stripped timestamp tail ' health.', got ok=%v tail=%q", ok, tail)
+	}
+	if tail, ok := remainingStreamTail("好处", "好处 [00:00:30]"); !ok || tail != "" {
+		t.Fatalf("expected trailing stripped timestamp to match with empty tail, got ok=%v tail=%q", ok, tail)
+	}
+	if hasCompatibleStreamPrefix("好处，完全不同", "好处 [1]，完全不同") {
+		t.Fatalf("non-clock bracket [1] should not be treated as stripped timestamp")
+	}
+	if hasCompatibleStreamPrefix("好处，其实不然", "好处 [00:00:30]，完全不同") {
+		t.Fatalf("genuine text revision must still be rejected")
+	}
+}
