@@ -62,3 +62,62 @@ func TestParseActionStatusMirrorSlot(t *testing.T) {
 		t.Fatalf("expected mirrored thinking title, got %+v", res.Action)
 	}
 }
+
+func TestParseActionStatusYouTubeInterpolatesToolNameAndDropsOrphanTemplate(t *testing.T) {
+	res := parseActionFromFrame(t, []any{
+		nil,
+		[]any{"c_1", "r_1"},
+		map[string]any{"7": []any{
+			nil,
+			[]any{"youtube_tool", []any{nil, nil, "YouTube", "https://www.gstatic.com/images/branding/productlogos/youtube/v9/192px.svg", nil, "正在连接 {tool_logo_placeholder} {tool_name_placeholder}"}, float64(1)},
+		}},
+	})
+	if res.Action == nil {
+		t.Fatal("expected action card for youtube_tool")
+	}
+	if res.Action.ToolID != "youtube_tool" || res.Action.ToolTitle != "YouTube" || res.Action.StatusTemplate != "正在连接 {tool_logo_placeholder} YouTube" {
+		t.Fatalf("unexpected youtube_tool action card: %+v", res.Action)
+	}
+
+	// Subsequent orphan completion template in slot 5 without a tool array must be ignored
+	// so it never clobbers pending tool cards or leaks raw brace placeholders.
+	orphan := parseActionFromFrame(t, []any{
+		nil,
+		[]any{"c_1", "r_1"},
+		map[string]any{"7": []any{nil, nil, nil, nil, nil, []any{"已连接到 {tool_logo_placeholder} {tool_name_placeholder}"}}},
+	})
+	if orphan.Action != nil {
+		t.Fatalf("expected nil Action for orphan tool placeholder template in slot 5, got %+v", orphan.Action)
+	}
+}
+
+func TestParseCandidateSliceStripsYouTubeArtifactAndHoldsTrailingAutoLink(t *testing.T) {
+	cStreaming := []any{
+		"rc_yt",
+		[]any{"视频链接：\n[http://www.youtube.com/watch?v=DAn34l](http://www.youtube.com/watch?v=DAn34l)"},
+		nil, nil, nil, nil, nil, nil,
+		[]any{float64(1)},
+	}
+	f1, ok := parseCandidateSlice(cStreaming, "id1", "Flash")
+	if !ok {
+		t.Fatal("expected parseCandidateSlice f1 ok")
+	}
+	if f1.Text != "视频链接：\n" {
+		t.Fatalf("expected incomplete trailing auto-link held back while streaming, got %q", f1.Text)
+	}
+
+	cDone := []any{
+		"rc_yt",
+		[]any{"视频链接：\n[http://www.youtube.com/watch?v=DAn34l_YrUM](http://www.youtube.com/watch?v=DAn34l_YrUM)\nhttp://googleusercontent.com/youtube_content/1"},
+		nil, nil, nil, nil, nil, nil,
+		[]any{float64(2)},
+	}
+	f2, ok := parseCandidateSlice(cDone, "id1", "Flash")
+	if !ok {
+		t.Fatal("expected parseCandidateSlice f2 ok")
+	}
+	want := "视频链接：\n[http://www.youtube.com/watch?v=DAn34l_YrUM](http://www.youtube.com/watch?v=DAn34l_YrUM)"
+	if f2.Text != want {
+		t.Fatalf("expected youtube_content placeholder stripped and final link preserved, got %q, want %q", f2.Text, want)
+	}
+}
