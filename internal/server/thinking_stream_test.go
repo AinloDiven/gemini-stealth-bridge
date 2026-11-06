@@ -110,8 +110,8 @@ func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 func TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
 	padding := strings.Repeat("这是一段关于视频内容的详细解析文字。", 10)
-	streamingText := padding + "\n* **核心概念** [00:00:16]：打破传统固定思维。\n* **扩展模式** [00:01:29]：支持双人同打。"
-	finalText := padding + "\n* **核心概念** [[00:16](https://www.youtube.com/watch?v=DAn34l_YrUM&t=16)]：打破传统固定思维。\n* **扩展模式** [[01:29](https://www.youtube.com/watch?v=DAn34l_YrUM&t=89)]：支持双人同打。\n✅ 验证完毕。"
+	streamingText := padding + "\n* **核心概念** [00:00:16]：打破传统固定思维。\n* **扩展模式** [00:02:26]：支持双人同打。\n\n👉 **视频链接**：[[https://www.youtube](https://www.youtube)."
+	finalText := padding + "\n* **核心概念** [[00:16](https://www.youtube.com/watch?v=SntsJWcCEhs&t=16)]：打破传统固定思维。\n* **扩展模式** [[02:26](https://www.youtube.com/watch?v=SntsJWcCEhs&t=146)]：支持双人同打。\n\n👉 **视频链接**：[https://www.youtube.com/watch?v=SntsJWcCEhs](https://www.youtube.com/watch?v=SntsJWcCEhs)"
 
 	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
 		if err := onFrame(&gemini.LineParseResult{
@@ -148,7 +148,6 @@ func TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision(t *te
 	for _, want := range []string{
 		`"provider":"youtube_tool"`,
 		`"status_template":"正在连接 {tool_logo_placeholder} YouTube"`,
-		`✅ 验证完毕。`,
 		`data: [DONE]`,
 	} {
 		if !strings.Contains(body, want) {

@@ -410,7 +410,7 @@ The binding lives in `$BRIDGE_HOME/session-bindings.json`;
 empty `model` uses `BRIDGE_DEFAULT_MODEL` when configured. A fixed cloud Skill
 can be set with `BRIDGE_SKILL` (per-key `BRIDGE_SKILL_PER_KEY`, or `"skill"` in
 the account file); gsb resolves the `cCSu7` runtime handle, writes
-StreamGenerate slot 81, and prepends the `/skill` command at byte 0 of each
+StreamGenerate slot 81, and prepends the `@skill` mention at byte 0 of each
 turn's prompt. See [`docs/PARITY_FEATURES.md`](docs/PARITY_FEATURES.md).
 
 Streaming also carries additive frames: `x_gemini_reasoning`
@@ -797,7 +797,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 |---|---|---|
 | `BRIDGE_DEFAULT_THINKING` | `low` | `low`, `medium`, `high` |
 | `BRIDGE_DEFAULT_MODEL` | empty | Model used when the request omits `model`; runtime-switchable with `PATCH /v1/admin/config` and `persist` |
-| `BRIDGE_SKILL` | empty | Fixed cloud Skill slash command; arms slot 81 |
+| `BRIDGE_SKILL` | empty | Fixed cloud Skill `@` mention; arms slot 81 |
 | `BRIDGE_SKILL_PER_KEY` | empty | `token:skill` overrides |
 | `BRIDGE_SESSION_BINDING_TTL_MS` | `86400000` | `X-GSB-Session` binding TTL |
 | `BRIDGE_SESSION_BINDING_MAX` | `1024` | Maximum live explicit bindings |

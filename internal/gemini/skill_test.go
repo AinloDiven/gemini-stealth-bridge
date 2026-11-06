@@ -74,6 +74,9 @@ func TestExtractSkillRecordsAndMatch(t *testing.T) {
 	if !skillRecordMatches(records[0], "伊珂丝") {
 		t.Fatal("expected name match")
 	}
+	if !skillRecordMatches(records[0], normalizeSkillName("@伊珂丝")) {
+		t.Fatal("expected @-prefixed name match")
+	}
 	if !skillRecordMatches(records[0], "eksie") {
 		t.Fatal("expected alias match")
 	}
@@ -102,13 +105,13 @@ func TestExtractSkillRecordsSkipsMalformedFirstRecord(t *testing.T) {
 func TestPersistStateKeepsAccountSkill(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "account.json")
 	ac := NewAccountClient("acct", "SID=value", path, nil, nil)
-	ac.skill = "/伊珂丝"
+	ac.skill = "@伊珂丝"
 	ac.persistState()
 	rec, _, err := cookies.LoadAccountFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rec.Skill != "/伊珂丝" {
+	if rec.Skill != "@伊珂丝" {
 		t.Fatalf("expected account skill to survive cookie rotation, got %q", rec.Skill)
 	}
 }

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -758,11 +757,13 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 						canStreamText := identityVerified
 						if canStreamText {
-							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
-								startStream(false)
-								emit(sseDeltaContent{Content: text[len(sentText):]}, nil, nil)
-								sentText = text
-								lastActiveKeepaliveAt = time.Now()
+							if !hasTools && len(text) > 240 && gemini.GeminiErrorReply(text) == "" {
+								if tail, ok := remainingStreamTail(text, sentText); ok && tail != "" {
+									startStream(false)
+									emit(sseDeltaContent{Content: tail}, nil, nil)
+									sentText = text
+									lastActiveKeepaliveAt = time.Now()
+								}
 							} else if hasTools && !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
 								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
 									startStream(false)
@@ -1458,52 +1459,54 @@ func (s *Server) evaluateAttemptCompletion(
 	return interpreted, nil
 }
 
-var (
-	youtubeTimestampLinkPrefixRe  = regexp.MustCompile(`(?i)^\[\[(\d{1,2}:\d{2}(?::\d{2})?)\]\(https?://(?:[a-z0-9-]+\.)*(?:youtube\.com|youtu\.be)/[^\)\s]*\)\]`)
-	plainBracketTimestampPrefixRe = regexp.MustCompile(`^\[(\d{1,2}:\d{2}(?::\d{2})?)\]`)
-)
-
-func parseClockTimestampSeconds(ts string) (int, bool) {
-	parts := strings.Split(ts, ":")
-	if len(parts) != 2 && len(parts) != 3 {
-		return 0, false
+func skipInlineLinkSpan(s string, i int) int {
+	if i >= len(s) || s[i] != '[' {
+		return -1
 	}
-	total := 0
-	for _, p := range parts {
-		if p == "" || len(p) > 2 {
-			return 0, false
+	depth := 0
+	for j := i; j < len(s) && s[j] != '\n' && s[j] != '\r'; j++ {
+		switch s[j] {
+		case '[':
+			depth++
+		case ']':
+			depth--
+			if j+1 < len(s) && s[j+1] == '(' {
+				end := strings.IndexByte(s[j+2:], ')')
+				if end < 0 || strings.ContainsAny(s[j+2:j+2+end], " \t\r\n") {
+					return -1
+				}
+				j += 2 + end
+				if depth > 0 && j+1 < len(s) && s[j+1] == ']' {
+					j++
+					depth--
+				}
+			}
+			if depth == 0 {
+				return j + 1
+			}
+			if depth == 1 && j+1 <= len(s) && strings.TrimRight(s[j+1:], ".)]") == "" {
+				return len(s)
+			}
 		}
-		v, err := strconv.Atoi(p)
-		if err != nil || v < 0 {
-			return 0, false
-		}
-		total = total*60 + v
 	}
-	return total, true
+	return -1
 }
 
-// matchStreamPrefixWithTimestampLinks aligns a final frame where Gemini Web's
-// YouTube extension post-processor retroactively converted inline [HH:MM:SS]
-// timestamps into [[MM:SS](https://www.youtube.com/watch?v=...&t=...)] links.
-func matchStreamPrefixWithTimestampLinks(full, sent string) (string, bool) {
-	if !strings.Contains(full, "[[") {
+func matchStreamPrefixWithLinkRewrites(full, sent string) (string, bool) {
+	if !strings.Contains(full, "[") {
 		return "", false
 	}
 	fi, si := 0, 0
-	matchedLink := false
+	matched := false
 	for si < len(sent) && fi < len(full) {
-		if full[fi] == '[' && sent[si] == '[' && fi+1 < len(full) && full[fi+1] == '[' {
-			if linkMatch := youtubeTimestampLinkPrefixRe.FindStringSubmatch(full[fi:]); len(linkMatch) == 2 {
-				if plainMatch := plainBracketTimestampPrefixRe.FindStringSubmatch(sent[si:]); len(plainMatch) == 2 {
-					secFull, ok1 := parseClockTimestampSeconds(linkMatch[1])
-					secSent, ok2 := parseClockTimestampSeconds(plainMatch[1])
-					if ok1 && ok2 && secFull == secSent {
-						fi += len(linkMatch[0])
-						si += len(plainMatch[0])
-						matchedLink = true
-						continue
-					}
-				}
+		if full[fi] == '[' && sent[si] == '[' {
+			fNext := skipInlineLinkSpan(full, fi)
+			sNext := skipInlineLinkSpan(sent, si)
+			if fNext > fi && sNext > si {
+				fi = fNext
+				si = sNext
+				matched = true
+				continue
 			}
 		}
 		if full[fi] != sent[si] {
@@ -1512,7 +1515,7 @@ func matchStreamPrefixWithTimestampLinks(full, sent string) (string, bool) {
 		fi++
 		si++
 	}
-	if !matchedLink || si < len(sent) {
+	if !matched || si < len(sent) {
 		return "", false
 	}
 	return full[fi:], true
@@ -1525,7 +1528,7 @@ func remainingStreamTail(full, sent string) (string, bool) {
 	if strings.HasPrefix(full, sent) {
 		return full[len(sent):], true
 	}
-	if tail, ok := matchStreamPrefixWithTimestampLinks(full, sent); ok {
+	if tail, ok := matchStreamPrefixWithLinkRewrites(full, sent); ok {
 		return tail, true
 	}
 	fullTrimLeft := strings.TrimLeft(full, " \t\r\n")
@@ -1533,7 +1536,7 @@ func remainingStreamTail(full, sent string) (string, bool) {
 	if strings.HasPrefix(fullTrimLeft, sentTrimLeft) {
 		return fullTrimLeft[len(sentTrimLeft):], true
 	}
-	if tail, ok := matchStreamPrefixWithTimestampLinks(fullTrimLeft, sentTrimLeft); ok {
+	if tail, ok := matchStreamPrefixWithLinkRewrites(fullTrimLeft, sentTrimLeft); ok {
 		return tail, true
 	}
 	fullTrimBoth := strings.TrimRight(fullTrimLeft, " \t\r\n")
@@ -1541,7 +1544,7 @@ func remainingStreamTail(full, sent string) (string, bool) {
 	if fullTrimBoth != "" && fullTrimBoth == sentTrimBoth {
 		return "", true
 	}
-	if tail, ok := matchStreamPrefixWithTimestampLinks(fullTrimBoth, sentTrimBoth); ok && strings.TrimSpace(tail) == "" {
+	if tail, ok := matchStreamPrefixWithLinkRewrites(fullTrimBoth, sentTrimBoth); ok && strings.TrimSpace(tail) == "" {
 		return "", true
 	}
 	return "", false

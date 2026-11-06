@@ -1299,7 +1299,7 @@ func isSkillHandle(value any) bool {
 }
 
 func normalizeSkillName(name string) string {
-	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "/")))
+	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "@")))
 }
 
 // sameSkill compares configured names after normalization and treats the known

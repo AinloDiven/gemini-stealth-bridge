@@ -855,7 +855,7 @@ The binding survives restarts under `$BRIDGE_HOME/session-bindings.json`; see
 
 A fixed cloud Skill can be configured with `BRIDGE_SKILL` (or per account/key);
 when present, gsb resolves the server handle, arms StreamGenerate slot 81, and
-puts the same `/skill` prefix at byte 0 of the per-turn prompt.
+puts the same `@skill` prefix at byte 0 of the per-turn prompt.
 
 Message content can be a string or an array of parts. Supported image shapes:
 
@@ -1296,7 +1296,7 @@ An unknown value falls back to `chrome_150_psk`. User-Agent and `Sec-CH-UA*` ver
 |---|---|---|
 | `BRIDGE_DEFAULT_THINKING` | `low` | Effort applied when a request sends none: `low`, `medium`, `high` |
 | `BRIDGE_DEFAULT_MODEL` | Empty | Model used when a request omits `model`; switchable at runtime via `PATCH /v1/admin/config` `{"defaultModel":…,"persist":true}` |
-| `BRIDGE_SKILL` | Empty | Fixed cloud Skill slash command (for example `/伊珂丝`); arms StreamGenerate slot 81 |
+| `BRIDGE_SKILL` | Empty | Fixed cloud Skill `@` mention (for example `@伊珂丝`); arms StreamGenerate slot 81 |
 | `BRIDGE_SKILL_PER_KEY` | Empty | `token:skill` overrides for `BRIDGE_SKILL` |
 | `BRIDGE_SESSION_BINDING_TTL_MS` | `86400000` | Lifetime of an explicit `X-GSB-Session` binding |
 | `BRIDGE_SESSION_BINDING_MAX` | `1024` | Maximum live explicit session bindings |
