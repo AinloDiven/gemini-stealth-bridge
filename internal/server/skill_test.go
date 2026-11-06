@@ -22,14 +22,14 @@ func (m *skillUpstream) BindSkillRuntime(ctx context.Context, name string) (stri
 
 func TestFormatSkillPromptIsIdempotentAndKeepsByteZero(t *testing.T) {
 	cases := []struct{ text, want string }{
-		{"hi", "/伊珂丝 hi"},
-		{"/伊珂丝 hi", "/伊珂丝 hi"},
-		{"/伊珂丝\nhi", "/伊珂丝\nhi"},
-		{"/伊珂丝hi", "/伊珂丝 hi"},
-		{"/伊珂丝", "/伊珂丝"},
-		{"", "/伊珂丝"},
-		{"【用户消息】\nhi", "/伊珂丝 【用户消息】\nhi"},
-		{"<|im_start|>user\nhi", "/伊珂丝 <|im_start|>user\nhi"},
+		{"hi", "@伊珂丝 hi"},
+		{"@伊珂丝 hi", "@伊珂丝 hi"},
+		{"@伊珂丝\nhi", "@伊珂丝\nhi"},
+		{"@伊珂丝hi", "@伊珂丝 hi"},
+		{"@伊珂丝", "@伊珂丝"},
+		{"", "@伊珂丝"},
+		{"【用户消息】\nhi", "@伊珂丝 【用户消息】\nhi"},
+		{"<|im_start|>user\nhi", "@伊珂丝 <|im_start|>user\nhi"},
 	}
 	for _, tc := range cases {
 		if got := formatSkillPrompt(tc.text, "伊珂丝"); got != tc.want {
@@ -61,7 +61,7 @@ func TestSkillTargetForPrecedence(t *testing.T) {
 
 func TestSkillBindingArmsSlotAndPrefixesPrompt(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.Skill = "/伊珂丝"
+	srv.Cfg.Skill = "@伊珂丝"
 	var prompt, handle string
 	base := &mockUpstream{streamFn: func(ctx context.Context, p string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
 		prompt, handle = p, opts.SkillRuntime
@@ -76,17 +76,17 @@ func TestSkillBindingArmsSlotAndPrefixesPrompt(t *testing.T) {
 	if rec := runChat(t, srv, acct, sm, nil); rec.Code != 200 {
 		t.Fatalf("skill turn failed: %d %s", rec.Code, rec.Body.String())
 	}
-	if sm.name != "/伊珂丝" || handle != sm.handle {
-		t.Fatalf("expected skill %q handle %q, got name=%q handle=%q", "/伊珂丝", sm.handle, sm.name, handle)
+	if sm.name != "@伊珂丝" || handle != sm.handle {
+		t.Fatalf("expected skill %q handle %q, got name=%q handle=%q", "@伊珂丝", sm.handle, sm.name, handle)
 	}
-	if !strings.HasPrefix(prompt, "/伊珂丝 synthetic") {
+	if !strings.HasPrefix(prompt, "@伊珂丝 synthetic") {
 		t.Fatalf("expected skill prefix at byte 0, got %q", prompt)
 	}
 }
 
 func TestSkillBindingFailureDoesNotFailTurn(t *testing.T) {
 	srv, acct := newTestHarness(false, false)
-	srv.Cfg.Skill = "/伊珂丝"
+	srv.Cfg.Skill = "@伊珂丝"
 	var prompt, handle string
 	base := &mockUpstream{streamFn: func(ctx context.Context, p string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
 		prompt, handle = p, opts.SkillRuntime
@@ -104,7 +104,7 @@ func TestSkillBindingFailureDoesNotFailTurn(t *testing.T) {
 	if handle != "" {
 		t.Fatalf("failed skill binding must leave slot 81 empty, got %q", handle)
 	}
-	if prompt != "/伊珂丝 synthetic" {
+	if prompt != "@伊珂丝 synthetic" {
 		t.Fatalf("failed slot must keep the configured text projection, got %q", prompt)
 	}
 }

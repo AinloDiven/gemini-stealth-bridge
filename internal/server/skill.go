@@ -28,8 +28,8 @@ func normalizeSkillCommand(skill string) string {
 	if cmd == "" {
 		return ""
 	}
-	if !strings.HasPrefix(cmd, "/") {
-		cmd = "/" + cmd
+	if !strings.HasPrefix(cmd, "@") {
+		cmd = "@" + cmd
 	}
 	return cmd
 }

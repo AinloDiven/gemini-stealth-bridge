@@ -996,9 +996,11 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						}
 						canStreamText := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if canStreamText {
-							if !hasTools && strings.HasPrefix(text, sentText) && len(text) > 240 && len(text) > len(sentText) && gemini.GeminiErrorReply(text) == "" {
-								emitTextDelta(text[len(sentText):])
-								sentText = text
+							if !hasTools && len(text) > 240 && gemini.GeminiErrorReply(text) == "" {
+								if tail, ok := remainingStreamTail(text, sentText); ok && tail != "" {
+									emitTextDelta(tail)
+									sentText = text
+								}
 							} else if hasTools && !mediaToolUsed && len(text) > 240 {
 								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
 									emitTextDelta(safePrefix[len(sentText):])

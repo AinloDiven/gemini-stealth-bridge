@@ -154,9 +154,7 @@ var (
 	hex16Re                       = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
 	googleUserContentRe           = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
 	imageSizeSuffixRe             = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
-	googleCardContentRe           = regexp.MustCompile(`(?i)^https?://googleusercontent\.com/card_content/\d+`)
-	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)[ \t]*\r?\n*https?://googleusercontent\.com/\w+/\S*`)
-	trailingAutoLinkRe            = regexp.MustCompile(`(?i)\[https?://[^\]\s]+\]\(https?://[^\)\s]+\)$`)
+	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)[ \t]*\r?\n*https?://googleusercontent\.com/(?:image_generation_content|generated_video_content|youtube_content|map_content)/\S*`)
 	closedThinkBlockRe            = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
 	codeEventBlockRe              = regexp.MustCompile("(?is)```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+\\s*([\\s\\S]*?)```\\s*")
 	openThinkStartRe              = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
@@ -933,13 +931,6 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 			text, _ = tArr[0].(string)
 		}
 	}
-	if googleCardContentRe.MatchString(strings.TrimSpace(text)) {
-		if altArr, ok := jspbField(c, 22).([]any); ok && len(altArr) > 0 {
-			if altText, _ := altArr[0].(string); altText != "" {
-				text = altText
-			}
-		}
-	}
 	if googleGenContentPlaceholderRe.MatchString(text) {
 		text = strings.TrimSpace(googleGenContentPlaceholderRe.ReplaceAllString(text, ""))
 	}
@@ -960,10 +951,8 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		}
 	}
 
-	if !done && strings.HasSuffix(text, ")") {
-		if loc := trailingAutoLinkRe.FindStringIndex(text); len(loc) == 2 {
-			text = text[:loc[0]]
-		}
+	if !done {
+		text = trimIncompleteTrailingURL(text)
 	}
 
 	images := extractGeneratedImages(c)
@@ -1093,6 +1082,17 @@ func interpolateToolNamePlaceholder(s, toolTitle string) string {
 		return s
 	}
 	return strings.TrimSpace(strings.ReplaceAll(s, "{tool_name_placeholder}", strings.TrimSpace(toolTitle)))
+}
+
+func trimIncompleteTrailingURL(text string) string {
+	i := len(text)
+	for i > 0 && text[i-1] >= 0x21 && text[i-1] <= 0x7e {
+		i--
+	}
+	if tail := text[i:]; strings.Contains(tail, "http://") || strings.Contains(tail, "https://") {
+		return text[:i]
+	}
+	return text
 }
 
 func actionArray(frame []any, slot, field int) []any {

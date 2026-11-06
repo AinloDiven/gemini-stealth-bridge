@@ -94,7 +94,7 @@ func TestParseActionStatusYouTubeInterpolatesToolNameAndDropsOrphanTemplate(t *t
 func TestParseCandidateSliceStripsYouTubeArtifactAndHoldsTrailingAutoLink(t *testing.T) {
 	cStreaming := []any{
 		"rc_yt",
-		[]any{"视频链接：\n[http://www.youtube.com/watch?v=DAn34l](http://www.youtube.com/watch?v=DAn34l)"},
+		[]any{"👉 **视频链接**：[[https://www.youtube](https://www.youtube)."},
 		nil, nil, nil, nil, nil, nil,
 		[]any{float64(1)},
 	}
@@ -102,13 +102,13 @@ func TestParseCandidateSliceStripsYouTubeArtifactAndHoldsTrailingAutoLink(t *tes
 	if !ok {
 		t.Fatal("expected parseCandidateSlice f1 ok")
 	}
-	if f1.Text != "视频链接：\n" {
+	if f1.Text != "👉 **视频链接**：" {
 		t.Fatalf("expected incomplete trailing auto-link held back while streaming, got %q", f1.Text)
 	}
 
 	cDone := []any{
 		"rc_yt",
-		[]any{"视频链接：\n[http://www.youtube.com/watch?v=DAn34l_YrUM](http://www.youtube.com/watch?v=DAn34l_YrUM)\nhttp://googleusercontent.com/youtube_content/1"},
+		[]any{"👉 **视频链接**：[https://www.youtube.com/watch?v=SntsJWcCEhs](https://www.youtube.com/watch?v=SntsJWcCEhs)\nhttp://googleusercontent.com/youtube_content/1"},
 		nil, nil, nil, nil, nil, nil,
 		[]any{float64(2)},
 	}
@@ -116,7 +116,7 @@ func TestParseCandidateSliceStripsYouTubeArtifactAndHoldsTrailingAutoLink(t *tes
 	if !ok {
 		t.Fatal("expected parseCandidateSlice f2 ok")
 	}
-	want := "视频链接：\n[http://www.youtube.com/watch?v=DAn34l_YrUM](http://www.youtube.com/watch?v=DAn34l_YrUM)"
+	want := "👉 **视频链接**：[https://www.youtube.com/watch?v=SntsJWcCEhs](https://www.youtube.com/watch?v=SntsJWcCEhs)"
 	if f2.Text != want {
 		t.Fatalf("expected youtube_content placeholder stripped and final link preserved, got %q, want %q", f2.Text, want)
 	}

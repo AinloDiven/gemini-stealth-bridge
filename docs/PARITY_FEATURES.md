@@ -51,9 +51,9 @@ Configure a Gemini cloud Skill once instead of sending it on every request:
 
 | Setting | Scope | Example |
 |---|---|---|
-| `BRIDGE_SKILL` | Global default | `BRIDGE_SKILL=/伊珂丝` |
-| `BRIDGE_SKILL_PER_KEY` | API key override | `BRIDGE_SKILL_PER_KEY="bot-key:/伊珂丝"` |
-| `"skill"` in `accounts/<id>.json` | Account override | `"skill": "/伊珂丝"` |
+| `BRIDGE_SKILL` | Global default | `BRIDGE_SKILL=@伊珂丝` |
+| `BRIDGE_SKILL_PER_KEY` | API key override | `BRIDGE_SKILL_PER_KEY="bot-key:@伊珂丝"` |
+| `"skill"` in `accounts/<id>.json` | Account override | `"skill": "@伊珂丝"` |
 
 Precedence: per-key > account file > global. An empty value disables the skill.
 
@@ -63,12 +63,12 @@ When a skill is resolved for a turn:
    the server-issued runtime handle. The listing is fetched per turn, matching
    the web client; one extra retry is made when the list is empty.
 2. The handle is written to StreamGenerate `inner[81]` as `[handle]`.
-3. The same slash command is prepended to the byte 0 of the prompt that is sent
+3. The same `@skill` mention is prepended to the byte 0 of the prompt that is sent
    for this turn (both a full prompt and a continuation delta), idempotently and
    without changing any other character.
 
 Matching accepts the Skill name, its runtime handle, and the aliases
-`伊珂丝` / `eksie` / `eks` / `ex` / `エクス` (case-insensitive, leading `/`
+`伊珂丝` / `eksie` / `eks` / `ex` / `エクス` (case-insensitive, leading `@`
 optional). Binding failures are logged and the turn runs without slot 81 rather
 than failing; the upstream account-level `45808580` experiment can still keep a
 valid handle from mounting, which is controlled by Google.
