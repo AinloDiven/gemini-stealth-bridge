@@ -476,6 +476,7 @@ func (s *Server) runSearchOnAccount(ctx context.Context, acct *AccountState, mod
 	opts.Files = nil
 	opts.HasTools = false
 	opts.DisableTools = false
+	opts.SkillRuntime = ""
 	opts.ProtocolMode = "web"
 
 	var (

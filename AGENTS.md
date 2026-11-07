@@ -427,7 +427,7 @@ Non-streaming: `choices[0].message.content`, optional `reasoning_content`, optio
 
 `input` accepts a string, a list of items, or `messages` as a fallback. `instructions` becomes a system message.
 
-Supported item types: `message`, `function_call`, `function_call_output`, `custom_tool_call`, `custom_tool_call_output`, `reasoning`, `input_text`, `input_image`, `image`.
+Supported item types: `message`, `function_call`, `function_call_output`, `custom_tool_call`, `custom_tool_call_output`, `reasoning`, `input_text`, `input_image`, `image`, `input_file`, `file`, `document`, `input_audio`, `audio`, `input_video`, `video`, `video_url`.
 
 Supported tool shapes: flat `{type:"function", name, description, parameters}`, nested Chat-style, `custom`, `local_shell`, and `namespace` wrappers.
 
@@ -532,7 +532,7 @@ When tools are enabled and the prompt has media intent, `gsb` injects `generate_
 
 ## 11. Images and native media generation
 
-### 11.1 Input images
+### 11.1 Input attachments (images, files/PDF, audio, video)
 
 Accepted shapes:
 
@@ -540,6 +540,9 @@ Accepted shapes:
 { "type": "image_url", "image_url": { "url": "data:image/png;base64,..." } }
 { "type": "input_image", "image_url": "https://example.com/image.png" }
 { "type": "image", "data": "<base64>", "mimeType": "image/png" }
+{ "type": "file", "file": { "filename": "spec.pdf", "file_data": "data:application/pdf;base64,..." } }
+{ "type": "input_audio", "input_audio": { "data": "<base64>", "format": "ogg" } }
+{ "type": "video_url", "video_url": { "url": "https://example.com/clip.mp4" } }
 ```
 
 Limits:

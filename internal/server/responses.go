@@ -198,7 +198,7 @@ func NormalizeResponsesInput(body map[string]any) (messages []map[string]any, to
 					}
 					continue
 
-				case "input_text", "input_image", "image", "input_file", "file", "input_audio", "audio", "document":
+				case "input_text", "input_image", "image", "input_file", "file", "input_audio", "audio", "input_video", "video", "video_url", "document":
 					flushPendingAssistant()
 					messages = append(messages, map[string]any{
 						"role":    "user",
@@ -562,7 +562,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	curPrompt := prep.curPrompt
 	flattenStats := prep.flattenStats
 	overflowParts := prep.overflowParts
-	messageParts := prep.messageParts
+	imageParts := prep.imageParts
 	fullAttachmentParts := prep.fullAttachmentParts
 	attachmentParts := prep.attachmentParts
 	hasher := prep.hasher
@@ -826,6 +826,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 	freshSocketNext := false
 	rebootstrapNext := false
 	serverMediaRounds := 0
+	var skillTurn skillTurnState
+	sendPrompt := curPrompt
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		curAttempt = attempt
 		attemptStartedAt := time.Now()
@@ -838,7 +840,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			servedID, servedLabel string
 			identityConflict      bool
 			mediaToolUsed         bool
-			media                 mediaAccumulator
+			lastImages            []gemini.GeneratedImage
+			lastVideos            []gemini.GeneratedVideo
 			lastCID, lastRID      string
 			lastContextToken      string
 			grounding             []gemini.GroundingSource
@@ -860,6 +863,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		opts.FreshSocket = freshSocketNext
 		if rebootstrapNext {
 			_ = c.Bootstrap(ctx)
+			skillTurn.invalidate()
 		}
 		freshSocketNext = false
 		rebootstrapNext = false
@@ -876,11 +880,12 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 		if uploadErr != nil {
 			streamErr = uploadErr
 		} else {
+			sendPrompt = skillTurn.prepare(ctx, s, scope, account, &opts, curPrompt)
 			upstreamCalls++
 			account.mu.Lock()
 			account.activeStreams++
 			account.mu.Unlock()
-			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
+			upstream, streamErr = c.StreamGenerateLive(ctx, sendPrompt, opts, func(update *gemini.LineParseResult) error {
 				attemptStateMu.Lock()
 				if update.MediaToolActive {
 					mediaToolUsed = true
@@ -925,9 +930,14 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					}
 					attemptStateMu.Lock()
 					s.rewriteFrameMedia(ctx, account.ID, &frame)
-					media.Observe(frame)
-					if media.HasMedia() {
+					if len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0 {
 						mediaToolUsed = true
+						if len(frame.GeneratedImages) > 0 {
+							lastImages = frame.GeneratedImages
+						}
+						if len(frame.GeneratedVideos) > 0 {
+							lastVideos = frame.GeneratedVideos
+						}
 					}
 					if mediaToolUsed {
 						servedID = model.ModelID
@@ -947,7 +957,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					thoughts = mergeStreamedThoughts(thoughts, frame.Thoughts)
 					done = frame.Done
 					if done {
-						text = media.AppendMarkdown(text)
+						text = gemini.AppendGeneratedMediaMarkdown(text, lastImages, lastVideos)
 					}
 					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 					attemptStateMu.Unlock()
@@ -1267,9 +1277,9 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 								AllowOverflow:   s.Cfg.HistoryOffload,
 							}); cErr == nil {
 								curPrompt = appendErrorReplyRecoveryNote(compacted, hasTools)
-								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(messageParts))
+								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(imageParts))
 								attachmentParts = append(attachmentParts, extraOverflow...)
-								attachmentParts = append(attachmentParts, messageParts...)
+								attachmentParts = append(attachmentParts, imageParts...)
 								continue
 							}
 						}
@@ -1312,7 +1322,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"model":              mid,
 				"account":            account.ID,
 				"effort":             effortStr,
-				"prompt_bytes":       len(curPrompt),
+				"prompt_bytes":       len(sendPrompt),
 				"header_bytes":       flattenStats.HeaderBytes,
 				"body_bytes":         flattenStats.BodyBytes,
 				"footer_bytes":       flattenStats.FooterBytes,
@@ -1366,8 +1376,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				continue
 			}
 			calls = clientCalls
-		} else if hasTools && len(calls) == 0 && media.HasMedia() && serverMediaRounds < 2 && sentText == "" {
-			if promptAdd := formatDirectMediaToolContinuation(media.Images(), media.Videos()); promptAdd != "" {
+		} else if hasTools && len(calls) == 0 && (len(lastImages) > 0 || len(lastVideos) > 0) && serverMediaRounds < 2 && sentText == "" {
+			if promptAdd := formatDirectMediaToolContinuation(lastImages, lastVideos); promptAdd != "" {
 				fullPrompt = fullPrompt + promptAdd
 				curPrompt = fullPrompt
 				opts.Metadata = nil
@@ -1668,7 +1678,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			"model":              mid,
 			"account":            account.ID,
 			"effort":             effortStr,
-			"prompt_bytes":       len(curPrompt),
+			"prompt_bytes":       len(sendPrompt),
 			"header_bytes":       flattenStats.HeaderBytes,
 			"body_bytes":         flattenStats.BodyBytes,
 			"footer_bytes":       flattenStats.FooterBytes,

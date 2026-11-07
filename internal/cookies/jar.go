@@ -324,6 +324,9 @@ func SaveCredentialFile(path string, cred CredentialFile) (int64, error) {
 		if cred.ProxyURL == "" {
 			cred.ProxyURL = prev.ProxyURL
 		}
+		if cred.Skill == "" {
+			cred.Skill = prev.Skill
+		}
 		if len(prev.Surfaces) > 0 {
 			if cred.Surfaces == nil {
 				cred.Surfaces = make(map[string]string, len(prev.Surfaces))

@@ -9,6 +9,7 @@
 cookies.json
 web-credentials.json
 session-cache.json
+session-bindings.json
 
 # Personal backlog & internal update plans, not part of the published repo.
 # Unanchored on purpose: these must stay ignored even if moved into a

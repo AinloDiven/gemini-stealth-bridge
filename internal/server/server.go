@@ -97,6 +97,7 @@ type AuthScope struct {
 	AccountID string
 	Group     string
 	Admin     bool
+	Pool      bool
 	Token     string
 	SessionID string
 }
@@ -127,7 +128,7 @@ type Server struct {
 	sessionCache      map[string][]any
 	sessionCacheAt    map[string]time.Time
 	sessionOrder      []string
-	sessionBindings   map[string]sessionBinding
+	bindings          map[string]sessionBinding
 	uploadCache       map[string]cachedUpload
 	uploadOrder       []string
 	lastHotLoadAt     time.Time
@@ -137,9 +138,8 @@ type Server struct {
 	cacheMisses       atomic.Uint64
 	cacheFlushMu      sync.Mutex
 	cacheFlushPending atomic.Bool
+	bindFlushPending  atomic.Bool
 	cacheFlushWG      sync.WaitGroup
-	bindingFlushPending atomic.Bool
-	bindingFlushWG      sync.WaitGroup
 	clientFactory     func(a *AccountState) UpstreamClient
 
 	// rotateMu guards the sticky rotation cursor used by the "rotate" strategy.
@@ -198,17 +198,17 @@ func New(cfg config.Config) *Server {
 	}
 
 	s := &Server{
-		Cfg:             cfg,
-		Pool:            pool,
-		Rotator:         rotator,
-		tokenToAcct:     tokMap,
-		tokenToGroup:    grpMap,
-		sessionCache:    make(map[string][]any),
-		sessionCacheAt:  make(map[string]time.Time),
-		sessionBindings: make(map[string]sessionBinding),
-		uploadCache:     make(map[string]cachedUpload),
-		startedAt:       time.Now().UTC(),
-		clock:           time.Now,
+		Cfg:            cfg,
+		Pool:           pool,
+		Rotator:        rotator,
+		tokenToAcct:    tokMap,
+		tokenToGroup:   grpMap,
+		sessionCache:   make(map[string][]any),
+		sessionCacheAt: make(map[string]time.Time),
+		bindings:       make(map[string]sessionBinding),
+		uploadCache:    make(map[string]cachedUpload),
+		startedAt:      time.Now().UTC(),
+		clock:          time.Now,
 	}
 	s.loadSessionCacheFromDisk()
 	s.loadSessionBindingsFromDisk()
@@ -293,9 +293,9 @@ func (s *Server) ResolveAuthScope(r *http.Request) AuthScope {
 
 	if isPoolKey {
 		if len(s.accounts) == 1 {
-			return AuthScope{OK: true, AccountID: s.accounts[0].ID, Token: token}
+			return AuthScope{OK: true, AccountID: s.accounts[0].ID, Pool: true, Token: token}
 		}
-		return AuthScope{OK: true, Admin: true, Token: token}
+		return AuthScope{OK: true, Admin: true, Pool: true, Token: token}
 	}
 	return AuthScope{OK: false}
 }
@@ -424,12 +424,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		sendJSON(w, 200, map[string]any{
-			"transport":     "stealth-utls-h2",
-			"profile":       s.Cfg.ImpersonateProfile,
-			"sessions":      s.Pool.Status(),
-			"cache_entries": s.sessionCacheLen(),
-			"cache_hits":    s.cacheHits.Load(),
-			"cache_misses":  s.cacheMisses.Load(),
+			"transport":       "stealth-utls-h2",
+			"profile":         s.Cfg.ImpersonateProfile,
+			"sessions":        s.Pool.Status(),
+			"cache_entries":   s.sessionCacheLen(),
+			"binding_entries": s.sessionBindingLen(),
+			"cache_hits":      s.cacheHits.Load(),
+			"cache_misses":    s.cacheMisses.Load(),
 		}, nil)
 		return
 
@@ -703,6 +704,7 @@ func (s *Server) accountStatusMap(a *AccountState, now time.Time) map[string]any
 		"quarantineReason": a.QuarantineReason,
 		"disabled":         a.Disabled,
 		"accountGroup":     a.AccountGroup,
+		"skill":            a.Skill,
 		"importedFrom":     a.ImportedFrom,
 		"profileId":        a.ProfileID,
 		"proxyConfigured":  a.ProxyURL != "" || s.Cfg.ProxyURL != "",

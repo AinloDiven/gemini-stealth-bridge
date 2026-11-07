@@ -262,6 +262,7 @@ func (s *Server) buildAdminConfigPayload() map[string]any {
 		"rotateCursor": rotCursor,
 		"metrics": map[string]any{
 			"cacheEntries":   s.sessionCacheLen(),
+			"bindingEntries": s.sessionBindingLen(),
 			"cacheHits":      s.cacheHits.Load(),
 			"cacheMisses":    s.cacheMisses.Load(),
 			"activeSessions": len(s.Pool.Status()),
@@ -422,7 +423,7 @@ func (s *Server) handleAdminPatchConfig(w http.ResponseWriter, body map[string]a
 		if val == "<nil>" {
 			val = ""
 		}
-		if len(val) > 128 || strings.IndexFunc(val, func(r rune) bool { return r <= ' ' }) >= 0 {
+		if !config.IsValidModelID(val) {
 			s.mu.Unlock()
 			sendJSON(w, http.StatusBadRequest, map[string]any{
 				"error": map[string]any{"message": "defaultModel must be a model id without whitespace, at most 128 characters", "type": "invalid_request_error"},
@@ -639,7 +640,7 @@ func (s *Server) handleAdminImportAccount(ctx context.Context, w http.ResponseWr
 		return
 	}
 
-	hdr, _, err := cookies.ParseImportPayload(rawCookie)
+	hdr, parsedCred, err := cookies.ParseImportPayload(rawCookie)
 	if err != nil {
 		sendJSON(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{"message": err.Error(), "type": "invalid_request_error"},
@@ -660,6 +661,11 @@ func (s *Server) handleAdminImportAccount(ctx context.Context, w http.ResponseWr
 	acctGroup = strings.TrimSpace(acctGroup)
 	proxyURL, _ := body["proxyUrl"].(string)
 	proxyURL = strings.TrimSpace(proxyURL)
+	skill, _ := body["skill"].(string)
+	skill = strings.TrimSpace(skill)
+	if skill == "" && parsedCred != nil {
+		skill = strings.TrimSpace(parsedCred.Skill)
+	}
 
 	s.mu.RLock()
 	acctsDir := s.Cfg.AccountsDir
@@ -706,6 +712,7 @@ func (s *Server) handleAdminImportAccount(ctx context.Context, w http.ResponseWr
 		ProfileID:    "cookie-export",
 		AccountGroup: acctGroup,
 		ProxyURL:     proxyURL,
+		Skill:        skill,
 	}
 	if _, err := cookies.SaveCredentialFile(outPath, initialRec); err != nil {
 		sendJSON(w, http.StatusInternalServerError, map[string]any{
@@ -927,6 +934,7 @@ func (s *Server) handleAdminDeleteAccount(w http.ResponseWriter, acctID string) 
 		}
 	}
 	s.mu.Unlock()
+	s.purgeAccountSessionBindings(acctID)
 
 	sendJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",

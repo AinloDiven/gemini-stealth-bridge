@@ -1185,29 +1185,32 @@ func (ac *AccountClient) nextReqID() int64 {
 	return ac.reqCounter.Add(100000)
 }
 
-// BindSkillRuntime resolves a configured cloud Skill name to the server-issued
-// runtime handle that StreamGenerate carries in inner[81]. The cCSu7 RPC is
-// called per turn (matching the web client, which does not cache the handle
-// across turns), with one retry when the listing comes back empty. A handle
-// confirmed earlier for the same page session is kept when the listing is
-// transiently empty, which is the web client's empty-list fallback.
+var skillHandleRe = regexp.MustCompile(`^[0-9a-fA-F-]{20,40}$`)
+
+// BindSkillRuntime resolves a configured cloud Skill name via cCSu7 to the
+// server-issued runtime handle carried in StreamGenerate inner[81].
 func (ac *AccountClient) BindSkillRuntime(ctx context.Context, name string) (string, error) {
 	target := normalizeSkillName(name)
 	if target == "" {
 		return "", nil
 	}
-
 	ac.mu.RLock()
 	cachedHandle, cachedName, cachedFSid, currentFSid := ac.skillHandle, ac.skillName, ac.skillFSid, ac.fSid
 	ac.mu.RUnlock()
 	cachedValid := skillCacheValid(cachedHandle, cachedName, cachedFSid, target, currentFSid)
 
-	records, listErr := ac.listSkillRecords(ctx)
-	if listErr != nil {
-		if cachedValid {
-			return cachedHandle, nil
+	var records [][]any
+	for attempt := 0; attempt < 2; attempt++ {
+		_, entries, err := ac.BatchExec(ctx, "cCSu7", "[]")
+		if err != nil {
+			if cachedValid {
+				return cachedHandle, nil
+			}
+			return "", err
 		}
-		return "", listErr
+		if records = extractSkillRecords(findBatchPayload(entries, "cCSu7")); len(records) > 0 {
+			break
+		}
 	}
 	if len(records) == 0 {
 		if cachedValid {
@@ -1216,105 +1219,44 @@ func (ac *AccountClient) BindSkillRuntime(ctx context.Context, name string) (str
 		return "", fmt.Errorf("cloud Skill list is empty")
 	}
 	for _, rec := range records {
-		if !skillRecordMatches(rec, target) {
-			continue
+		if handle, _ := rec[0].(string); handle != "" && skillRecordMatches(rec, target) {
+			ac.mu.Lock()
+			ac.skillHandle, ac.skillName, ac.skillFSid = handle, target, ac.fSid
+			ac.mu.Unlock()
+			return handle, nil
 		}
-		handle, _ := rec[0].(string)
-		if handle == "" {
-			continue
-		}
-		ac.mu.Lock()
-		ac.skillHandle, ac.skillName, ac.skillFSid = handle, target, ac.fSid
-		ac.mu.Unlock()
-		return handle, nil
 	}
 	if cachedValid {
 		return cachedHandle, nil
 	}
-	ac.clearSkillCache()
-	return "", fmt.Errorf("cloud Skill %q is not available on this account", name)
-}
-
-// listSkillRecords performs the browser's empty-list retry without conflating
-// an RPC failure with an empty result. The caller owns cache fallback policy.
-func (ac *AccountClient) listSkillRecords(ctx context.Context) ([][]any, error) {
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		_, entries, err := ac.BatchExec(ctx, "cCSu7", "[]")
-		if err != nil {
-			return nil, err
-		}
-		records := extractSkillRecords(findBatchPayload(entries, "cCSu7"))
-		if len(records) > 0 {
-			return records, nil
-		}
-		lastErr = fmt.Errorf("cloud Skill list is empty")
-	}
-	return nil, lastErr
-}
-
-func (ac *AccountClient) clearSkillCache() {
 	ac.mu.Lock()
 	ac.skillHandle, ac.skillName, ac.skillFSid = "", "", ""
 	ac.mu.Unlock()
-}
-
-var skillAliases = map[string]bool{
-	"伊珂丝": true, "eksie": true, "eks": true, "ex": true, "エクス": true,
-}
-
-var skillHandleRe = regexp.MustCompile(`^[0-9a-fA-F-]{20,40}$`)
-
-func isSkillHandle(value any) bool {
-	handle, ok := value.(string)
-	return ok && skillHandleRe.MatchString(handle)
+	return "", fmt.Errorf("cloud Skill %q is not available on this account", name)
 }
 
 func normalizeSkillName(name string) string {
 	return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "@")))
 }
 
-// sameSkill compares configured names after normalization and treats the known
-// persona aliases as the same upstream skill.
-func sameSkill(a, b string) bool {
-	left, right := normalizeSkillName(a), normalizeSkillName(b)
-	if left == "" || right == "" {
-		return false
-	}
-	if left == right {
-		return true
-	}
-	return skillAliases[left] && skillAliases[right]
-}
-
-// skillCacheValid reports whether a previously confirmed handle can stand in
-// for an empty cCSu7 listing. The handle is page-session scoped and only valid
-// for the same configured skill.
 func skillCacheValid(handle, cachedName, cachedFSid, target, currentFSid string) bool {
-	return handle != "" && sameSkill(cachedName, target) && cachedFSid == currentFSid
+	a, b := normalizeSkillName(cachedName), normalizeSkillName(target)
+	return handle != "" && a != "" && a == b && cachedFSid == currentFSid
 }
 
-// extractSkillRecords mirrors the web client's cCSu7 decoder. Records can be
-// nested under wrapper arrays; scan sibling records instead of trusting only
-// the first entry so a malformed first record does not hide valid later ones.
 func extractSkillRecords(payload any) [][]any {
 	var walk func(any, int) [][]any
 	walk = func(node any, depth int) [][]any {
-		if depth > 6 {
-			return nil
-		}
 		arr, ok := node.([]any)
-		if !ok || len(arr) == 0 {
+		if !ok || len(arr) == 0 || depth > 6 {
 			return nil
 		}
-		records := make([][]any, 0, len(arr))
+		var records [][]any
 		for _, item := range arr {
-			rec, ok := item.([]any)
-			if !ok || len(rec) == 0 {
-				continue
-			}
-			if isSkillHandle(rec[0]) {
-				records = append(records, rec)
+			if rec, ok := item.([]any); ok && len(rec) > 0 {
+				if h, ok := rec[0].(string); ok && skillHandleRe.MatchString(h) {
+					records = append(records, rec)
+				}
 			}
 		}
 		if len(records) > 0 {
@@ -1331,18 +1273,12 @@ func extractSkillRecords(payload any) [][]any {
 }
 
 func skillRecordMatches(rec []any, target string) bool {
-	if target == "" {
+	want := normalizeSkillName(target)
+	if want == "" {
 		return false
 	}
-	for _, idx := range []int{0, 1} {
-		if idx >= len(rec) {
-			continue
-		}
-		raw, ok := rec[idx].(string)
-		if !ok {
-			continue
-		}
-		if sameSkill(raw, target) {
+	for i := 0; i < 2 && i < len(rec); i++ {
+		if raw, ok := rec[i].(string); ok && normalizeSkillName(raw) == want {
 			return true
 		}
 	}

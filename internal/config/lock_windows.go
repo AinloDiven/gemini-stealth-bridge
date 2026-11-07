@@ -31,6 +31,7 @@ func AcquireLock(homeDir string) (*LockHandle, error) {
 	}
 
 	var ol windows.Overlapped
+	ol.Offset = 4096
 	err = windows.LockFileEx(
 		windows.Handle(f.Fd()),
 		windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY,

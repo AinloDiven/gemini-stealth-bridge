@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -76,9 +77,21 @@ func (s *Server) loadSessionCacheFromDisk() {
 // still creating its temp file in a directory that may already be removed.
 func (s *Server) FlushSessionCacheNow() {
 	s.cacheFlushWG.Wait()
-	s.bindingFlushWG.Wait()
 	s.flushSessionCacheLocked()
 	s.flushSessionBindingsLocked()
+}
+
+func writeJSONAtomically(path string, value any) {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return
+	}
+	tmp := fmt.Sprintf("%s.tmp-%d", path, time.Now().UnixNano())
+	if os.WriteFile(tmp, b, 0o600) == nil {
+		if os.Rename(tmp, path) != nil {
+			_ = os.Remove(tmp)
+		}
+	}
 }
 
 // flushSessionCacheLocked performs the write without waiting on the wait group, so
@@ -107,7 +120,7 @@ func (s *Server) flushSessionCacheLocked() {
 	}
 	s.mu.RUnlock()
 
-	_ = writeJSONAtomically(p, entries)
+	writeJSONAtomically(p, entries)
 }
 
 func (s *Server) flushSessionCacheToDisk() {
@@ -353,7 +366,7 @@ func (s *Server) uploadCached(ctx context.Context, acctID string, c UpstreamClie
 			return cachedURL, nil
 		}
 		origName := att.Filename
-		fetched, err := prompt.FetchRemoteAttachment(ctx, att.RemoteURL, 0)
+		fetched, err := prompt.FetchRemoteImage(ctx, att.RemoteURL, 0)
 		if err != nil {
 			return gemini.UploadedFile{}, err
 		}

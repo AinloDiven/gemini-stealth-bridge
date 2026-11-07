@@ -275,6 +275,11 @@ func FromEnv() *Config {
 		warnings = append(warnings, fmt.Sprintf("invalid BRIDGE_QUIET_HOURS=%q; expected HH:MM-HH:MM", quietHours))
 	}
 
+	defaultModel := lookup("BRIDGE_DEFAULT_MODEL")
+	if defaultModel != "" && !IsValidModelID(defaultModel) {
+		warnings = append(warnings, fmt.Sprintf("invalid BRIDGE_DEFAULT_MODEL=%q; expected model id without whitespace (<=128 chars)", defaultModel))
+	}
+
 	hostVal := lookup("BRIDGE_HOST")
 	if hostVal == "" {
 		hostVal = lookupStr("HOST", "127.0.0.1")
@@ -318,7 +323,7 @@ func FromEnv() *Config {
 		ProxyURL:                lookup("BRIDGE_PROXY_SERVER"),
 		ImpersonateProfile:      impersonate,
 		DefaultThinking:         defThink,
-		DefaultModel:            lookup("BRIDGE_DEFAULT_MODEL"),
+		DefaultModel:            defaultModel,
 		Skill:                   lookup("BRIDGE_SKILL"),
 		SkillPerKey:             parseKeyValMap(lookup("BRIDGE_SKILL_PER_KEY")),
 		UserAgent:               ua,
@@ -369,6 +374,19 @@ func (c Config) Validate() error {
 	errs = append(errs, c.Warnings...)
 	if c.QuietHours != "" && !isValidQuietHours(c.QuietHours) {
 		msg := fmt.Sprintf("invalid BRIDGE_QUIET_HOURS=%q; expected HH:MM-HH:MM", c.QuietHours)
+		found := false
+		for _, w := range errs {
+			if w == msg {
+				found = true
+				break
+			}
+		}
+		if !found {
+			errs = append(errs, msg)
+		}
+	}
+	if c.DefaultModel != "" && !IsValidModelID(c.DefaultModel) {
+		msg := fmt.Sprintf("invalid BRIDGE_DEFAULT_MODEL=%q; expected model id without whitespace (<=128 chars)", c.DefaultModel)
 		found := false
 		for _, w := range errs {
 			if w == msg {
@@ -583,6 +601,11 @@ func deriveAcceptLanguage(locale string) string {
 		return fmt.Sprintf("%s,%s;q=0.9,en-US;q=0.8,en;q=0.7", loc, base)
 	}
 	return fmt.Sprintf("%s,en-US;q=0.9,en;q=0.8", loc)
+}
+
+// IsValidModelID reports whether s is a non-whitespace model identifier within 128 bytes.
+func IsValidModelID(s string) bool {
+	return len(s) <= 128 && strings.IndexFunc(s, func(r rune) bool { return r <= ' ' }) < 0
 }
 
 func isValidQuietHours(s string) bool {

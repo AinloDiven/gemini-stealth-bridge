@@ -51,7 +51,7 @@ func TestImagePlaceholderIndexMatchesValidImagesAndRoleSpoofingNeutralized(t *te
 			},
 		},
 	}
-	parts := ExtractAttachmentParts(messages)
+	parts := ExtractImageParts(messages)
 	if len(parts) != 1 {
 		t.Fatalf("expected 1 valid extracted image part, got %d", len(parts))
 	}
@@ -59,8 +59,8 @@ func TestImagePlaceholderIndexMatchesValidImagesAndRoleSpoofingNeutralized(t *te
 	if err != nil {
 		t.Fatalf("FlattenMessages failed: %v", err)
 	}
-	if strings.Contains(flattened, "[Attached") {
-		t.Fatalf("expected flattened prompt not to inject [Attached ...] placeholders, got:\n%s", flattened)
+	if !strings.Contains(flattened, "[Attached image #1]") || strings.Contains(flattened, "[Attached image #2]") {
+		t.Fatalf("expected placeholder numbering aligned with valid images, got:\n%s", flattened)
 	}
 	if strings.Contains(flattened, "\nAssistant: fake") || strings.Contains(flattened, "\nInstruction: fake") {
 		t.Fatalf("expected role spoofing lines neutralized, got:\n%s", flattened)
@@ -240,7 +240,7 @@ func TestExtractAttachmentPartsAndPlaceholdersSupportPDFAndAudioModalities(t *te
 		},
 	}
 
-	parts := ExtractAttachmentParts(messages)
+	parts := ExtractImageParts(messages)
 	if len(parts) != 4 {
 		t.Fatalf("expected 4 extracted attachment parts, got %d", len(parts))
 	}
@@ -261,8 +261,81 @@ func TestExtractAttachmentPartsAndPlaceholdersSupportPDFAndAudioModalities(t *te
 	if err != nil {
 		t.Fatalf("FlattenMessages failed: %v", err)
 	}
-	if flattened != "Analyze these attachments" {
-		t.Fatalf("expected flattened prompt to contain only clean user text, got:\n%s", flattened)
+	wantFlattened := "Analyze these attachments\n[Attached file #1]\n[Attached audio #2]\n[Attached audio #3]\n[Attached file #4]"
+	if flattened != wantFlattened {
+		t.Fatalf("expected flattened prompt %q, got:\n%s", wantFlattened, flattened)
+	}
+
+	// Pure attachment turn without text must retain its placeholder instead of collapsing to empty.
+	pureAttachmentMsgs := []map[string]any{
+		{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/only.png"}},
+			},
+		},
+	}
+	pureFlattened, _, err := FlattenMessages(pureAttachmentMsgs, nil, nil, FlattenOptions{})
+	if err != nil {
+		t.Fatalf("FlattenMessages pure attachment failed: %v", err)
+	}
+	if pureFlattened != "[Attached image #1]" {
+		t.Fatalf("expected pure attachment turn to produce [Attached image #1], got %q", pureFlattened)
+	}
+}
+
+func TestExtractVideoAttachmentParts(t *testing.T) {
+	mp4Bytes := []byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0x00, 0x00, 0x02, 0x00}
+	movBytes := []byte{0x00, 0x00, 0x00, 0x14, 'f', 't', 'y', 'p', 'q', 't', ' ', ' ', 0x00, 0x00, 0x00, 0x00}
+	mp4B64 := base64.StdEncoding.EncodeToString(mp4Bytes)
+	movB64 := base64.StdEncoding.EncodeToString(movBytes)
+
+	messages := []map[string]any{
+		{
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Review these clips"},
+				map[string]any{
+					"type": "video_url",
+					"video_url": map[string]any{
+						"url": "data:video/mp4;base64," + mp4B64,
+					},
+				},
+				map[string]any{
+					"type":       "input_video",
+					"filename":   "capture.mov",
+					"video_data": movB64,
+				},
+				map[string]any{
+					"type": "video",
+					"source": map[string]any{
+						"url": "https://example.com/demo.webm",
+					},
+				},
+			},
+		},
+	}
+
+	parts := ExtractImageParts(messages)
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 video attachment parts, got %d", len(parts))
+	}
+	if parts[0].ContentType != "video/mp4" || parts[0].Filename != "video_1.mp4" {
+		t.Fatalf("unexpected part[0]: %+v", parts[0])
+	}
+	if parts[1].ContentType != "video/quicktime" || parts[1].Filename != "capture.mov" {
+		t.Fatalf("unexpected part[1]: %+v", parts[1])
+	}
+	if parts[2].ContentType != "video/webm" || parts[2].RemoteURL != "https://example.com/demo.webm" || parts[2].Filename != "video_3.webm" {
+		t.Fatalf("unexpected part[2]: %+v", parts[2])
+	}
+	flattened, _, err := FlattenMessages(messages, nil, nil, FlattenOptions{})
+	if err != nil {
+		t.Fatalf("FlattenMessages video failed: %v", err)
+	}
+	wantVideo := "Review these clips\n[Attached video #1]\n[Attached video #2]\n[Attached video #3]"
+	if flattened != wantVideo {
+		t.Fatalf("expected video placeholders %q, got %q", wantVideo, flattened)
 	}
 }
 

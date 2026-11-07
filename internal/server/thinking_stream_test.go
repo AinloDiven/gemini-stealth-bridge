@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 // TestThinkingStreamEmitsReasoningLifecycleAndActionTitle verifies the additive
@@ -75,7 +77,7 @@ func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 			Action: &gemini.ActionStatus{
 				ToolID:         "skills",
 				ToolTitle:      "Skill Title",
-				StatusTemplate: "{tool_logo_placeholder} Skills: Eksie",
+				StatusTemplate: "{tool_logo_placeholder} Skills: Research",
 			},
 			Frames: []gemini.Frame{makeFrame("answer", "", true, testModel.ModelID)},
 		}); err != nil {
@@ -90,7 +92,7 @@ func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 	for _, want := range []string{
 		`"x_gemini_action_status"`,
 		`"provider":"skills"`,
-		`"status_template":"{tool_logo_placeholder} Skills: Eksie"`,
+		`"status_template":"{tool_logo_placeholder} Skills: Research"`,
 		`"progress_detail":"Skill Title"`,
 		`"source_type":"tool_progress"`,
 		`"state":"active"`,
@@ -156,6 +158,57 @@ func TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision(t *te
 	}
 }
 
+func TestStreamParenthesizedURLAcrossFramesDoesNotTriggerUpstreamRevision(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	padding := strings.Repeat("这是一段足够超过流式缓冲阈值的说明文字。", 10)
+	parseWireCandidate := func(text string, status float64) *gemini.LineParseResult {
+		inner, err := json.Marshal([]any{
+			nil,
+			[]any{"c_url", "r_url"},
+			nil, nil,
+			[]any{
+				[]any{"rc_url", []any{text}, nil, nil, nil, nil, nil, nil, []any{status}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := json.Marshal([]any{[]any{"wrb.fr", nil, string(inner)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := gemini.ParseFrameLine(string(env))
+		if err != nil || res == nil || len(res.Frames) != 1 {
+			t.Fatalf("ParseFrameLine failed: %+v err=%v", res, err)
+		}
+		res.AnsweredModelID = testModel.ModelID
+		res.Frames[0].AnsweredModelID = testModel.ModelID
+		return res
+	}
+
+	u1 := parseWireCandidate(padding+"详见 (", 1)
+	u2 := parseWireCandidate(padding+"详见 (https://example.com/docs/path", 1)
+	u3 := parseWireCandidate(padding+"详见 (https://example.com/docs/path) 说明。", 2)
+
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		for _, u := range []*gemini.LineParseResult{u1, u2, u3} {
+			if err := onFrame(u); err != nil {
+				return nil, err
+			}
+		}
+		return &gemini.StreamResponse{Status: 200, CID: "c_url", RID: "r_url"}, nil
+	}}
+
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
+	body := rec.Body.String()
+	if strings.Contains(body, "upstream_revision") || strings.Contains(body, `"error"`) {
+		t.Fatalf("unexpected error streaming parenthesized URL across frames:\n%s", body)
+	}
+	if !strings.Contains(body, "https://example.com/docs/path) 说明。") {
+		t.Fatalf("expected held-back URL flushed intact on completion, got:\n%s", body)
+	}
+}
+
 // TestStreamTimestampStrippingDoesNotTriggerUpstreamRevision verifies that when
 // Gemini Web streams unlinked clock timestamps (e.g. " [00:00:30]") and strips
 // them on the final frame (done=true) because no video metadata is attached to
@@ -203,5 +256,31 @@ func TestStreamTimestampStrippingDoesNotTriggerUpstreamRevision(t *testing.T) {
 	}
 	if hasCompatibleStreamPrefix("好处，其实不然", "好处 [00:00:30]，完全不同") {
 		t.Fatalf("genuine text revision must still be rejected")
+	}
+}
+
+func TestThinkingStreamClosesReasoningBeforeMidStreamError(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	srv.Cfg.MaxAttempts = 1
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Frames: []gemini.Frame{makeFrame("", "partial thought", false, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		return nil, transport.NewUpstreamError("stream interrupted", 502, "upstream_error", nil, nil)
+	}}
+
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
+	body := rec.Body.String()
+
+	doneIdx := strings.Index(body, `"event":"done"`)
+	errIdx := strings.Index(body, `"error":`)
+	if doneIdx < 0 || errIdx < 0 {
+		t.Fatalf("expected reasoning done and error chunk in SSE body:\n%s", body)
+	}
+	if doneIdx >= errIdx {
+		t.Fatalf("expected reasoning done (%d) before error (%d):\n%s", doneIdx, errIdx, body)
 	}
 }
