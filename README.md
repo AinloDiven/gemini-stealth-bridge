@@ -857,12 +857,15 @@ A fixed cloud Skill can be configured with `BRIDGE_SKILL` (or per account/key);
 when present, gsb resolves the server handle, arms StreamGenerate slot 81, and
 puts the same `@skill` prefix at byte 0 of the per-turn prompt.
 
-Message content can be a string or an array of parts. Supported image shapes:
+Message content can be a string or an array of parts. Supported attachment shapes (images, PDF/files, audio, video):
 
 ```json
 { "type": "image_url", "image_url": { "url": "data:image/png;base64,..." } }
 { "type": "input_image", "image_url": "https://example.com/image.png" }
 { "type": "image", "data": "<base64>", "mimeType": "image/png" }
+{ "type": "file", "file": { "filename": "spec.pdf", "file_data": "data:application/pdf;base64,..." } }
+{ "type": "input_audio", "input_audio": { "data": "<base64>", "format": "ogg" } }
+{ "type": "video_url", "video_url": { "url": "https://example.com/clip.mp4" } }
 ```
 
 Remote images are limited to 20 MiB, follow at most 5 redirects, and reject private/loopback destinations unless `BRIDGE_ALLOW_PRIVATE_IMAGE_URLS=1`.
@@ -965,7 +968,7 @@ Content-Type: application/json
 `input` accepts:
 
 - a string,
-- an array of items (`message`, `function_call`, `function_call_output`, `custom_tool_call`, `custom_tool_call_output`, `reasoning`, `input_text`, `input_image`, `image`),
+- an array of items (`message`, `function_call`, `function_call_output`, `custom_tool_call`, `custom_tool_call_output`, `reasoning`, `input_text`, `input_image`, `image`, `input_file`, `file`, `document`, `input_audio`, `audio`, `input_video`, `video`, `video_url`),
 - or `messages` as a fallback.
 
 `instructions` becomes a system message. `tools` accepts flat Responses definitions (`{type:"function", name, description, parameters}`), nested Chat-style definitions, `custom` tools, `local_shell`, and `namespace` wrappers. `tool_choice` accepts `auto`, `none`, `required`, or `{type:"function", name}`.
@@ -1296,7 +1299,7 @@ An unknown value falls back to `chrome_150_psk`. User-Agent and `Sec-CH-UA*` ver
 |---|---|---|
 | `BRIDGE_DEFAULT_THINKING` | `low` | Effort applied when a request sends none: `low`, `medium`, `high` |
 | `BRIDGE_DEFAULT_MODEL` | Empty | Model used when a request omits `model`; switchable at runtime via `PATCH /v1/admin/config` `{"defaultModel":…,"persist":true}` |
-| `BRIDGE_SKILL` | Empty | Fixed cloud Skill `@` mention (for example `@伊珂丝`); arms StreamGenerate slot 81 |
+| `BRIDGE_SKILL` | Empty | Fixed cloud Skill `@` mention (for example `@research`); arms StreamGenerate slot 81 |
 | `BRIDGE_SKILL_PER_KEY` | Empty | `token:skill` overrides for `BRIDGE_SKILL` |
 | `BRIDGE_SESSION_BINDING_TTL_MS` | `86400000` | Lifetime of an explicit `X-GSB-Session` binding |
 | `BRIDGE_SESSION_BINDING_MAX` | `1024` | Maximum live explicit session bindings |

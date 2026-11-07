@@ -145,6 +145,20 @@ func TestSaveAndLoadAccountFile(t *testing.T) {
 	}
 }
 
+func TestSaveCredentialFilePreservesSkill(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "acct.json")
+	if _, err := SaveCredentialFile(path, CredentialFile{Name: "acct", Cookies: "SAPISID=123", Skill: "@research"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveCredentialFile(path, CredentialFile{Name: "acct", Cookies: "SAPISID=456"}); err != nil {
+		t.Fatal(err)
+	}
+	reimported, _, err := LoadAccountFile(path)
+	if err != nil || reimported.Skill != "@research" {
+		t.Fatalf("expected Skill preserved across re-import, got %+v (err=%v)", reimported, err)
+	}
+}
+
 func TestFindBrowserCookieDB_WindowsAndProfileDirs(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("LOCALAPPDATA", tmp)

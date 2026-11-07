@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -34,7 +35,7 @@ func TestParseActionStatusThinkingTitle(t *testing.T) {
 }
 
 func TestParseActionStatusToolCardRelaysIconInputs(t *testing.T) {
-	template := "{tool_logo_placeholder} Skills: Eksie"
+	template := "{tool_logo_placeholder} Skills: Research"
 	res := parseActionFromFrame(t, []any{
 		nil,
 		[]any{"c_1", "r_1"},
@@ -119,5 +120,44 @@ func TestParseCandidateSliceStripsYouTubeArtifactAndHoldsTrailingAutoLink(t *tes
 	want := "👉 **视频链接**：[https://www.youtube.com/watch?v=SntsJWcCEhs](https://www.youtube.com/watch?v=SntsJWcCEhs)"
 	if f2.Text != want {
 		t.Fatalf("expected youtube_content placeholder stripped and final link preserved, got %q, want %q", f2.Text, want)
+	}
+}
+
+func TestTrimIncompleteTrailingURLPreservesPrecedingASCIIAndIsMonotonic(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"See (https://example.com/docs", "See ("},
+		{"Read [guide](https://example.com/guide", "Read [guide]("},
+		{`{"url":"https://example.com/api`, `{"url":"`},
+		{"👉 **视频链接**：[[https://www.youtube](https://www.youtube).", "👉 **视频链接**："},
+		{"plain text without url", "plain text without url"},
+	}
+	for _, tc := range cases {
+		if got := trimIncompleteTrailingURL(tc.in); got != tc.want {
+			t.Fatalf("trimIncompleteTrailingURL(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	streams := []string{
+		"See (https://example.com/docs) for details.",
+		"Read [the guide](https://example.com/guide) next.",
+		`{"tool_calls":[{"name":"fetch","arguments":{"url":"https://example.com/api"}}]} `,
+		"👉 **视频链接**：[[https://www.youtube](https://www.youtube).",
+	}
+	for _, full := range streams {
+		prev := ""
+		for k := 1; k <= len(full); k++ {
+			// Only check valid UTF-8 prefix boundaries.
+			if k < len(full) && (full[k]&0xc0) == 0x80 {
+				continue
+			}
+			cur := trimIncompleteTrailingURL(full[:k])
+			if !strings.HasPrefix(cur, prev) {
+				t.Fatalf("non-monotonic trim on %q at %d: prev=%q cur=%q", full, k, prev, cur)
+			}
+			prev = cur
+		}
 	}
 }

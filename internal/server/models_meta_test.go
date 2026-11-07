@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/base64"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -192,6 +193,64 @@ func TestChatAndResponsesUploadPDFAndAudioAttachments(t *testing.T) {
 	}
 	if len(lastOpts.Files) != 2 || lastOpts.Files[0].Filename != "paper.pdf" || lastOpts.Files[1].Filename != "audio_2.ogg" {
 		t.Fatalf("unexpected StreamOptions.Files: %+v", lastOpts.Files)
+	}
+}
+
+func TestChatAndResponsesUploadVideoAttachments(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	var uploadedTypes []string
+	var uploadedNames []string
+	up := &mockUpstream{
+		uploadFn: func(ctx context.Context, data []byte, filename, contentType string) (gemini.UploadedFile, error) {
+			uploadedTypes = append(uploadedTypes, contentType)
+			uploadedNames = append(uploadedNames, filename)
+			return gemini.UploadedFile{Path: "/contrib_service/ttl_1d/" + filename, Filename: filename}, nil
+		},
+		streamFn: func(ctx context.Context, promptText string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			_ = onFrame(&gemini.LineParseResult{
+				AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{
+					{RCID: "rc1", Text: "Parsed video", Done: true, AnsweredModelID: testModel.ModelID},
+				},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	acct.Client = up
+
+	mp4B64 := base64.StdEncoding.EncodeToString([]byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0, 0, 0, 1})
+	mp4B64Resp := base64.StdEncoding.EncodeToString([]byte{0x00, 0x00, 0x00, 0x18, 'f', 't', 'y', 'p', 'm', 'p', '4', '2', 0, 0, 0, 2})
+	chatRec := runChat(t, srv, acct, up, map[string]any{
+		"messages": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "text", "text": "Describe clip"},
+					map[string]any{"type": "video_url", "video_url": map[string]any{"url": "data:video/mp4;base64," + mp4B64}},
+				},
+			},
+		},
+	})
+	if chatRec.Code != 200 {
+		t.Fatalf("chat video upload failed: %d %s", chatRec.Code, chatRec.Body.String())
+	}
+
+	respRec := httptest.NewRecorder()
+	srv.HandleResponses(context.Background(), respRec, map[string]any{
+		"model": testModel.ModelName,
+		"input": []any{
+			map[string]any{"type": "input_text", "text": "Describe clip"},
+			map[string]any{"type": "input_video", "filename": "demo.mp4", "video_data": mp4B64Resp},
+		},
+	}, AuthScope{OK: true, AccountID: "acct"})
+	if respRec.Code != 200 {
+		t.Fatalf("responses video upload failed: %d %s", respRec.Code, respRec.Body.String())
+	}
+	if len(uploadedTypes) != 2 || uploadedTypes[0] != "video/mp4" || uploadedTypes[1] != "video/mp4" {
+		t.Fatalf("unexpected uploaded video MIME types: %v", uploadedTypes)
+	}
+	if len(uploadedNames) != 2 || uploadedNames[0] != "video_1.mp4" || uploadedNames[1] != "demo.mp4" {
+		t.Fatalf("unexpected uploaded video filenames: %v", uploadedNames)
 	}
 }
 

@@ -1409,6 +1409,10 @@ func (s *Server) preferBindingAccount(accts []*AccountState, requested, accountI
 }
 
 func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requested string, hasher *prompt.HistoryHasher) *AccountState {
+	return s.resolveChatAccountPreferred(accts, scope, requested, hasher, "")
+}
+
+func (s *Server) resolveChatAccountPreferred(accts []*AccountState, scope AuthScope, requested string, hasher *prompt.HistoryHasher, preferredID string) *AccountState {
 	if scope.AccountID != "" {
 		for _, a := range accts {
 			if a.ID == scope.AccountID {
@@ -1441,6 +1445,9 @@ func (s *Server) resolveChatAccount(accts []*AccountState, scope AuthScope, requ
 		if explicitTokens {
 			return nil
 		}
+	}
+	if preferred := s.preferBindingAccount(accts, requested, preferredID); preferred != nil {
+		return preferred
 	}
 	if s.rotate() {
 		return s.resolveRotateAccount(accts, requested, hasher)
@@ -1638,7 +1645,7 @@ type preparedGeneration struct {
 	curPrompt           string
 	flattenStats        prompt.FlattenStats
 	overflowParts       []prompt.AttachmentPart
-	messageParts        []prompt.AttachmentPart
+	imageParts          []prompt.AttachmentPart
 	fullAttachmentParts []prompt.AttachmentPart
 	attachmentParts     []prompt.AttachmentPart
 	hasher              *prompt.HistoryHasher
@@ -1663,7 +1670,12 @@ func (s *Server) prepareGeneration(
 	toolChoiceRaw any,
 ) (*preparedGeneration, error) {
 	rawModel, _ := body["model"].(string)
-	requested, inlineThink, modelFromDefault := s.resolveGenerationRequestModel(rawModel)
+	rawModel = strings.TrimSpace(rawModel)
+	modelFromDefault := rawModel == "" && strings.TrimSpace(s.Cfg.DefaultModel) != ""
+	if modelFromDefault {
+		rawModel = strings.TrimSpace(s.Cfg.DefaultModel)
+	}
+	requested, inlineThink := gemini.ParseModelRequest(rawModel)
 
 	// The scope decides which accounts this request may touch: an account key
 	// sees only its own account, a group key only its group, the pool key all
@@ -1682,14 +1694,25 @@ func (s *Server) prepareGeneration(
 		hasher = prompt.NewHistoryHasher(messages, toolsRaw, toolChoiceRaw)
 	}
 
+	tempReq, _ := body["temporary"].(bool)
 	sessionKey := ""
 	var binding *sessionBinding
 	if s.Cfg.SessionCache && scope.SessionID != "" {
 		sessionKey = sessionBindingKey(scope, scope.SessionID)
 		binding = s.getSessionBinding(sessionKey)
 	}
+	preferredAccountID := ""
+	if binding != nil && !tempReq && !s.Cfg.Temporary {
+		preferredAccountID = binding.AccountID
+	}
 
-	account, requested := s.selectGenerationAccount(accts, scope, requested, hasher, modelFromDefault)
+	account := s.resolveChatAccountPreferred(accts, scope, requested, hasher, preferredAccountID)
+	if account == nil && modelFromDefault {
+		if fallback := s.resolveChatAccountPreferred(accts, scope, "", hasher, preferredAccountID); fallback != nil {
+			log.Printf("configured default model %q is unavailable; using account default", s.Cfg.DefaultModel)
+			account, requested = fallback, ""
+		}
+	}
 	if account == nil {
 		for _, a := range accts {
 			a.mu.RLock()
@@ -1707,11 +1730,6 @@ func (s *Server) prepareGeneration(
 			msg = fmt.Sprintf("group key is bound to group %q, which has no loaded account", scope.Group)
 		}
 		return nil, transport.NewUpstreamError(msg, 401, "authentication_error", nil, nil)
-	}
-	if binding != nil {
-		if preferred := s.preferBindingAccount(accts, requested, binding.AccountID); preferred != nil {
-			account = preferred
-		}
 	}
 	// The continuation belongs to one account. If that account is no longer
 	// eligible, start from a clean prompt on the replacement instead of sending
@@ -1747,7 +1765,13 @@ func (s *Server) prepareGeneration(
 		return nil, mErr
 	}
 
-	model, requested := s.selectGenerationModel(account, requested, modelFromDefault)
+	model := resolveModelOnAccount(account, requested)
+	if model == nil && modelFromDefault {
+		if fallback := resolveModelOnAccount(account, ""); fallback != nil {
+			log.Printf("configured default model %q is unavailable on account %s; using account default", s.Cfg.DefaultModel, account.ID)
+			model, requested = fallback, ""
+		}
+	}
 	if model == nil {
 		reqLabel := requested
 		if reqLabel == "" {
@@ -1799,10 +1823,10 @@ func (s *Server) prepareGeneration(
 		return nil, err
 	}
 
-	messageParts := prompt.ExtractAttachmentParts(messages)
-	fullAttachmentParts := make([]prompt.AttachmentPart, 0, len(overflowParts)+len(messageParts))
+	imageParts := prompt.ExtractImageParts(messages)
+	fullAttachmentParts := make([]prompt.AttachmentPart, 0, len(overflowParts)+len(imageParts))
 	fullAttachmentParts = append(fullAttachmentParts, overflowParts...)
-	fullAttachmentParts = append(fullAttachmentParts, messageParts...)
+	fullAttachmentParts = append(fullAttachmentParts, imageParts...)
 	attachmentParts := fullAttachmentParts
 
 	hasTools := len(contract.Tools) > 0 && contract.ChoiceMode != "none"
@@ -1812,7 +1836,6 @@ func (s *Server) prepareGeneration(
 		buffered = hasTools
 	}
 
-	tempReq, _ := body["temporary"].(bool)
 	effortVal := extractEffortFromBody(body)
 	if (effortVal == nil || effortVal == "") && inlineThink != "" {
 		effortVal = inlineThink
@@ -1839,28 +1862,46 @@ func (s *Server) prepareGeneration(
 		ProtocolMode:    s.Cfg.ProtocolMode,
 		PersonalContext: s.Cfg.PersonalContext,
 	}
-	skillTarget := s.skillTargetFor(scope, account)
-	opts.SkillRuntime = s.bindSkillRuntime(ctx, account, skillTarget)
 
-	continuation := s.selectContinuation(
-		messages, toolsRaw, toolChoiceRaw, hasher,
-		binding, bindingSplit, sessionKey,
-		account.ID, mid, opts.Temporary,
-		fullPrompt, attachmentParts,
-	)
-	opts.Metadata = continuation.Metadata
-	curPrompt := continuation.Prompt
-	attachmentParts = continuation.Parts
-	cacheKey := continuation.CacheKey
-	cacheSplit := continuation.CacheSplit
+	curPrompt := fullPrompt
+	cacheKey := ""
+	cacheSplit := 0
+	if bindingSplit >= 0 && bindingSplit < len(messages) && !opts.Temporary {
+		opts.Metadata = append([]any(nil), binding.Meta...)
+		cacheKey = sessionKey
+		cacheSplit = bindingSplit
+		if deltaPrompt, _, dErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
+			StartIndex:      bindingSplit,
+			MaxPromptChars:  s.Cfg.MaxPromptChars,
+			MaxOldToolChars: s.Cfg.MaxOldToolChars,
+			AllowOverflow:   false,
+		}); dErr == nil {
+			curPrompt = deltaPrompt
+			attachmentParts = prompt.ExtractImageParts(messages[bindingSplit:])
+		}
+	}
+	if len(opts.Metadata) == 0 && s.Cfg.SessionCache && !opts.Temporary && hasher != nil {
+		selectedKey, cachedMeta, split := s.consumeSessionCacheForGeneration(account.ID, mid, hasher)
+		if len(cachedMeta) > 0 {
+			opts.Metadata = cachedMeta
+			cacheKey = selectedKey
+			cacheSplit = split
+			deltaPrompt, _, dErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
+				StartIndex:      split,
+				MaxPromptChars:  s.Cfg.MaxPromptChars,
+				MaxOldToolChars: s.Cfg.MaxOldToolChars,
+				AllowOverflow:   false,
+			})
+			if dErr == nil {
+				curPrompt = deltaPrompt
+				attachmentParts = prompt.ExtractImageParts(messages[split:])
+			}
+		}
+	}
 	if len(overflowParts) > 0 && len(opts.Metadata) == 0 {
 		account.mu.Lock()
 		account.offloadRequests++
 		account.mu.Unlock()
-	}
-	if skillTarget != "" {
-		fullPrompt = formatSkillPrompt(fullPrompt, skillTarget)
-		curPrompt = formatSkillPrompt(curPrompt, skillTarget)
 	}
 
 	return &preparedGeneration{
@@ -1880,7 +1921,7 @@ func (s *Server) prepareGeneration(
 		curPrompt:           curPrompt,
 		flattenStats:        flattenStats,
 		overflowParts:       overflowParts,
-		messageParts:        messageParts,
+		imageParts:          imageParts,
 		fullAttachmentParts: fullAttachmentParts,
 		attachmentParts:     attachmentParts,
 		hasher:              hasher,
@@ -1891,119 +1932,6 @@ func (s *Server) prepareGeneration(
 }
 
 var lightweightTitleRe = regexp.MustCompile(`(?i)\b(?:generate\s+a\s+(?:concise|short|brief)[,\s]+(?:single[- ]line\s+)?(?:task\s+|session\s+|chat\s+|conversation\s+)?title|write\s+a\s+(?:concise|short|brief)\s+(?:3[-–]6\s+word\s+)?title\s+for\s+this|summarize\s+this\s+(?:conversation|message|chat)\s+(?:in|into)\s+a\s+short\s+title)\b`)
-
-func (s *Server) resolveGenerationRequestModel(raw string) (requested, inlineThink string, fromDefault bool) {
-	raw = strings.TrimSpace(raw)
-	fromDefault = raw == "" && strings.TrimSpace(s.Cfg.DefaultModel) != ""
-	if raw == "" {
-		raw = strings.TrimSpace(s.Cfg.DefaultModel)
-	}
-	requested, inlineThink = gemini.ParseModelRequest(raw)
-	return requested, inlineThink, fromDefault
-}
-
-func (s *Server) selectGenerationAccount(accts []*AccountState, scope AuthScope, requested string, hasher *prompt.HistoryHasher, modelFromDefault bool) (*AccountState, string) {
-	account := s.resolveChatAccount(accts, scope, requested, hasher)
-	if account == nil && modelFromDefault {
-		// A configured default that no account advertises must not take the
-		// whole pool down; fall back to the account's own first model. An
-		// explicit request model keeps the strict model_not_found path.
-		if fallback := s.resolveChatAccount(accts, scope, "", hasher); fallback != nil {
-			log.Printf("configured default model %q is unavailable; using account default", s.Cfg.DefaultModel)
-			return fallback, ""
-		}
-	}
-	return account, requested
-}
-
-func (s *Server) selectGenerationModel(account *AccountState, requested string, modelFromDefault bool) (*gemini.ModelInfo, string) {
-	model := resolveModelOnAccount(account, requested)
-	if model == nil && modelFromDefault {
-		if fallback := resolveModelOnAccount(account, ""); fallback != nil {
-			log.Printf("configured default model %q is unavailable on account %s; using account default", s.Cfg.DefaultModel, account.ID)
-			return fallback, ""
-		}
-	}
-	return model, requested
-}
-
-func (s *Server) bindSkillRuntime(ctx context.Context, account *AccountState, target string) string {
-	if target == "" {
-		return ""
-	}
-	binder, ok := account.Client.(skillRuntimeBinder)
-	if !ok {
-		return ""
-	}
-	handle, err := binder.BindSkillRuntime(ctx, target)
-	if err != nil {
-		log.Printf("cloud Skill %q could not be bound for account %s: %v; turn runs without slot 81", target, account.ID, err)
-		return ""
-	}
-	return handle
-}
-
-type continuationSelection struct {
-	Prompt     string
-	Parts      []prompt.AttachmentPart
-	Metadata   []any
-	CacheKey   string
-	CacheSplit int
-}
-
-// selectContinuation centralizes the precedence between an explicit session
-// binding and the content-addressed continuation cache.
-func (s *Server) selectContinuation(
-	messages []map[string]any,
-	toolsRaw, toolChoiceRaw any,
-	hasher *prompt.HistoryHasher,
-	binding *sessionBinding,
-	bindingSplit int,
-	sessionKey, accountID, model string,
-	temporary bool,
-	fullPrompt string,
-	fullParts []prompt.AttachmentPart,
-) continuationSelection {
-	selection := continuationSelection{Prompt: fullPrompt, Parts: fullParts}
-	if bindingSplit >= 0 && !temporary {
-		selection.Metadata = append([]any(nil), binding.Meta...)
-		selection.CacheKey = sessionKey
-		selection.CacheSplit = bindingSplit
-		if text, parts, ok := s.flattenContinuation(messages, toolsRaw, toolChoiceRaw, bindingSplit); ok {
-			selection.Prompt = text
-			selection.Parts = parts
-		}
-	}
-	if len(selection.Metadata) == 0 && s.Cfg.SessionCache && !temporary && hasher != nil {
-		key, meta, split := s.consumeSessionCacheForGeneration(accountID, model, hasher)
-		if len(meta) > 0 {
-			selection.Metadata = meta
-			selection.CacheKey = key
-			selection.CacheSplit = split
-			if text, parts, ok := s.flattenContinuation(messages, toolsRaw, toolChoiceRaw, split); ok {
-				selection.Prompt = text
-				selection.Parts = parts
-			}
-		}
-	}
-	return selection
-}
-
-func (s *Server) flattenContinuation(messages []map[string]any, toolsRaw, toolChoiceRaw any, start int) (string, []prompt.AttachmentPart, bool) {
-	if start < 0 || start >= len(messages) {
-		return "", nil, false
-	}
-	text, _, err := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
-		StartIndex:      start,
-		MaxPromptChars:  s.Cfg.MaxPromptChars,
-		MaxOldToolChars: s.Cfg.MaxOldToolChars,
-		AllowOverflow:   false,
-	})
-	if err != nil {
-		return "", nil, false
-	}
-	return text, prompt.ExtractAttachmentParts(messages[start:]), true
-}
 
 func isLightweightTitleRequest(messages []map[string]any) bool {
 	if len(messages) == 0 || len(messages) > 4 {

@@ -455,7 +455,6 @@ func (s *Server) runMediaGenerationOnAccount(
 	var (
 		lastFrame gemini.Frame
 		hasFrame  bool
-		media     mediaAccumulator
 	)
 	upstream, err := client.StreamGenerateLive(ctx, genPrompt, opts, func(update *gemini.LineParseResult) error {
 		for _, f := range update.Frames {
@@ -479,7 +478,6 @@ func (s *Server) runMediaGenerationOnAccount(
 			if len(f.GeneratedVideos) == 0 && len(lastFrame.GeneratedVideos) > 0 {
 				f.GeneratedVideos = lastFrame.GeneratedVideos
 			}
-			media.Observe(f)
 			lastFrame = f
 			hasFrame = true
 		}
@@ -555,7 +553,7 @@ func (s *Server) runMediaGenerationOnAccount(
 			Entry:         entry,
 		})
 	}
-	return results, media.AppendMarkdown(lastFrame.Text), nil
+	return results, gemini.AppendGeneratedMediaMarkdown(lastFrame.Text, lastFrame.GeneratedImages, lastFrame.GeneratedVideos), nil
 }
 
 // executeServerSideMediaCalls executes any BuiltinMediaToolName ("generate_media")

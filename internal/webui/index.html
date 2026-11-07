@@ -1439,6 +1439,15 @@
           <div class="form-grid-2">
             <div class="field">
               <div class="field-label-row">
+                <label for="cfg-default-model">Default Model</label>
+                <span id="src-defaultModel" class="source-tag mono">default</span>
+              </div>
+              <input id="cfg-default-model" type="text" class="input mono" placeholder="Account default" autocomplete="off">
+              <span class="helper">Used when a request omits <code class="mono">model</code>; leave blank for account default.</span>
+            </div>
+
+            <div class="field">
+              <div class="field-label-row">
                 <label for="cfg-thinking">Default Thinking Effort</label>
                 <span id="src-defaultThinking" class="source-tag mono">default</span>
               </div>
@@ -2170,6 +2179,7 @@
         document.getElementById('stat-cursor').textContent = currentRotateCursor || 'auto';
         document.getElementById('stat-sessions').textContent = String(metrics.activeSessions || 0);
         document.getElementById('stat-cache').textContent = (metrics.cacheHits || 0) + ' / ' + (metrics.cacheMisses || 0);
+        document.getElementById('cfg-default-model').value = cfg.defaultModel || '';
         document.getElementById('cfg-thinking').value = cfg.defaultThinking || 'low';
         document.getElementById('cfg-strategy').value = cfg.accountStrategy || 'rotate';
         document.getElementById('cfg-preflight').value = cfg.quotaPreflight || 'strict';
@@ -2184,7 +2194,7 @@
         document.getElementById('cfg-history-offload').checked = Boolean(cfg.historyOffload);
 
         const sources = adm.sources || {};
-        ['defaultThinking', 'accountStrategy', 'quotaPreflight', 'accountPriority', 'maxRpmPerAccount', 'maxConcurrentPerAccount'].forEach(function (k) {
+        ['defaultModel', 'defaultThinking', 'accountStrategy', 'quotaPreflight', 'accountPriority', 'maxRpmPerAccount', 'maxConcurrentPerAccount'].forEach(function (k) {
           const el = document.getElementById('src-' + k);
           if (el) el.textContent = sources[k] || 'default';
         });
@@ -2475,6 +2485,7 @@
 
       async function submitConfig(persist) {
         const payload = {
+          defaultModel: document.getElementById('cfg-default-model').value.trim(),
           defaultThinking: document.getElementById('cfg-thinking').value,
           accountStrategy: document.getElementById('cfg-strategy').value,
           quotaPreflight: document.getElementById('cfg-preflight').value,

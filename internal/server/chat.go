@@ -191,7 +191,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	curPrompt := prep.curPrompt
 	flattenStats := prep.flattenStats
 	overflowParts := prep.overflowParts
-	messageParts := prep.messageParts
+	imageParts := prep.imageParts
 	fullAttachmentParts := prep.fullAttachmentParts
 	attachmentParts := prep.attachmentParts
 	hasher := prep.hasher
@@ -227,6 +227,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	reasoningText := ""
 
 	writeExtensionLocked := func(ext sseExtensionChunk) {
+		if ctx.Err() != nil || handlerDone.Load() {
+			return
+		}
 		b, err := json.Marshal(&ext)
 		if err != nil {
 			return
@@ -257,14 +260,13 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			},
 		})
 	}
-	// Error paths after headers must still close a started reasoning lifecycle.
-	defer func() {
+	closeReasoningIfStarted := func() {
 		streamMu.Lock()
 		if headersSent {
 			closeReasoningLocked()
 		}
 		streamMu.Unlock()
-	}()
+	}
 
 	// markPhase records a phase timestamp once, in milliseconds from request
 	// start. A value stays -1 until that phase is actually observed.
@@ -386,13 +388,12 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		sigBytes, _ := json.Marshal(payload)
 		sig := string(sigBytes)
 		streamMu.Lock()
+		defer streamMu.Unlock()
 		if !headersSent {
 			pendingAction = a
-			streamMu.Unlock()
 			return
 		}
 		if sig == lastActionSig {
-			streamMu.Unlock()
 			return
 		}
 		lastActionSig = sig
@@ -404,32 +405,6 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			ProtocolVersion: 3,
 			ActionStatus:    payload,
 		})
-		streamMu.Unlock()
-	}
-	queueActionStatus := func(a *gemini.ActionStatus) {
-		if a == nil {
-			return
-		}
-		streamMu.Lock()
-		sent := headersSent
-		if !sent {
-			pendingAction = a
-		}
-		streamMu.Unlock()
-		if sent {
-			emitActionStatus(a)
-		}
-	}
-	flushPendingAction := func() {
-		streamMu.Lock()
-		a := pendingAction
-		if a == nil || !headersSent {
-			streamMu.Unlock()
-			return
-		}
-		pendingAction = nil
-		streamMu.Unlock()
-		emitActionStatus(a)
 	}
 
 	var pinger *streamPinger
@@ -442,9 +417,10 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		p.Stop()
 	}
 	defer stopKeepalive()
-	// Defers run LIFO, so this runs before stopKeepalive: the pinger sees
-	// handlerDone and exits instead of writing after the handler returns.
+	// Defers run LIFO, so handlerDone runs before stopKeepalive and
+	// closeReasoningIfStarted runs before handlerDone.
 	defer handlerDone.Store(true)
+	defer closeReasoningIfStarted()
 
 	// streamStarted closes as soon as the response headers are flushed, so the
 	// grace timer below does not keep a goroutine alive after streaming begins.
@@ -483,6 +459,13 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		pingerMu.Unlock()
 
 		emit(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+		streamMu.Lock()
+		pa := pendingAction
+		pendingAction = nil
+		streamMu.Unlock()
+		if pa != nil {
+			emitActionStatus(pa)
+		}
 	}
 
 	// startStream reads the caller-owned attempt diagnostics, so it must only be
@@ -542,6 +525,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 	rebootstrapNext := false
 	priorAttemptSentThought := false
 	serverMediaRounds := 0
+	var skillTurn skillTurnState
+	sendPrompt := curPrompt
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		curAttempt = attempt
 		var (
@@ -553,7 +538,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			servedID, servedLabel string
 			identityConflict      bool
 			mediaToolUsed         bool
-			media                 mediaAccumulator
+			lastImages            []gemini.GeneratedImage
+			lastVideos            []gemini.GeneratedVideo
 			lastCID, lastRID      string
 			lastContextToken      string
 			grounding             []gemini.GroundingSource
@@ -605,6 +591,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		opts.FreshSocket = freshSocketNext
 		if rebootstrapNext {
 			_ = c.Bootstrap(ctx)
+			skillTurn.invalidate()
 		}
 		freshSocketNext = false
 		rebootstrapNext = false
@@ -621,11 +608,12 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		if uploadErr != nil {
 			streamErr = uploadErr
 		} else {
+			sendPrompt = skillTurn.prepare(ctx, s, scope, account, &opts, curPrompt)
 			upstreamCalls++
 			account.mu.Lock()
 			account.activeStreams++
 			account.mu.Unlock()
-			upstream, streamErr = c.StreamGenerateLive(ctx, curPrompt, opts, func(update *gemini.LineParseResult) error {
+			upstream, streamErr = c.StreamGenerateLive(ctx, sendPrompt, opts, func(update *gemini.LineParseResult) error {
 				attemptStateMu.Lock()
 				if update.MediaToolActive {
 					mediaToolUsed = true
@@ -648,10 +636,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 				if stream && buffered && ctx.Err() == nil && identityVerifiedNow {
 					startStream(false)
-					flushPendingAction()
 				}
 				if update.Action != nil {
-					queueActionStatus(update.Action)
+					emitActionStatus(update.Action)
 				}
 
 				if update.CID != "" {
@@ -674,9 +661,14 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 					attemptStateMu.Lock()
 					s.rewriteFrameMedia(ctx, account.ID, &frame)
-					media.Observe(frame)
-					if media.HasMedia() {
+					if len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0 {
 						mediaToolUsed = true
+						if len(frame.GeneratedImages) > 0 {
+							lastImages = frame.GeneratedImages
+						}
+						if len(frame.GeneratedVideos) > 0 {
+							lastVideos = frame.GeneratedVideos
+						}
 					}
 					if mediaToolUsed {
 						servedID = model.ModelID
@@ -696,7 +688,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					thoughts = mergeStreamedThoughts(thoughts, frame.Thoughts)
 					done = frame.Done
 					if done {
-						text = media.AppendMarkdown(text)
+						text = gemini.AppendGeneratedMediaMarkdown(text, lastImages, lastVideos)
 					}
 					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
 					attemptStateMu.Unlock()
@@ -729,7 +721,6 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if identityVerified {
 							startStream(false)
-							flushPendingAction()
 						}
 						if identityVerified && s.Cfg.LiveThoughts {
 							if hasTools && !s.Cfg.KeepToolPreamble && sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) {
@@ -775,7 +766,6 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 					}
 				}
-				flushPendingAction()
 				return nil
 			})
 			account.mu.Lock()
@@ -1039,9 +1029,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 								AllowOverflow:   s.Cfg.HistoryOffload,
 							}); cErr == nil {
 								curPrompt = appendErrorReplyRecoveryNote(compacted, hasTools)
-								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(messageParts))
+								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(imageParts))
 								attachmentParts = append(attachmentParts, extraOverflow...)
-								attachmentParts = append(attachmentParts, messageParts...)
+								attachmentParts = append(attachmentParts, imageParts...)
 								continue
 							}
 						}
@@ -1084,7 +1074,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"model":              mid,
 				"account":            account.ID,
 				"effort":             effortStr,
-				"prompt_bytes":       len(curPrompt),
+				"prompt_bytes":       len(sendPrompt),
 				"header_bytes":       flattenStats.HeaderBytes,
 				"body_bytes":         flattenStats.BodyBytes,
 				"footer_bytes":       flattenStats.FooterBytes,
@@ -1112,6 +1102,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
 			})
 			if ctx.Err() == nil {
+				closeReasoningIfStarted()
 				sendChatError(w, headersSent, runCheck)
 			}
 			return
@@ -1140,8 +1131,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				continue
 			}
 			calls = clientCalls
-		} else if hasTools && len(calls) == 0 && media.HasMedia() && serverMediaRounds < 2 && sentText == "" {
-			if promptAdd := formatDirectMediaToolContinuation(media.Images(), media.Videos()); promptAdd != "" {
+		} else if hasTools && len(calls) == 0 && (len(lastImages) > 0 || len(lastVideos) > 0) && serverMediaRounds < 2 && sentText == "" {
+			if promptAdd := formatDirectMediaToolContinuation(lastImages, lastVideos); promptAdd != "" {
 				fullPrompt = fullPrompt + promptAdd
 				curPrompt = fullPrompt
 				opts.Metadata = nil
@@ -1216,6 +1207,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					oaCalls, finalizeErr = toolStreamer.FinalizeError(calls, text)
 					if finalizeErr != nil {
 						if ctx.Err() == nil {
+							closeReasoningIfStarted()
 							sendChatError(w, headersSent, finalizeErr)
 						}
 						return
@@ -1312,7 +1304,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			"model":              mid,
 			"account":            account.ID,
 			"effort":             effortStr,
-			"prompt_bytes":       len(curPrompt),
+			"prompt_bytes":       len(sendPrompt),
 			"header_bytes":       flattenStats.HeaderBytes,
 			"body_bytes":         flattenStats.BodyBytes,
 			"footer_bytes":       flattenStats.FooterBytes,

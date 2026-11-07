@@ -1089,10 +1089,50 @@ func trimIncompleteTrailingURL(text string) string {
 	for i > 0 && text[i-1] >= 0x21 && text[i-1] <= 0x7e {
 		i--
 	}
-	if tail := text[i:]; strings.Contains(tail, "http://") || strings.Contains(tail, "https://") {
-		return text[:i]
+	tail := text[i:]
+	if tail == "" {
+		return text
 	}
-	return text
+	lower := strings.ToLower(tail)
+	u := indexHTTPURL(lower)
+	if u < 0 {
+		u = trailingPartialHTTPURL(lower)
+	}
+	if u < 0 {
+		return text
+	}
+	for b := 0; b < 2 && u > 0 && tail[u-1] == '['; b++ {
+		u--
+	}
+	return text[:i+u]
+}
+
+func indexHTTPURL(lower string) int {
+	i1 := strings.Index(lower, "http://")
+	i2 := strings.Index(lower, "https://")
+	switch {
+	case i1 < 0:
+		return i2
+	case i2 < 0:
+		return i1
+	case i1 < i2:
+		return i1
+	default:
+		return i2
+	}
+}
+
+func trailingPartialHTTPURL(lower string) int {
+	for start := max(0, len(lower)-len("https:/")); start < len(lower); start++ {
+		sub := lower[start:]
+		if strings.HasPrefix("http://", sub) || strings.HasPrefix("https://", sub) {
+			return start
+		}
+	}
+	if strings.HasSuffix(lower, "[") {
+		return len(lower)
+	}
+	return -1
 }
 
 func actionArray(frame []any, slot, field int) []any {

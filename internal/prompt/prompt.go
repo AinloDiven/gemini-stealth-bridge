@@ -26,7 +26,7 @@ import (
 )
 
 var (
-	dataURLAttachmentRe     = regexp.MustCompile(`^data:([a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+)(?:;[a-zA-Z0-9_.+-]+=[^;,]+)*;base64,([A-Za-z0-9+/=\s_-]+)$`)
+	dataURLImageRe          = regexp.MustCompile(`^data:([a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+)(?:;[a-zA-Z0-9_.+-]+=[^;,]+)*;base64,([A-Za-z0-9+/=\s_-]+)$`)
 	defaultFilenameRe       = regexp.MustCompile(`^(?:image|audio|video|file)_\d+\.[a-z0-9]+$`)
 	nonAlphaNumRe           = regexp.MustCompile(`[^a-z0-9]`)
 	fencedToolCallRe        = regexp.MustCompile("(?is)```(?:json)?\\s*\\{\\s*\"(?:tool_calls|toolCalls|function_call)\"[\\s\\S]*?```")
@@ -49,8 +49,8 @@ func isContextNote(s string) bool {
 	return strings.HasPrefix(s, "[Context note:") || strings.HasPrefix(s, "Instruction: [")
 }
 
-// DetectAttachmentMIME infers the MIME type and file extension of an attachment from its magic bytes or fallback MIME.
-func DetectAttachmentMIME(data []byte, fallback string) (mimeType string, ext string) {
+// DetectImageMIME infers the MIME type and file extension of an attachment from its magic bytes or fallback MIME.
+func DetectImageMIME(data []byte, fallback string) (mimeType string, ext string) {
 	fbLower := strings.ToLower(strings.TrimSpace(strings.Split(fallback, ";")[0]))
 	if fbLower == "" {
 		fbLower = "image/png"
@@ -104,84 +104,61 @@ func DetectAttachmentMIME(data []byte, fallback string) (mimeType string, ext st
 	return normalizeFallbackMIME(fbLower)
 }
 
-// mimeSpec is the single source of truth for MIME aliases, filename
-// extensions, and audio format spellings. Detection by magic bytes stays in
-// DetectAttachmentMIME; everything name- or hint-based goes through this table.
-type mimeSpec struct {
-	MIME         string
-	Ext          string
-	Aliases      []string
-	Extensions   []string
-	AudioFormats []string
-}
-
-var mimeSpecs = []mimeSpec{
-	{MIME: "image/png", Ext: "png", Extensions: []string{"png"}},
-	{MIME: "image/jpeg", Ext: "jpg", Aliases: []string{"image/jpg"}, Extensions: []string{"jpg", "jpeg"}},
-	{MIME: "image/gif", Ext: "gif", Extensions: []string{"gif"}},
-	{MIME: "image/webp", Ext: "webp", Extensions: []string{"webp"}},
-	{MIME: "image/svg+xml", Ext: "svg"},
-	{MIME: "application/pdf", Ext: "pdf", Extensions: []string{"pdf"}},
-	{MIME: "audio/mpeg", Ext: "mp3", Aliases: []string{"audio/mp3"}, Extensions: []string{"mp3"}, AudioFormats: []string{"mp3", "mpeg"}},
-	{MIME: "audio/wav", Ext: "wav", Aliases: []string{"audio/x-wav", "audio/wave"}, Extensions: []string{"wav"}, AudioFormats: []string{"wav", "wave", "x-wav", "pcm16", ""}},
-	{MIME: "audio/ogg", Ext: "ogg", Aliases: []string{"audio/opus"}, Extensions: []string{"ogg", "opus"}, AudioFormats: []string{"ogg", "opus"}},
-	{MIME: "audio/flac", Ext: "flac", Aliases: []string{"audio/x-flac"}, Extensions: []string{"flac"}, AudioFormats: []string{"flac", "x-flac"}},
-	{MIME: "audio/mp4", Ext: "m4a", Aliases: []string{"audio/m4a", "audio/x-m4a"}, Extensions: []string{"m4a"}, AudioFormats: []string{"m4a", "mp4", "x-m4a"}},
-	{MIME: "audio/aac", Ext: "aac", Extensions: []string{"aac"}, AudioFormats: []string{"aac"}},
-	{MIME: "audio/webm", Ext: "webm", AudioFormats: []string{"webm"}},
-	{MIME: "video/mp4", Ext: "mp4", Extensions: []string{"mp4"}},
-	{MIME: "video/webm", Ext: "webm", Extensions: []string{"webm"}},
-	{MIME: "video/quicktime", Ext: "mov", Extensions: []string{"mov"}},
-	{MIME: "text/plain", Ext: "txt", Extensions: []string{"txt", "log"}},
-	{MIME: "text/markdown", Ext: "md", Aliases: []string{"text/x-markdown"}, Extensions: []string{"md"}},
-	{MIME: "text/csv", Ext: "csv", Extensions: []string{"csv"}},
-	{MIME: "application/json", Ext: "json", Extensions: []string{"json"}},
-	{MIME: "application/octet-stream", Ext: "bin", Extensions: []string{"bin"}},
-}
-
-type mimeIndexes struct {
-	byAlias map[string]mimeSpec
-	byExt   map[string]mimeSpec
-	byAudio map[string]mimeSpec
-}
-
-var mimeIndex = func() mimeIndexes {
-	idx := mimeIndexes{
-		byAlias: make(map[string]mimeSpec),
-		byExt:   make(map[string]mimeSpec),
-		byAudio: make(map[string]mimeSpec),
+var (
+	mimeAliases = map[string]string{
+		"image/jpg":       "image/jpeg",
+		"audio/mp3":       "audio/mpeg",
+		"audio/x-wav":     "audio/wav",
+		"audio/wave":      "audio/wav",
+		"audio/opus":      "audio/ogg",
+		"audio/x-flac":    "audio/flac",
+		"audio/m4a":       "audio/mp4",
+		"audio/x-m4a":     "audio/mp4",
+		"text/x-markdown": "text/markdown",
 	}
-	for _, spec := range mimeSpecs {
-		idx.byAlias[spec.MIME] = spec
-		for _, alias := range spec.Aliases {
-			idx.byAlias[alias] = spec
-		}
-		for _, ext := range spec.Extensions {
-			idx.byExt[ext] = spec
-		}
-		for _, format := range spec.AudioFormats {
-			idx.byAudio[format] = spec
-		}
+	mimeExts = map[string]string{
+		"image/jpeg":               "jpg",
+		"image/svg+xml":            "svg",
+		"audio/mpeg":               "mp3",
+		"audio/mp4":                "m4a",
+		"video/quicktime":          "mov",
+		"text/plain":               "txt",
+		"text/markdown":            "md",
+		"application/octet-stream": "bin",
 	}
-	return idx
-}()
+	extToMIME = map[string]string{
+		"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+		"gif": "image/gif", "webp": "image/webp", "pdf": "application/pdf",
+		"mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg", "opus": "audio/ogg",
+		"flac": "audio/flac", "m4a": "audio/mp4", "aac": "audio/aac",
+		"mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime",
+		"txt": "text/plain", "log": "text/plain", "md": "text/markdown",
+		"csv": "text/csv", "json": "application/json", "bin": "application/octet-stream",
+	}
+	audioFormatMIME = map[string]string{
+		"": "audio/wav", "wav": "audio/wav", "wave": "audio/wav", "x-wav": "audio/wav", "pcm16": "audio/wav",
+		"mp3": "audio/mpeg", "mpeg": "audio/mpeg",
+		"ogg": "audio/ogg", "opus": "audio/ogg",
+		"flac": "audio/flac", "x-flac": "audio/flac",
+		"m4a": "audio/mp4", "mp4": "audio/mp4", "x-m4a": "audio/mp4",
+		"aac": "audio/aac", "webm": "audio/webm",
+	}
+)
 
 func normalizeFallbackMIME(fbLower string) (string, string) {
-	if spec, ok := mimeIndex.byAlias[fbLower]; ok {
-		return spec.MIME, spec.Ext
-	}
 	if fbLower == "" {
 		return "image/png", "png"
 	}
+	if canonical, ok := mimeAliases[fbLower]; ok {
+		fbLower = canonical
+	}
+	if ext, ok := mimeExts[fbLower]; ok {
+		return fbLower, ext
+	}
 	ext := "png"
 	if parts := strings.Split(fbLower, "/"); len(parts) > 1 {
-		cleaned := nonAlphaNumRe.ReplaceAllString(parts[1], "")
-		if cleaned != "" {
-			if cleaned == "jpeg" {
-				ext = "jpg"
-			} else {
-				ext = cleaned
-			}
+		if cleaned := nonAlphaNumRe.ReplaceAllString(parts[1], ""); cleaned != "" {
+			ext = cleaned
 		}
 	}
 	return fbLower, ext
@@ -235,12 +212,8 @@ func inferMIMEFromFilename(filename, fallback string) string {
 		return strings.TrimSpace(fallback)
 	}
 	lower := strings.ToLower(strings.TrimSpace(filename))
-	idx := strings.LastIndex(lower, ".")
-	if idx < 0 || idx == len(lower)-1 {
-		return ""
-	}
-	if spec, ok := mimeIndex.byExt[lower[idx+1:]]; ok {
-		return spec.MIME
+	if idx := strings.LastIndex(lower, "."); idx >= 0 && idx < len(lower)-1 {
+		return extToMIME[lower[idx+1:]]
 	}
 	return ""
 }
@@ -250,8 +223,8 @@ func audioFormatToMIME(format string) string {
 	if strings.Contains(f, "/") {
 		return f
 	}
-	if spec, ok := mimeIndex.byAudio[f]; ok {
-		return spec.MIME
+	if m, ok := audioFormatMIME[f]; ok {
+		return m
 	}
 	return "audio/" + f
 }
@@ -291,9 +264,9 @@ type FlattenStats struct {
 	ToolSchemaBytes int `json:"toolSchemaBytes"`
 }
 
-// ParseDataURLAttachment decodes a data:<mime>;base64,... URL into an AttachmentPart.
-func ParseDataURLAttachment(rawURL string, index int) *AttachmentPart {
-	m := dataURLAttachmentRe.FindStringSubmatch(strings.TrimSpace(rawURL))
+// ParseDataURLImage decodes a data:<mime>;base64,... URL into an AttachmentPart.
+func ParseDataURLImage(rawURL string, index int) *AttachmentPart {
+	m := dataURLImageRe.FindStringSubmatch(strings.TrimSpace(rawURL))
 	if len(m) < 3 {
 		return nil
 	}
@@ -301,7 +274,7 @@ func ParseDataURLAttachment(rawURL string, index int) *AttachmentPart {
 	if err != nil || len(data) == 0 {
 		return nil
 	}
-	contentType, ext := DetectAttachmentMIME(data, strings.ToLower(m[1]))
+	contentType, ext := DetectImageMIME(data, strings.ToLower(m[1]))
 	return &AttachmentPart{
 		Data:        data,
 		ContentType: contentType,
@@ -309,238 +282,126 @@ func ParseDataURLAttachment(rawURL string, index int) *AttachmentPart {
 	}
 }
 
-func extractSingleAttachmentPart(part map[string]any, index int) *AttachmentPart {
+func extractSingleImagePart(part map[string]any, index int) *AttachmentPart {
 	if part == nil {
 		return nil
 	}
-	withFilename := func(att *AttachmentPart, explicitName string) *AttachmentPart {
-		if att == nil {
-			return nil
+	pType, _ := part["type"].(string)
+	var defaultMIME string
+	allowRawData := true
+	switch pType {
+	case "image_url", "input_image":
+		allowRawData = false
+	case "image":
+		defaultMIME = "image/png"
+	case "input_audio", "audio":
+		defaultMIME = "audio/wav"
+	case "video_url", "input_video", "video":
+		defaultMIME = "video/mp4"
+	case "file", "input_file", "document":
+		defaultMIME = "application/pdf"
+	default:
+		return nil
+	}
+
+	var rawURL string
+	maps := make([]map[string]any, 0, 3)
+	for _, k := range []string{pType, "image_url", "video_url", "input_audio", "audio", "input_video", "video", "file", "input_file", "source"} {
+		if s, ok := part[k].(string); ok && rawURL == "" && (k == "image_url" || k == "video_url") {
+			rawURL = strings.TrimSpace(s)
+		} else if sub, ok := part[k].(map[string]any); ok && sub != nil {
+			maps = append(maps, sub)
 		}
-		if explicitName != "" {
+	}
+	maps = append(maps, part)
+
+	pick := func(keys ...string) string {
+		for _, m := range maps {
+			for _, k := range keys {
+				if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
+					return strings.TrimSpace(v)
+				}
+			}
+		}
+		return ""
+	}
+
+	if rawURL == "" {
+		rawURL = pick("url", "file_url", "video_url")
+	}
+	var dataStr string
+	if allowRawData {
+		dataStr = pick("data", "file_data", "video_data")
+	}
+	mime := pick("mime_type", "media_type", "content_type", "mediaType", "mimeType")
+	filename := pick("filename", "file_name", "name", "title")
+	if formatStr := pick("format"); mime == "" && formatStr != "" {
+		if pType == "input_audio" || pType == "audio" {
+			mime = audioFormatToMIME(formatStr)
+		} else if f := strings.ToLower(strings.TrimPrefix(formatStr, ".")); strings.Contains(f, "/") {
+			mime = f
+		} else {
+			mime = inferMIMEFromFilename("x."+f, "")
+		}
+	}
+	mime = inferMIMEFromFilename(filename, mime)
+	if mime == "" && rawURL != "" && !strings.HasPrefix(strings.ToLower(rawURL), "data:") {
+		if parsed, err := url.Parse(rawURL); err == nil {
+			mime = inferMIMEFromFilename(parsed.Path, "")
+		}
+	}
+	if mime == "" {
+		mime = defaultMIME
+	}
+
+	finish := func(att *AttachmentPart) *AttachmentPart {
+		if att != nil && filename != "" {
 			_, ext := normalizeFallbackMIME(att.ContentType)
-			if clean := sanitizeAttachmentFilename(explicitName, ext); clean != "" {
+			if clean := sanitizeAttachmentFilename(filename, ext); clean != "" {
 				att.Filename = clean
 			}
 		}
 		return att
 	}
-	fromURL := func(rawURL, fallbackMIME, explicitName string) *AttachmentPart {
-		u := strings.TrimSpace(rawURL)
-		if u == "" {
-			return nil
-		}
-		fallbackMIME = inferMIMEFromFilename(explicitName, fallbackMIME)
-		lower := strings.ToLower(u)
-		if strings.HasPrefix(lower, "data:") {
-			return withFilename(ParseDataURLAttachment(u, index), explicitName)
-		}
-		if strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") {
-			mime, ext := DetectAttachmentMIME(nil, fallbackMIME)
-			return withFilename(&AttachmentPart{
-				RemoteURL:   u,
-				ContentType: mime,
-				Filename:    defaultAttachmentFilename(mime, ext, index),
-			}, explicitName)
-		}
+	target := rawURL
+	if target == "" {
+		target = dataStr
+	}
+	if target == "" {
 		return nil
 	}
-	fromRawOrURL := func(rawData, fallbackMIME, explicitName string) *AttachmentPart {
-		s := strings.TrimSpace(rawData)
-		if s == "" {
-			return nil
-		}
-		lower := strings.ToLower(s)
-		if strings.HasPrefix(lower, "data:") || strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") {
-			return fromURL(s, fallbackMIME, explicitName)
-		}
-		fallbackMIME = inferMIMEFromFilename(explicitName, fallbackMIME)
-		if fallbackMIME == "" {
-			fallbackMIME = "application/octet-stream"
-		}
-		data, err := decodeBase64Payload(s)
-		if err != nil || len(data) == 0 {
-			return nil
-		}
-		contentType, ext := DetectAttachmentMIME(data, fallbackMIME)
-		return withFilename(&AttachmentPart{
-			Data:        data,
-			ContentType: contentType,
-			Filename:    defaultAttachmentFilename(contentType, ext, index),
-		}, explicitName)
+	lower := strings.ToLower(target)
+	if strings.HasPrefix(lower, "data:") {
+		return finish(ParseDataURLImage(target, index))
 	}
-	extractMIME := func(m map[string]any) string {
-		for _, k := range []string{"mime_type", "media_type", "content_type", "mediaType", "mimeType"} {
-			if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
-				return strings.TrimSpace(v)
-			}
-		}
-		return ""
+	if strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://") {
+		ct, ext := DetectImageMIME(nil, mime)
+		return finish(&AttachmentPart{
+			RemoteURL:   target,
+			ContentType: ct,
+			Filename:    defaultAttachmentFilename(ct, ext, index),
+		})
 	}
-	extractName := func(m map[string]any) string {
-		for _, k := range []string{"filename", "file_name", "name", "title"} {
-			if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
-				return strings.TrimSpace(v)
-			}
-		}
-		return ""
+	if rawURL != "" {
+		return nil
 	}
-
-	pType, _ := part["type"].(string)
-	switch pType {
-	case "image_url", "input_image":
-		var rawURL, mime, filename string
-		if s, ok := part["image_url"].(string); ok {
-			rawURL = s
-		} else if sub, ok := part["image_url"].(map[string]any); ok {
-			rawURL, _ = sub["url"].(string)
-			mime = extractMIME(sub)
-			filename = extractName(sub)
-		}
-		if rawURL == "" {
-			rawURL, _ = part["url"].(string)
-		}
-		if mime == "" {
-			mime = extractMIME(part)
-		}
-		if filename == "" {
-			filename = extractName(part)
-		}
-		return fromURL(rawURL, mime, filename)
-	case "image":
-		var rawURL, dataStr string
-		mime := extractMIME(part)
-		filename := extractName(part)
-		if s, ok := part["image_url"].(string); ok {
-			rawURL = s
-		} else if sub, ok := part["image_url"].(map[string]any); ok {
-			rawURL, _ = sub["url"].(string)
-			if mime == "" {
-				mime = extractMIME(sub)
-			}
-			if filename == "" {
-				filename = extractName(sub)
-			}
-		} else if src, ok := part["source"].(map[string]any); ok {
-			rawURL, _ = src["url"].(string)
-			dataStr, _ = src["data"].(string)
-			if mime == "" {
-				mime = extractMIME(src)
-			}
-		}
-		if rawURL == "" {
-			rawURL, _ = part["url"].(string)
-		}
-		if rawURL != "" {
-			return fromURL(rawURL, mime, filename)
-		}
-		if dataStr == "" {
-			dataStr, _ = part["data"].(string)
-		}
-		if dataStr != "" {
-			if mime == "" {
-				mime = "image/png"
-			}
-			return fromRawOrURL(dataStr, mime, filename)
-		}
-	case "input_audio", "audio":
-		var rawURL, dataStr, formatStr string
-		mime := extractMIME(part)
-		filename := extractName(part)
-		for _, subKey := range []string{"input_audio", "audio"} {
-			if sub, ok := part[subKey].(map[string]any); ok && sub != nil {
-				if dataStr == "" {
-					dataStr, _ = sub["data"].(string)
-				}
-				if rawURL == "" {
-					rawURL, _ = sub["url"].(string)
-				}
-				if formatStr == "" {
-					formatStr, _ = sub["format"].(string)
-				}
-				if mime == "" {
-					mime = extractMIME(sub)
-				}
-				if filename == "" {
-					filename = extractName(sub)
-				}
-			}
-		}
-		if dataStr == "" {
-			dataStr, _ = part["data"].(string)
-		}
-		if rawURL == "" {
-			rawURL, _ = part["url"].(string)
-		}
-		if formatStr == "" {
-			formatStr, _ = part["format"].(string)
-		}
-		if mime == "" {
-			if formatStr != "" {
-				mime = audioFormatToMIME(formatStr)
-			} else {
-				mime = inferMIMEFromFilename(filename, "audio/wav")
-			}
-		}
-		if rawURL != "" {
-			return fromURL(rawURL, mime, filename)
-		}
-		if dataStr != "" {
-			return fromRawOrURL(dataStr, mime, filename)
-		}
-	case "file", "input_file", "document":
-		var rawURL, dataStr string
-		mime := extractMIME(part)
-		filename := extractName(part)
-		for _, subKey := range []string{"file", "input_file", "source"} {
-			if sub, ok := part[subKey].(map[string]any); ok && sub != nil {
-				if dataStr == "" {
-					dataStr, _ = sub["file_data"].(string)
-				}
-				if dataStr == "" {
-					dataStr, _ = sub["data"].(string)
-				}
-				if rawURL == "" {
-					rawURL, _ = sub["file_url"].(string)
-				}
-				if rawURL == "" {
-					rawURL, _ = sub["url"].(string)
-				}
-				if mime == "" {
-					mime = extractMIME(sub)
-				}
-				if filename == "" {
-					filename = extractName(sub)
-				}
-			}
-		}
-		if dataStr == "" {
-			dataStr, _ = part["file_data"].(string)
-		}
-		if dataStr == "" {
-			dataStr, _ = part["data"].(string)
-		}
-		if rawURL == "" {
-			rawURL, _ = part["file_url"].(string)
-		}
-		if rawURL == "" {
-			rawURL, _ = part["url"].(string)
-		}
-		if mime == "" {
-			mime = inferMIMEFromFilename(filename, "application/pdf")
-		}
-		if rawURL != "" {
-			return fromURL(rawURL, mime, filename)
-		}
-		if dataStr != "" {
-			return fromRawOrURL(dataStr, mime, filename)
-		}
+	if mime == "" {
+		mime = "application/octet-stream"
 	}
-	return nil
+	data, err := decodeBase64Payload(target)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	ct, ext := DetectImageMIME(data, mime)
+	return finish(&AttachmentPart{
+		Data:        data,
+		ContentType: ct,
+		Filename:    defaultAttachmentFilename(ct, ext, index),
+	})
 }
 
-// ExtractAttachmentParts extracts all inline base64 or remote http(s) attachments from OpenAI/Anthropic message arrays.
-func ExtractAttachmentParts(messages []map[string]any) []AttachmentPart {
+// ExtractImageParts extracts all inline base64 or remote http(s) attachments from OpenAI/Anthropic message arrays.
+func ExtractImageParts(messages []map[string]any) []AttachmentPart {
 	var images []AttachmentPart
 	for _, m := range messages {
 		if m == nil {
@@ -555,7 +416,7 @@ func ExtractAttachmentParts(messages []map[string]any) []AttachmentPart {
 			if !ok || part == nil {
 				continue
 			}
-			if att := extractSingleAttachmentPart(part, len(images)); att != nil {
+			if att := extractSingleImagePart(part, len(images)); att != nil {
 				images = append(images, *att)
 			}
 		}
@@ -563,9 +424,9 @@ func ExtractAttachmentParts(messages []map[string]any) []AttachmentPart {
 	return images
 }
 
-// FetchRemoteAttachment downloads an http(s) attachment URL with SSRF protection, a 20MB cap,
+// FetchRemoteImage downloads an http(s) attachment URL with SSRF protection, a 20MB cap,
 // and magic-byte MIME detection.
-func FetchRemoteAttachment(ctx context.Context, rawURL string, index int) (*AttachmentPart, error) {
+func FetchRemoteImage(ctx context.Context, rawURL string, index int) (*AttachmentPart, error) {
 	parsed, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return nil, transport.NewUpstreamError("invalid remote image URL", 400, "invalid_request_error", nil, err)
@@ -634,7 +495,7 @@ func FetchRemoteAttachment(ctx context.Context, rawURL string, index int) (*Atta
 		return nil, transport.NewUpstreamError("remote image exceeds 20MB limit", 400, "invalid_request_error", nil, nil)
 	}
 	headerMIME := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
-	mime, ext := DetectAttachmentMIME(data, headerMIME)
+	mime, ext := DetectImageMIME(data, headerMIME)
 	if index < 0 {
 		index = 0
 	}
@@ -688,9 +549,10 @@ func FlattenMessagesWithStats(
 	opts FlattenOptions,
 ) (string, []AttachmentPart, FlattenStats, error) {
 	var (
-		sys       []string
-		turns     []turnEntry
-		callNames = make(map[string]string)
+		sys          []string
+		turns        []turnEntry
+		callNames    = make(map[string]string)
+		imageCounter int
 	)
 
 	for _, m := range messages {
@@ -738,7 +600,7 @@ func FlattenMessagesWithStats(
 			if name == "" {
 				name = "tool"
 			}
-			text := spoofedRoleLineRe.ReplaceAllString(contentToText(m["content"]), "$1 :")
+			text := spoofedRoleLineRe.ReplaceAllString(contentToText(m["content"], &imageCounter), "$1 :")
 			idSuffix := ""
 			if tcID != "" {
 				idSuffix = fmt.Sprintf(" (%s)", tcID)
@@ -752,7 +614,7 @@ func FlattenMessagesWithStats(
 			continue
 		}
 
-		text := contentToText(m["content"])
+		text := contentToText(m["content"], &imageCounter)
 		if role != "assistant" && role != "system" && role != "developer" {
 			text = spoofedRoleLineRe.ReplaceAllString(text, "$1 :")
 		}
@@ -1296,7 +1158,7 @@ func normalizeMessageForHash(m map[string]any) any {
 			if pType == "text" || pType == "input_text" {
 				t, _ := p["text"].(string)
 				parts = append(parts, t)
-			} else if att := extractSingleAttachmentPart(p, len(imgDigests)); att != nil {
+			} else if att := extractSingleImagePart(p, len(imgDigests)); att != nil {
 				if att.RemoteURL != "" {
 					imgDigests = append(imgDigests, "url:"+att.RemoteURL)
 				} else if len(att.Data) > 0 {
@@ -1355,7 +1217,21 @@ func normalizeMessageForHash(m map[string]any) any {
 	return entry
 }
 
-func contentToText(content any) string {
+func attachmentPlaceholder(mimeType string, n int) string {
+	m := strings.ToLower(strings.TrimSpace(mimeType))
+	switch {
+	case strings.HasPrefix(m, "image/"):
+		return fmt.Sprintf("[Attached image #%d]", n)
+	case strings.HasPrefix(m, "audio/"):
+		return fmt.Sprintf("[Attached audio #%d]", n)
+	case strings.HasPrefix(m, "video/"):
+		return fmt.Sprintf("[Attached video #%d]", n)
+	default:
+		return fmt.Sprintf("[Attached file #%d]", n)
+	}
+}
+
+func contentToText(content any, imageCounter *int) string {
 	switch c := content.(type) {
 	case nil:
 		return ""
@@ -1371,6 +1247,9 @@ func contentToText(content any) string {
 			} else if m, ok := item.(map[string]any); ok && m != nil {
 				if t, ok := m["text"].(string); ok && t != "" {
 					parts = append(parts, t)
+				} else if att := extractSingleImagePart(m, *imageCounter); att != nil {
+					*imageCounter++
+					parts = append(parts, attachmentPlaceholder(att.ContentType, *imageCounter))
 				}
 			}
 		}

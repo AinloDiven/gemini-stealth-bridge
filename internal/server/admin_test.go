@@ -156,6 +156,21 @@ func TestAdminConfigPatchAndEnvFilePersistence(t *testing.T) {
 	if reloaded.FieldSources["BRIDGE_DEFAULT_MODEL"] != "file" {
 		t.Fatalf("expected source 'file' for BRIDGE_DEFAULT_MODEL, got %q", reloaded.FieldSources["BRIDGE_DEFAULT_MODEL"])
 	}
+	if err := reloaded.Validate(); err != nil {
+		t.Fatalf("expected valid config, got %v", err)
+	}
+	t.Setenv("BRIDGE_DEFAULT_MODEL", "bad model id")
+	if err := config.Load().Validate(); err == nil || !strings.Contains(err.Error(), "BRIDGE_DEFAULT_MODEL") {
+		t.Fatalf("expected Validate() to reject whitespace BRIDGE_DEFAULT_MODEL, got %v", err)
+	}
+	// Verify WebUI serves the defaultModel control.
+	wuiReq := httptest.NewRequest(http.MethodGet, "/", nil)
+	wuiReq.RemoteAddr = "127.0.0.1:41000"
+	wuiRec := httptest.NewRecorder()
+	srv.ServeHTTP(wuiRec, wuiReq)
+	if wuiRec.Code != http.StatusOK || !strings.Contains(wuiRec.Body.String(), "cfg-default-model") || !strings.Contains(wuiRec.Body.String(), "src-defaultModel") {
+		t.Fatalf("expected WebUI HTML to expose cfg-default-model and src-defaultModel, code=%d", wuiRec.Code)
+	}
 }
 
 func TestAdminRuntimeConfigSourceIsRuntime(t *testing.T) {
@@ -206,6 +221,7 @@ func TestAdminAccountLifecycleAndWriteOnlyCookies(t *testing.T) {
 	importPayload, _ := json.Marshal(map[string]any{
 		"id":           "ops-acct-1",
 		"accountGroup": "tier1",
+		"skill":        "@research",
 		"cookie":       secretCookie,
 	})
 	reqImp := httptest.NewRequest(http.MethodPost, "/v1/admin/accounts/import", bytes.NewReader(importPayload))
@@ -217,6 +233,18 @@ func TestAdminAccountLifecycleAndWriteOnlyCookies(t *testing.T) {
 	}
 	if strings.Contains(recImp.Body.String(), "super-secret-psid-value") {
 		t.Fatalf("import response leaked raw cookie value: %s", recImp.Body.String())
+	}
+	if !strings.Contains(recImp.Body.String(), `"skill":"@research"`) {
+		t.Fatalf("expected accountStatusMap to echo skill, got: %s", recImp.Body.String())
+	}
+	// Re-importing the same account without skill must preserve @research.
+	reimportPayload, _ := json.Marshal(map[string]any{"id": "ops-acct-1", "cookie": secretCookie})
+	reqReimp := httptest.NewRequest(http.MethodPost, "/v1/admin/accounts/import", bytes.NewReader(reimportPayload))
+	reqReimp.RemoteAddr = "127.0.0.1:42000"
+	recReimp := httptest.NewRecorder()
+	srv.ServeHTTP(recReimp, reqReimp)
+	if recReimp.Code != http.StatusOK || !strings.Contains(recReimp.Body.String(), `"skill":"@research"`) {
+		t.Fatalf("re-import clobbered account skill: %d %s", recReimp.Code, recReimp.Body.String())
 	}
 
 	// Quarantine the account, then clear quarantine via POST /v1/admin/accounts/ops-acct-1/unquarantine

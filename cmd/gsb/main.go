@@ -283,6 +283,7 @@ func main() {
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutCancel()
 	_ = httpSrv.Shutdown(shutCtx)
+	srv.FlushSessionCacheNow()
 	srv.Pool.Reset()
 }
 
