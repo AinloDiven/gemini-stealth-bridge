@@ -19,6 +19,10 @@ type skillTurnState struct {
 func (st *skillTurnState) invalidate() { st.bound = false }
 
 func (st *skillTurnState) prepare(ctx context.Context, s *Server, scope AuthScope, account *AccountState, opts *gemini.StreamOptions, prompt string) string {
+	if opts != nil && opts.Temporary {
+		opts.SkillRuntime = ""
+		return prompt
+	}
 	acctID := ""
 	if account != nil {
 		acctID = account.ID

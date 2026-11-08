@@ -280,3 +280,39 @@ func TestMCPWebSearchSkipsSkillBinding(t *testing.T) {
 		t.Fatalf("expected raw search query without @skill prefix, got %q", capturedQuery)
 	}
 }
+
+func TestTemporaryChatSkipsSkillBinding(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.Skill = "@research"
+	acct.Skill = "@account-skill"
+
+	var gotPrompt, gotHandle string
+	var gotTemp bool
+	base := &mockUpstream{streamFn: func(ctx context.Context, p string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		gotPrompt, gotHandle, gotTemp = p, opts.SkillRuntime, opts.Temporary
+		_ = onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Frames: []gemini.Frame{makeFrame("ok", "", true, testModel.ModelID)},
+		})
+		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
+	}}
+	sm := &skillUpstream{mockUpstream: base, handle: "0123456789abcdef0123456789abcdef"}
+	acct.Client = sm
+
+	rec := runChat(t, srv, acct, sm, map[string]any{
+		"temporary": true,
+		"messages":  []any{map[string]any{"role": "user", "content": "1+1"}},
+	})
+	if rec.Code != 200 {
+		t.Fatalf("temporary chat failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if !gotTemp {
+		t.Fatalf("expected opts.Temporary = true")
+	}
+	if sm.calls != 0 || gotHandle != "" {
+		t.Fatalf("expected temporary chat to skip skill binding, got calls=%d handle=%q", sm.calls, gotHandle)
+	}
+	if gotPrompt != "1+1" {
+		t.Fatalf("expected temporary chat prompt without fixed @skill header, got %q", gotPrompt)
+	}
+}
