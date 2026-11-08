@@ -284,3 +284,53 @@ func TestThinkingStreamClosesReasoningBeforeMidStreamError(t *testing.T) {
 		t.Fatalf("expected reasoning done (%d) before error (%d):\n%s", doneIdx, errIdx, body)
 	}
 }
+
+func TestMediaToolActionFlushesBufferedStreamWithoutTitleOrModelID(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	srv.Cfg.RejectDowngrade = true
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		// 1. Early title-less image_generation frame with no candidate frames and no AnsweredModelID.
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c_img", RID: "r_img",
+			MediaToolActive: true,
+			Action:          &gemini.ActionStatus{ToolID: "image_generation"},
+		}); err != nil {
+			return nil, err
+		}
+		// 2. Subsequent frame carrying both a ThinkingTitle and image_generation keeps generating_media phase.
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c_img", RID: "r_img",
+			MediaToolActive: true,
+			Action:          &gemini.ActionStatus{ThinkingTitle: "Refining composition", ToolID: "image_generation"},
+		}); err != nil {
+			return nil, err
+		}
+		// 3. Final candidate frame.
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c_img", RID: "r_img",
+			Frames: []gemini.Frame{makeFrame("done", "", true, "")},
+		}); err != nil {
+			return nil, err
+		}
+		return &gemini.StreamResponse{Status: 200, CID: "c_img", RID: "r_img"}, nil
+	}}
+
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
+	body := rec.Body.String()
+	for _, want := range []string{
+		`"phase":"generating_media"`,
+		`"provider":"image_generation"`,
+		`"progress_detail":""`,
+		`"progress_detail":"Refining composition"`,
+		`"lease_seconds":1020`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected SSE body to contain %s, got:\n%s", want, body)
+		}
+	}
+	actionIdx := strings.Index(body, `"phase":"generating_media"`)
+	doneIdx := strings.Index(body, `"content":"done"`)
+	if actionIdx < 0 || doneIdx < 0 || actionIdx >= doneIdx {
+		t.Fatalf("expected generating_media action (%d) flushed before final content (%d):\n%s", actionIdx, doneIdx, body)
+	}
+}

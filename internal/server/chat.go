@@ -69,18 +69,27 @@ func buildActionStatusPayload(operationID string, a *gemini.ActionStatus) map[st
 	if strings.Contains(progress, "{tool_logo_placeholder}") || strings.Contains(progress, "{tool_name_placeholder}") {
 		progress = ""
 	}
-	if progress == "" {
-		sourceType = "tool_progress"
-		progress = strings.TrimSpace(a.ToolTitle)
+	toolProgress := strings.TrimSpace(a.ToolTitle)
+	if toolProgress == "" {
+		toolProgress = stripToolLogoPlaceholder(a.BranchTitle)
+	}
+	switch a.ToolID {
+	case "web_search":
+		sourceType = "web_search"
+		phase = "searching"
 		if progress == "" {
-			progress = stripToolLogoPlaceholder(a.BranchTitle)
+			progress = toolProgress
 		}
-		switch a.ToolID {
-		case "web_search":
-			sourceType = "web_search"
-			phase = "searching"
-		case "image_generation", "video_generation":
-			phase = "generating_media"
+	case "image_generation", "video_generation", "music_gen":
+		sourceType = "tool_progress"
+		phase = "generating_media"
+		if toolProgress != "" {
+			progress = toolProgress
+		}
+	default:
+		if progress == "" {
+			sourceType = "tool_progress"
+			progress = toolProgress
 		}
 	}
 	template := strings.TrimSpace(a.StatusTemplate)
@@ -90,7 +99,7 @@ func buildActionStatusPayload(operationID string, a *gemini.ActionStatus) map[st
 	if !strings.Contains(template, "{tool_logo_placeholder}") {
 		template = ""
 	}
-	if progress == "" && template == "" {
+	if progress == "" && template == "" && phase != "generating_media" {
 		return nil
 	}
 	// A tool/thinking card is a progress observation, not the generation's

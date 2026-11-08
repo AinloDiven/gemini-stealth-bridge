@@ -808,7 +808,21 @@ func ParseFrameLine(line string) (*LineParseResult, error) {
 			res.AnsweredModelLabel = answeredLabel
 		}
 
-		// Check for async video_generation trigger in pj[6] ("7" in 1-based sparse dictionary) or pj[45] ("46").
+		// Check for media generation trigger in the action card (pj[2]["7"] / pj[11][0]) or legacy pj[6].
+		if res.Action != nil {
+			switch res.Action.ToolID {
+			case "video_generation":
+				res.MediaToolActive = true
+				if res.CID != "" {
+					res.AsyncVideoCID = res.CID
+				}
+				if res.Action.BranchTitle != "" {
+					res.AsyncVideoStatus = res.Action.BranchTitle
+				}
+			case "image_generation", "music_gen":
+				res.MediaToolActive = true
+			}
+		}
 		if toolStatus, ok := jspbField(pj, 6).([]any); ok && len(toolStatus) >= 2 {
 			if toolMeta, ok := toolStatus[1].([]any); ok && len(toolMeta) > 0 {
 				toolName, _ := toolMeta[0].(string)
@@ -1054,6 +1068,9 @@ func parseActionStatus(frame []any) *ActionStatus {
 	}
 	if len(toolArr) > 0 {
 		out.ToolID = firstActionString(jspbField(toolArr, 0))
+		if out.ToolID == "data_analysis_tool" && isImageGenerationTool(toolArr) {
+			out.ToolID = "image_generation"
+		}
 		if meta, ok := jspbField(toolArr, 1).([]any); ok {
 			out.ToolTitle = firstActionString(jspbField(meta, 2))
 			out.StatusTemplate = firstActionString(jspbField(meta, 5))
@@ -1075,6 +1092,11 @@ func parseActionStatus(frame []any) *ActionStatus {
 		return nil
 	}
 	return out
+}
+
+func isImageGenerationTool(toolArr []any) bool {
+	mode, ok := jspbSubField(jspbSubField(jspbSubField(jspbField(toolArr, 3), 1), 7), 0).(float64)
+	return ok && int(mode) == 20
 }
 
 func interpolateToolNamePlaceholder(s, toolTitle string) string {
