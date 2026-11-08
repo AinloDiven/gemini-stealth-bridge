@@ -92,6 +92,47 @@ func TestParseActionStatusYouTubeInterpolatesToolNameAndDropsOrphanTemplate(t *t
 	}
 }
 
+func TestParseActionStatusMediaToolsAndImageMode20(t *testing.T) {
+	// data_analysis_tool with mode 20 in toolArr[3][1][7][0] is image generation, even with empty title.
+	imgRes := parseActionFromFrame(t, []any{
+		nil,
+		[]any{"c_img", "r_img"},
+		map[string]any{"7": []any{
+			nil,
+			[]any{"data_analysis_tool", []any{nil, nil, "", ""}, float64(1), []any{nil, []any{nil, nil, nil, nil, nil, nil, nil, []any{float64(20)}}, false}},
+		}},
+	})
+	if imgRes.Action == nil || imgRes.Action.ToolID != "image_generation" || !imgRes.MediaToolActive {
+		t.Fatalf("expected image_generation with MediaToolActive=true, got Action=%+v MediaToolActive=%v", imgRes.Action, imgRes.MediaToolActive)
+	}
+
+	// Ordinary data_analysis_tool (mode 11) must stay data_analysis_tool and not set MediaToolActive.
+	dataRes := parseActionFromFrame(t, []any{
+		nil,
+		[]any{"c_da", "r_da"},
+		map[string]any{"7": []any{
+			nil,
+			[]any{"data_analysis_tool", []any{nil, nil, "Analysis", ""}, float64(1), []any{float64(11), nil, false}},
+		}},
+	})
+	if dataRes.Action == nil || dataRes.Action.ToolID != "data_analysis_tool" || dataRes.MediaToolActive {
+		t.Fatalf("expected ordinary data_analysis_tool with MediaToolActive=false, got Action=%+v MediaToolActive=%v", dataRes.Action, dataRes.MediaToolActive)
+	}
+
+	// video_generation in pj[2]["7"] sets MediaToolActive, AsyncVideoCID, and AsyncVideoStatus.
+	vidRes := parseActionFromFrame(t, []any{
+		nil,
+		[]any{"c_vid", "r_vid"},
+		map[string]any{"7": []any{
+			"??????",
+			[]any{"video_generation", []any{nil, nil, "????", ""}, float64(1)},
+		}},
+	})
+	if !vidRes.MediaToolActive || vidRes.AsyncVideoCID != "c_vid" || vidRes.AsyncVideoStatus != "??????" {
+		t.Fatalf("unexpected video_generation parse result: %+v", vidRes)
+	}
+}
+
 func TestParseCandidateSliceStripsYouTubeArtifactAndHoldsTrailingAutoLink(t *testing.T) {
 	cStreaming := []any{
 		"rc_yt",
