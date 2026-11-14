@@ -646,3 +646,62 @@ func TestResponsesCustomToolAndNamespaceNormalization(t *testing.T) {
 		t.Fatalf("expected function_call with namespace=mcp__sqlite, got %+v", item1)
 	}
 }
+
+func TestMediaToolActivePreventsNewConversationRetry(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.SessionCache = true
+	srv.Cfg.MaxAttempts = 3
+	srv.Cfg.MaxUpstreamAttempts = 3
+
+	scope := AuthScope{OK: true, AccountID: "acct", SessionID: "tg_vid_1"}
+	bindKey := sessionBindingKey(scope, scope.SessionID)
+	meta := gemini.BuildContinuationMetadata("c_vid_existing", "r_prev", "rc_prev", "ctx_prev")
+	srv.putSessionBinding(sessionBinding{
+		Key:       bindKey,
+		AccountID: acct.ID,
+		Model:     testModel.ModelName,
+		Meta:      meta,
+	})
+
+	calls := 0
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			calls++
+			if len(opts.Metadata) == 0 {
+				t.Fatalf("unexpected retry into a brand-new conversation (attempt %d had nil Metadata)", calls)
+			}
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c_vid_existing",
+				RID:             "r_vid_1",
+				MediaToolActive: true,
+				Action: &gemini.ActionStatus{
+					ToolID: "video_generation",
+				},
+				Frames: []gemini.Frame{
+					{RCID: "rc_thought", Thoughts: "Planning video...", Done: false},
+				},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+
+	acct.mu.Lock()
+	acct.Client = client
+	acct.mu.Unlock()
+	rec := httptest.NewRecorder()
+	body := map[string]any{
+		"model":  testModel.ModelName,
+		"stream": true,
+		"messages": []any{
+			map[string]any{"role": "user", "content": "帮我生成一个视频"},
+		},
+	}
+	srv.HandleChat(context.Background(), rec, body, scope)
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 upstream attempt after video_generation started, got %d", calls)
+	}
+	if b := srv.getSessionBinding(bindKey); b == nil || len(b.Meta) == 0 {
+		t.Fatalf("expected existing session binding to remain intact after active media turn, got %+v", b)
+	}
+}
+

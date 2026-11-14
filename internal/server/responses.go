@@ -924,9 +924,12 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if !selected {
 						candidateID = frame.RCID
 						selected = true
-					}
-					if frame.RCID != candidateID {
-						continue
+					} else if frame.RCID != candidateID {
+						if len(frame.GeneratedVideos) > 0 && len(lastVideos) == 0 && text == "" && sentText == "" {
+							candidateID = frame.RCID
+						} else {
+							continue
+						}
 					}
 					attemptStateMu.Lock()
 					s.rewriteFrameMedia(ctx, account.ID, &frame)
@@ -1074,14 +1077,14 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					s.refreshQuotaAsync(account, c)
 				}
 			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+			if cacheKey != "" && len(opts.Metadata) > 0 && !mediaToolUsed && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 				s.deleteSessionCache(cacheKey)
 				s.deleteSessionBinding(prep.sessionBindingKey)
 				cacheKey = ""
 			}
 
 			payloadCommitted := func() bool {
-				return sentText != "" || messageAdded
+				return sentText != "" || messageAdded || mediaToolUsed
 			}
 			responseCommitted := func() bool {
 				streamMu.Lock()
