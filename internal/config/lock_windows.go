@@ -69,6 +69,7 @@ func (h *LockHandle) Release() error {
 		return nil
 	}
 	var ol windows.Overlapped
+	ol.Offset = 4096
 	_ = windows.UnlockFileEx(windows.Handle(h.file.Fd()), 0, 1, 0, &ol)
 	err := h.file.Close()
 	h.file = nil

@@ -1255,12 +1255,10 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 				}
 			}
+			closeReasoningIfStarted()
 			if served != nil && (servedID != model.ModelID || labelMismatch) {
 				emit(map[string]any{"model_served": served}, nil, nil)
 			}
-			streamMu.Lock()
-			closeReasoningLocked()
-			streamMu.Unlock()
 			emit(sseDeltaEmpty{}, finish, usage)
 			streamMu.Lock()
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
