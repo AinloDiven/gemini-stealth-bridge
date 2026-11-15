@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,11 +49,61 @@ type sseDeltaEmpty struct{}
 // inside the OpenAI-compatible chat SSE stream. choices is always [] on these
 // frames; existing OpenAI clients ignore them.
 type sseExtensionChunk struct {
-	Object          string          `json:"object"`
-	Choices         []sseChatChoice `json:"choices"`
-	ProtocolVersion int             `json:"x_gemini_protocol_version"`
-	Reasoning       map[string]any  `json:"x_gemini_reasoning,omitempty"`
-	ActionStatus    map[string]any  `json:"x_gemini_action_status,omitempty"`
+	Object          string           `json:"object"`
+	Choices         []sseChatChoice  `json:"choices"`
+	ProtocolVersion int              `json:"x_gemini_protocol_version"`
+	Reasoning       map[string]any   `json:"x_gemini_reasoning,omitempty"`
+	ActionStatus    map[string]any   `json:"x_gemini_action_status,omitempty"`
+	Media           []map[string]any `json:"x_gemini_media,omitempty"`
+}
+
+func buildMediaExtensionPayload(images []gemini.GeneratedImage, videos []gemini.GeneratedVideo) []map[string]any {
+	if len(images) == 0 && len(videos) == 0 {
+		return nil
+	}
+	items := make([]map[string]any, 0, len(images)+len(videos))
+	for _, img := range images {
+		if img.URL == "" {
+			continue
+		}
+		item := map[string]any{"type": "image", "url": img.URL}
+		if img.Title != "" {
+			item["title"] = img.Title
+		}
+		if img.Alt != "" {
+			item["alt"] = img.Alt
+		}
+		if img.Width > 0 {
+			item["width"] = img.Width
+		}
+		if img.Height > 0 {
+			item["height"] = img.Height
+		}
+		if img.IsGIF {
+			item["is_gif"] = true
+		}
+		items = append(items, item)
+	}
+	for _, vid := range videos {
+		if vid.URL == "" {
+			continue
+		}
+		item := map[string]any{"type": "video", "url": vid.URL}
+		if vid.Title != "" {
+			item["title"] = vid.Title
+		}
+		if vid.ThumbnailURL != "" {
+			item["thumbnail_url"] = vid.ThumbnailURL
+		}
+		if vid.MimeType != "" {
+			item["mime_type"] = vid.MimeType
+		}
+		items = append(items, item)
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	return items
 }
 
 // buildActionStatusPayload projects one upstream action card into the
@@ -699,7 +750,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 					thoughts = mergeStreamedThoughts(thoughts, frame.Thoughts)
 					done = frame.Done
-					if done {
+					if done && !scope.StructuredMedia {
 						text = gemini.AppendGeneratedMediaMarkdown(text, lastImages, lastVideos)
 					}
 					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
@@ -804,6 +855,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			done,
 			text,
 			sentText,
+			len(lastImages) > 0 || len(lastVideos) > 0,
 			servedID,
 			servedLabel,
 			identityConflict,
@@ -1259,6 +1311,20 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 			}
 			closeReasoningIfStarted()
+			var mediaPayload []map[string]any
+			if len(calls) == 0 {
+				mediaPayload = buildMediaExtensionPayload(lastImages, lastVideos)
+			}
+			if len(mediaPayload) > 0 {
+				streamMu.Lock()
+				writeExtensionLocked(sseExtensionChunk{
+					Object:          "chat.completion.chunk",
+					Choices:         []sseChatChoice{},
+					ProtocolVersion: 3,
+					Media:           mediaPayload,
+				})
+				streamMu.Unlock()
+			}
 			if served != nil && (servedID != model.ModelID || labelMismatch) {
 				emit(map[string]any{"model_served": served}, nil, nil)
 			}
@@ -1293,6 +1359,11 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					},
 				},
 				"usage": usage,
+			}
+			if len(calls) == 0 {
+				if mediaPayload := buildMediaExtensionPayload(lastImages, lastVideos); len(mediaPayload) > 0 {
+					payload["x_gemini_media"] = mediaPayload
+				}
 			}
 			if served != nil && (servedID != model.ModelID || labelMismatch) {
 				payload["requested_model"] = mid
@@ -1362,6 +1433,7 @@ func (s *Server) evaluateAttemptCompletion(
 	done bool,
 	text string,
 	sentText string,
+	hasMedia bool,
 	servedID string,
 	servedLabel string,
 	identityConflict bool,
@@ -1425,7 +1497,7 @@ func (s *Server) evaluateAttemptCompletion(
 	if !done {
 		return nil, transport.NewUpstreamError("upstream ended before the selected candidate completed", 502, "incomplete_upstream_response", nil, nil)
 	}
-	if text == "" {
+	if text == "" && !hasMedia {
 		return nil, transport.NewUpstreamError("upstream completed without an answer", 502, "empty_upstream_response", nil, nil)
 	}
 	if errReply := gemini.GeminiErrorReply(text); errReply != "" {
@@ -1461,75 +1533,39 @@ func (s *Server) evaluateAttemptCompletion(
 	return interpreted, nil
 }
 
-func skipInlineLinkSpan(s string, i int) int {
-	if i >= len(s) || s[i] != '[' {
-		return -1
+var (
+	streamClockPrefixRe = regexp.MustCompile(`^[ \t]*\[\d+(?::\d+)+\][ \t]*`)
+	streamLinkTokenRe   = regexp.MustCompile(`^\[((?:\[[^\[\]\r\n]*\]\([^\s)\r\n]+\)|[^\[\]\r\n])*)\](?:\([^\s)\r\n]+\))?`)
+	streamLinkLabelRe   = regexp.MustCompile(`^\[([^\[\]\r\n]*)\]\([^\s)\r\n]+\)`)
+)
+
+func bracketRewriteSpan(s string) (spanLen int, label string, isLink, ok bool) {
+	if loc := streamLinkTokenRe.FindStringSubmatchIndex(s); loc != nil {
+		inner := s[loc[2]:loc[3]]
+		if m := streamLinkLabelRe.FindStringSubmatchIndex(inner); m != nil && m[1] == len(inner) {
+			inner = inner[m[2]:m[3]]
+		}
+		return loc[1], inner, strings.Contains(s[:loc[1]], "]("), true
 	}
-	depth := 0
-	for j := i; j < len(s) && s[j] != '\n' && s[j] != '\r'; j++ {
-		switch s[j] {
-		case '[':
-			depth++
-		case ']':
-			depth--
-			if j+1 < len(s) && s[j+1] == '(' {
-				end := strings.IndexByte(s[j+2:], ')')
-				if end < 0 || strings.ContainsAny(s[j+2:j+2+end], " \t\r\n") {
-					return -1
-				}
-				j += 2 + end
-				if depth > 0 && j+1 < len(s) && s[j+1] == ']' {
-					j++
-					depth--
-				}
-			}
-			if depth == 0 {
-				return j + 1
-			}
-			if depth == 1 && j+1 <= len(s) && strings.TrimRight(s[j+1:], ".)]") == "" {
-				return len(s)
-			}
+	if strings.HasPrefix(s, "[[") && !strings.ContainsAny(s, "\r\n") {
+		if m := streamLinkLabelRe.FindStringSubmatchIndex(s[1:]); m != nil && strings.TrimRight(s[1+m[1]:], ".)]") == "" {
+			return len(s), s[1+m[2] : 1+m[3]], true, true
 		}
 	}
-	return -1
+	return 0, "", false, false
 }
 
-func skipClockBracket(s string, i int) int {
-	if i >= len(s) || s[i] != '[' {
-		return -1
+func skipStrippedClockAt(sent string, si int, full string, fi int) (int, bool) {
+	m := streamClockPrefixRe.FindStringIndex(sent[si:])
+	if m == nil {
+		return si, false
 	}
-	colons, digits := 0, 0
-	for j := i + 1; j < len(s); j++ {
-		switch c := s[j]; {
-		case c >= '0' && c <= '9':
-			digits++
-		case c == ':':
-			if digits == 0 {
-				return -1
-			}
-			colons++
-			digits = 0
-		case c == ']':
-			if colons == 0 || digits == 0 {
-				return -1
-			}
-			return j + 1
-		default:
-			return -1
-		}
+	spanEnd := si + m[1]
+	if (sent[si] == ' ' && fi < len(full) && full[fi] != ' ') ||
+		fi == len(full) || (fi > 0 && full[fi-1] == ' ') || full[fi] != ' ' {
+		return spanEnd, true
 	}
-	return -1
-}
-
-func skipStrippedClockSpan(s string, i int, nextFull byte, hasNextFull bool) int {
-	if i < len(s) && s[i] == ' ' {
-		return skipClockBracket(s, i+1)
-	}
-	end := skipClockBracket(s, i)
-	if end > i && end < len(s) && s[end] == ' ' && (!hasNextFull || nextFull != ' ') {
-		return end + 1
-	}
-	return end
+	return si + len(strings.TrimRight(sent[si:spanEnd], " \t")), true
 }
 
 func matchStreamPrefixWithLinkRewrites(full, sent string) (string, bool) {
@@ -1540,11 +1576,11 @@ func matchStreamPrefixWithLinkRewrites(full, sent string) (string, bool) {
 	matched := false
 	for si < len(sent) && fi < len(full) {
 		if full[fi] == '[' && sent[si] == '[' {
-			fNext := skipInlineLinkSpan(full, fi)
-			sNext := skipInlineLinkSpan(sent, si)
-			if fNext > fi && sNext > si {
-				fi = fNext
-				si = sNext
+			fSpan, fLabel, fLink, fOK := bracketRewriteSpan(full[fi:])
+			sSpan, sLabel, sLink, sOK := bracketRewriteSpan(sent[si:])
+			if fOK && sOK && (fLabel == sLabel || fLink || sLink) {
+				fi += fSpan
+				si += sSpan
 				matched = true
 				continue
 			}
@@ -1554,19 +1590,19 @@ func matchStreamPrefixWithLinkRewrites(full, sent string) (string, bool) {
 			si++
 			continue
 		}
-		if sNext := skipStrippedClockSpan(sent, si, full[fi], true); sNext > si {
-			si = sNext
+		if nextSI, ok := skipStrippedClockAt(sent, si, full, fi); ok {
+			si = nextSI
 			matched = true
 			continue
 		}
 		return "", false
 	}
 	for si < len(sent) {
-		sNext := skipStrippedClockSpan(sent, si, 0, false)
-		if sNext <= si {
+		nextSI, ok := skipStrippedClockAt(sent, si, full, fi)
+		if !ok || nextSI == si {
 			break
 		}
-		si = sNext
+		si = nextSI
 		matched = true
 	}
 	if !matched || si < len(sent) {

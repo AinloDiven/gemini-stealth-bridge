@@ -959,7 +959,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					}
 					thoughts = mergeStreamedThoughts(thoughts, frame.Thoughts)
 					done = frame.Done
-					if done {
+					if done && !scope.StructuredMedia {
 						text = gemini.AppendGeneratedMediaMarkdown(text, lastImages, lastVideos)
 					}
 					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
@@ -1049,6 +1049,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			done,
 			text,
 			sentText,
+			len(lastImages) > 0 || len(lastVideos) > 0,
 			servedID,
 			servedLabel,
 			identityConflict,
@@ -1646,6 +1647,17 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				})
 			}
 
+			var mediaPayload []map[string]any
+			if len(oaCalls) == 0 {
+				mediaPayload = buildMediaExtensionPayload(lastImages, lastVideos)
+			}
+			if len(mediaPayload) > 0 {
+				emitSSE("response.x_gemini_media", map[string]any{
+					"x_gemini_protocol_version": 3,
+					"media":                     mediaPayload,
+				})
+			}
+
 			emitSSE("response.completed", map[string]any{
 				"response": map[string]any{
 					"id":         respID,
@@ -1666,6 +1678,11 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"model":      mid,
 				"output":     outputItems,
 				"usage":      respUsage,
+			}
+			if len(oaCalls) == 0 {
+				if mediaPayload := buildMediaExtensionPayload(lastImages, lastVideos); len(mediaPayload) > 0 {
+					payload["x_gemini_media"] = mediaPayload
+				}
 			}
 			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
 			markPhase(&headerMs)

@@ -93,13 +93,14 @@ type AccountState struct {
 
 // AuthScope represents the caller's resolved token scope.
 type AuthScope struct {
-	OK        bool
-	AccountID string
-	Group     string
-	Admin     bool
-	Pool      bool
-	Token     string
-	SessionID string
+	OK              bool
+	AccountID       string
+	Group           string
+	Admin           bool
+	Pool            bool
+	Token           string
+	SessionID       string
+	StructuredMedia bool
 }
 
 // canStreamVerified is the single commit predicate for model output in both
@@ -321,6 +322,17 @@ func (s *Server) requireAuthScope(w http.ResponseWriter, r *http.Request) (AuthS
 			return AuthScope{}, false
 		}
 		scope.SessionID = sid
+	}
+	if mode := strings.ToLower(strings.TrimSpace(r.Header.Get("X-GSB-Media-Mode"))); mode != "" {
+		switch mode {
+		case "markdown":
+			scope.StructuredMedia = false
+		case "structured":
+			scope.StructuredMedia = true
+		default:
+			sendJSON(w, 400, map[string]any{"error": map[string]any{"message": "invalid X-GSB-Media-Mode; expected markdown or structured", "type": "invalid_request_error"}}, nil)
+			return AuthScope{}, false
+		}
 	}
 	return scope, true
 }

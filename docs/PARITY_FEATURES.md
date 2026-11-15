@@ -46,6 +46,7 @@ Emitted as `choices: []` chunks with `x_gemini_protocol_version: 3` alongside un
 
 - **`x_gemini_reasoning`**: `start` -> `delta` -> `done` lifecycle (`done` is guaranteed before content, tool calls, stream completion, or mid-stream error frames).
 - **`x_gemini_action_status`**: Relays upstream action cards (`part_json[2]["7"]` / `part_json[11]["1"]`) as non-terminal progress updates (`progress_detail`, `source_type`, `phase`, optional wire `provider` and `{tool_logo_placeholder}` `status_template`, monotonic `sequence`).
+- **`x_gemini_media`**: Emits authoritative generated images and videos (`type`, local `/v1/media/...` `url`, optional wire `title`, `alt`, `width`, `height`, `is_gif`, `thumbnail_url`, `mime_type`). Set request header `X-GSB-Media-Mode: structured` (default `markdown`) on `/v1/chat/completions` or `/v1/responses` to omit fallback Markdown links from assistant text while still delivering structured media.
 
 ## 5. Multimodal Input Attachments
 

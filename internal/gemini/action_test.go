@@ -207,11 +207,23 @@ func TestParseConversationPollResponseForRIDAndVideoHints(t *testing.T) {
 	if !PromptRequestsVideo("generate a short cat walking video") {
 		t.Fatal("expected video prompt to match PromptRequestsVideo")
 	}
-	if !isAsyncVideoPlaceholderText("") || !isAsyncVideoPlaceholderText("Generating your video...") || !isAsyncVideoPlaceholderText("正在为您生成视频，请稍候") {
-		t.Fatal("expected placeholder strings to match isAsyncVideoPlaceholderText")
+	if !isPendingAsyncVideoFrame(Frame{Done: true}, "", "") {
+		t.Fatal("expected empty frame without videos to be treated as pending")
 	}
-	if isAsyncVideoPlaceholderText("I cannot generate that video because of policy.") {
-		t.Fatal("did not expect refusal text to match isAsyncVideoPlaceholderText")
+	if !isPendingAsyncVideoFrame(Frame{Done: true, Text: "Generating your video..."}, "Generating your video", "") {
+		t.Fatal("expected wire status match to be treated as pending in English")
+	}
+	if !isPendingAsyncVideoFrame(Frame{Done: true, Text: "Status: pending..."}, "Status: pending", "") {
+		t.Fatal("expected wire status match to work for arbitrary localized wire status")
+	}
+	if !isPendingAsyncVideoFrame(Frame{Done: true, Text: "Still working"}, "", "Still working") {
+		t.Fatal("expected unchanged stream placeholder to stay pending across polls")
+	}
+	if isPendingAsyncVideoFrame(Frame{Done: true, Text: "I cannot generate that video because of policy."}, "Generating your video", "Generating your video...") {
+		t.Fatal("did not expect terminal refusal text to be treated as pending")
+	}
+	if isPendingAsyncVideoFrame(Frame{Done: true, Text: "Video ready", GeneratedVideos: []GeneratedVideo{{URL: "https://example.com/v.mp4"}}}, "Generating your video", "") {
+		t.Fatal("did not expect frame with generated videos to remain pending")
 	}
 
 	// Build a multi-turn hNvQHb response where turns[0] is an older turn (r_old)

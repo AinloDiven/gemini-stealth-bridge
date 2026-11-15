@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -444,4 +445,90 @@ func mustMarshalWrbFrame(t *testing.T, cid, rid string, cand []any) string {
 		t.Fatal(err)
 	}
 	return string(outer)
+}
+
+func TestStructuredMediaExtensionAndHeaderMode(t *testing.T) {
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			frame := gemini.Frame{
+				RCID: "rc_media_1",
+				Text: "",
+				Done: true,
+				GeneratedImages: []gemini.GeneratedImage{
+					{URL: "https://example.com/gen.png", Title: "Poster", Alt: "Sample poster", Width: 512, Height: 512},
+				},
+			}
+			_ = onFrame(&gemini.LineParseResult{
+				CID:             "c_media",
+				RID:             "r_media",
+				MediaToolActive: true,
+				Frames:          []gemini.Frame{frame},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	srv := mcpTestServer(t, client)
+
+	doChat := func(mediaMode string, stream bool) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]any{
+			"model":    testModel.ModelName,
+			"stream":   stream,
+			"messages": []any{map[string]any{"role": "user", "content": "draw poster"}},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer audit")
+		if mediaMode != "" {
+			req.Header.Set("X-GSB-Media-Mode", mediaMode)
+		}
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Default markdown mode emits both x_gemini_media and fallback Markdown links.
+	recDefault := doChat("", true)
+	if recDefault.Code != 200 {
+		t.Fatalf("expected 200 default stream, got %d: %s", recDefault.Code, recDefault.Body.String())
+	}
+	defaultBody := recDefault.Body.String()
+	if !strings.Contains(defaultBody, `"x_gemini_media":[{"alt":"Sample poster"`) || !strings.Contains(defaultBody, "![Poster](http://example.com/v1/media/") {
+		t.Fatalf("expected both x_gemini_media and markdown in default mode, got:\n%s", defaultBody)
+	}
+
+	// Structured mode omits Markdown injection from content even when prose is empty, delivering media via x_gemini_media.
+	recStructured := doChat("structured", true)
+	if recStructured.Code != 200 {
+		t.Fatalf("expected 200 structured stream, got %d: %s", recStructured.Code, recStructured.Body.String())
+	}
+	structBody := recStructured.Body.String()
+	if !strings.Contains(structBody, `"x_gemini_media":[{"alt":"Sample poster"`) || !strings.Contains(structBody, `"url":"http://example.com/v1/media/`) {
+		t.Fatalf("expected x_gemini_media in structured mode, got:\n%s", structBody)
+	}
+	if strings.Contains(structBody, "![Poster]") || strings.Contains(structBody, "[Download Image") {
+		t.Fatalf("did not expect Markdown media links in structured mode, got:\n%s", structBody)
+	}
+
+	// Non-streaming JSON in structured mode includes x_gemini_media and keeps message.content clean.
+	recJSON := doChat("structured", false)
+	if recJSON.Code != 200 {
+		t.Fatalf("expected 200 structured JSON, got %d: %s", recJSON.Code, recJSON.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recJSON.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	if media, ok := payload["x_gemini_media"].([]any); !ok || len(media) != 1 {
+		t.Fatalf("expected 1 x_gemini_media item in JSON payload, got %#v", payload["x_gemini_media"])
+	}
+	choices := payload["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "" {
+		t.Fatalf("expected empty content without injected markdown, got %#v", msg["content"])
+	}
+
+	// Invalid X-GSB-Media-Mode fails fast with 400.
+	recBad := doChat("invalid_mode", true)
+	if recBad.Code != 400 {
+		t.Fatalf("expected 400 for invalid X-GSB-Media-Mode, got %d: %s", recBad.Code, recBad.Body.String())
+	}
 }

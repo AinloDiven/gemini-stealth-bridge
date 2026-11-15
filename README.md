@@ -889,9 +889,10 @@ Wire format:
 - a first role-only delta (`{"role":"assistant","content":""}`)
 - text in `choices[0].delta.content`
 - reasoning in `choices[0].delta.reasoning_content` when extracted and enabled
-- reasoning lifecycle in `x_gemini_reasoning` frames (`start`/`delta`/`done`) and
-  upstream action titles/icons in `x_gemini_action_status` frames (both are
-  additive `choices:[]` envelopes with `x_gemini_protocol_version:3`; see
+- reasoning lifecycle in `x_gemini_reasoning` frames (`start`/`delta`/`done`),
+  upstream action titles/icons in `x_gemini_action_status` frames, and structured
+  generated media in `x_gemini_media` frames (all additive `choices:[]`
+  envelopes with `x_gemini_protocol_version:3`; see
   [PARITY_FEATURES.md](docs/PARITY_FEATURES.md))
 - tool calls in `choices[0].delta.tool_calls`
 - a final chunk with `finish_reason` (`stop` or `tool_calls`) and `usage`

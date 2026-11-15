@@ -25,15 +25,34 @@ func PromptRequestsVideo(prompt string) bool {
 	return videoPromptHintRe.MatchString(prompt)
 }
 
-func isAsyncVideoPlaceholderText(text string) bool {
-	trimmed := strings.TrimSpace(text)
+func normalizeVideoStatus(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return strings.TrimRight(s, ".。…!！?？,，、:： 　\t\r\n")
+}
+
+// isPendingAsyncVideoFrame reports whether f represents an in-progress async
+// video turn rather than a completed video or terminal refusal/error reply.
+func isPendingAsyncVideoFrame(f Frame, wireStatus, streamPlaceholder string) bool {
+	if len(f.GeneratedVideos) > 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(f.Text)
 	if trimmed == "" {
 		return true
 	}
-	lower := strings.ToLower(trimmed)
-	return strings.Contains(lower, "generating your video") ||
-		strings.Contains(trimmed, "正在生成您的视频") ||
-		strings.Contains(trimmed, "正在为您生成视频")
+	if GeminiErrorReply(trimmed) != "" {
+		return false
+	}
+	normText := normalizeVideoStatus(trimmed)
+	if normStatus := normalizeVideoStatus(wireStatus); len([]rune(normStatus)) >= 3 {
+		if normText == normStatus || strings.HasPrefix(normText, normStatus) || strings.Contains(normText, normStatus) {
+			return true
+		}
+	}
+	if normInit := normalizeVideoStatus(streamPlaceholder); normInit != "" && normText == normInit {
+		return true
+	}
+	return !f.Done
 }
 
 // UploadedFile represents the [[uploadPath], safeName] tuple expected in inner[0][3].
@@ -425,6 +444,8 @@ func (ac *AccountClient) streamGenerateLocked(
 		cid, rid           string
 		firstRCID          string
 		asyncVideoCID      string
+		asyncVideoStatus   string
+		streamVideoText    string
 		frameCount         int
 		sawDone            bool
 		sawGeneratedVideo  bool
@@ -455,6 +476,9 @@ func (ac *AccountClient) streamGenerateLocked(
 		if parsed.AsyncVideoCID != "" {
 			asyncVideoCID = parsed.AsyncVideoCID
 		}
+		if parsed.AsyncVideoStatus != "" {
+			asyncVideoStatus = parsed.AsyncVideoStatus
+		}
 		for _, f := range parsed.Frames {
 			if firstRCID == "" && f.RCID != "" {
 				firstRCID = f.RCID
@@ -462,9 +486,12 @@ func (ac *AccountClient) streamGenerateLocked(
 			if len(f.GeneratedVideos) > 0 {
 				sawGeneratedVideo = true
 			}
+			if f.Text != "" && asyncVideoCID != "" && isPendingAsyncVideoFrame(f, asyncVideoStatus, "") {
+				streamVideoText = f.Text
+			}
 			if f.Done {
 				sawDone = true
-				if len(f.GeneratedVideos) > 0 || !isAsyncVideoPlaceholderText(f.Text) {
+				if !isPendingAsyncVideoFrame(f, asyncVideoStatus, "") {
 					sawFinalVideoReply = true
 				}
 			}
@@ -551,7 +578,7 @@ func (ac *AccountClient) streamGenerateLocked(
 				}
 				return retryRes, retryErr
 			}
-			polled, pollErr := ac.pollAsyncVideoGenerationLocked(ctx, sc, cookie, at, bl, fSid, lang, asyncVideoCID, rid, firstRCID)
+			polled, pollErr := ac.pollAsyncVideoGenerationLocked(ctx, sc, cookie, at, bl, fSid, lang, asyncVideoCID, rid, firstRCID, asyncVideoStatus, streamVideoText)
 			if pollErr != nil {
 				if opts.Temporary {
 					go ac.deleteConversationAsync(asyncVideoCID)
@@ -734,7 +761,7 @@ func findBalancedJSONArrayEnd(s string, start int) int {
 func (ac *AccountClient) pollAsyncVideoGenerationLocked(
 	ctx context.Context,
 	sc *transport.StealthClient,
-	cookie, at, bl, fSid, lang, cid, rid, preferredRCID string,
+	cookie, at, bl, fSid, lang, cid, rid, preferredRCID, asyncVideoStatus, streamVideoText string,
 ) (*LineParseResult, error) {
 	pollCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
@@ -792,7 +819,7 @@ func (ac *AccountClient) pollAsyncVideoGenerationLocked(
 				var chosen *Frame
 				for i := range parsed.Frames {
 					f := parsed.Frames[i]
-					if len(f.GeneratedVideos) == 0 && (!f.Done || isAsyncVideoPlaceholderText(f.Text)) {
+					if isPendingAsyncVideoFrame(f, asyncVideoStatus, streamVideoText) {
 						continue
 					}
 					if chosen == nil || (preferredRCID != "" && f.RCID == preferredRCID) {
