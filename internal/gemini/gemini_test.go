@@ -642,7 +642,7 @@ func TestParseCandidateSliceExposesStructuredMediaWithoutMarkdown(t *testing.T) 
 
 	c1 := []any{
 		"rc_1",
-		[]any{"前半句 "},
+		[]any{"First half "},
 		nil, nil, nil, nil, nil, nil,
 		[]any{float64(1)}, // done = false
 		mediaSlot,
@@ -654,13 +654,13 @@ func TestParseCandidateSliceExposesStructuredMediaWithoutMarkdown(t *testing.T) 
 	if len(f1.GeneratedImages) != 1 {
 		t.Fatalf("expected 1 generated image on intermediate frame, got %d", len(f1.GeneratedImages))
 	}
-	if f1.Text != "前半句 " {
-		t.Fatalf("expected intermediate frame Text to remain untouched %q without markdown suffix, got %q", "前半句 ", f1.Text)
+	if f1.Text != "First half " {
+		t.Fatalf("expected intermediate frame Text to remain untouched %q without markdown suffix, got %q", "First half ", f1.Text)
 	}
 
 	c2 := []any{
 		"rc_1",
-		[]any{"前半句 后半句 "},
+		[]any{"First half second half "},
 		nil, nil, nil, nil, nil, nil,
 		[]any{float64(2)}, // done = true
 		mediaSlot,

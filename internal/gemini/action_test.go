@@ -70,13 +70,13 @@ func TestParseActionStatusYouTubeInterpolatesToolNameAndDropsOrphanTemplate(t *t
 		[]any{"c_1", "r_1"},
 		map[string]any{"7": []any{
 			nil,
-			[]any{"youtube_tool", []any{nil, nil, "YouTube", "https://www.gstatic.com/images/branding/productlogos/youtube/v9/192px.svg", nil, "正在连接 {tool_logo_placeholder} {tool_name_placeholder}"}, float64(1)},
+			[]any{"youtube_tool", []any{nil, nil, "YouTube", "https://example.invalid/tool.svg", nil, "Connecting to {tool_logo_placeholder} {tool_name_placeholder}"}, float64(1)},
 		}},
 	})
 	if res.Action == nil {
 		t.Fatal("expected action card for youtube_tool")
 	}
-	if res.Action.ToolID != "youtube_tool" || res.Action.ToolTitle != "YouTube" || res.Action.StatusTemplate != "正在连接 {tool_logo_placeholder} YouTube" {
+	if res.Action.ToolID != "youtube_tool" || res.Action.ToolTitle != "YouTube" || res.Action.StatusTemplate != "Connecting to {tool_logo_placeholder} YouTube" {
 		t.Fatalf("unexpected youtube_tool action card: %+v", res.Action)
 	}
 
@@ -85,7 +85,7 @@ func TestParseActionStatusYouTubeInterpolatesToolNameAndDropsOrphanTemplate(t *t
 	orphan := parseActionFromFrame(t, []any{
 		nil,
 		[]any{"c_1", "r_1"},
-		map[string]any{"7": []any{nil, nil, nil, nil, nil, []any{"已连接到 {tool_logo_placeholder} {tool_name_placeholder}"}}},
+		map[string]any{"7": []any{nil, nil, nil, nil, nil, []any{"Connected to {tool_logo_placeholder} {tool_name_placeholder}"}}},
 	})
 	if orphan.Action != nil {
 		t.Fatalf("expected nil Action for orphan tool placeholder template in slot 5, got %+v", orphan.Action)
@@ -124,11 +124,11 @@ func TestParseActionStatusMediaToolsAndImageMode20(t *testing.T) {
 		nil,
 		[]any{"c_vid", "r_vid"},
 		map[string]any{"7": []any{
-			"??????",
-			[]any{"video_generation", []any{nil, nil, "????", ""}, float64(1)},
+			"Generating your video",
+			[]any{"video_generation", []any{nil, nil, "Video", ""}, float64(1)},
 		}},
 	})
-	if !vidRes.MediaToolActive || vidRes.AsyncVideoCID != "c_vid" || vidRes.AsyncVideoStatus != "??????" {
+	if !vidRes.MediaToolActive || vidRes.AsyncVideoCID != "c_vid" || vidRes.AsyncVideoStatus != "Generating your video" {
 		t.Fatalf("unexpected video_generation parse result: %+v", vidRes)
 	}
 }
@@ -136,7 +136,7 @@ func TestParseActionStatusMediaToolsAndImageMode20(t *testing.T) {
 func TestParseCandidateSliceStripsYouTubeArtifactAndHoldsTrailingAutoLink(t *testing.T) {
 	cStreaming := []any{
 		"rc_yt",
-		[]any{"👉 **视频链接**：[[https://www.youtube](https://www.youtube)."},
+		[]any{"Video link: [[https://www.youtube](https://www.youtube)."},
 		nil, nil, nil, nil, nil, nil,
 		[]any{float64(1)},
 	}
@@ -144,13 +144,13 @@ func TestParseCandidateSliceStripsYouTubeArtifactAndHoldsTrailingAutoLink(t *tes
 	if !ok {
 		t.Fatal("expected parseCandidateSlice f1 ok")
 	}
-	if f1.Text != "👉 **视频链接**：" {
+	if f1.Text != "Video link: " {
 		t.Fatalf("expected incomplete trailing auto-link held back while streaming, got %q", f1.Text)
 	}
 
 	cDone := []any{
 		"rc_yt",
-		[]any{"👉 **视频链接**：[https://www.youtube.com/watch?v=SntsJWcCEhs](https://www.youtube.com/watch?v=SntsJWcCEhs)\nhttp://googleusercontent.com/youtube_content/1"},
+		[]any{"Video link: [https://www.youtube.com/watch?v=test123](https://www.youtube.com/watch?v=test123)\nhttp://googleusercontent.com/youtube_content/1"},
 		nil, nil, nil, nil, nil, nil,
 		[]any{float64(2)},
 	}
@@ -158,7 +158,7 @@ func TestParseCandidateSliceStripsYouTubeArtifactAndHoldsTrailingAutoLink(t *tes
 	if !ok {
 		t.Fatal("expected parseCandidateSlice f2 ok")
 	}
-	want := "👉 **视频链接**：[https://www.youtube.com/watch?v=SntsJWcCEhs](https://www.youtube.com/watch?v=SntsJWcCEhs)"
+	want := "Video link: [https://www.youtube.com/watch?v=test123](https://www.youtube.com/watch?v=test123)"
 	if f2.Text != want {
 		t.Fatalf("expected youtube_content placeholder stripped and final link preserved, got %q, want %q", f2.Text, want)
 	}
@@ -172,7 +172,7 @@ func TestTrimIncompleteTrailingURLPreservesPrecedingASCIIAndIsMonotonic(t *testi
 		{"See (https://example.com/docs", "See ("},
 		{"Read [guide](https://example.com/guide", "Read [guide]("},
 		{`{"url":"https://example.com/api`, `{"url":"`},
-		{"👉 **视频链接**：[[https://www.youtube](https://www.youtube).", "👉 **视频链接**："},
+		{"Video link: [[https://www.youtube](https://www.youtube).", "Video link: "},
 		{"plain text without url", "plain text without url"},
 	}
 	for _, tc := range cases {
@@ -185,7 +185,7 @@ func TestTrimIncompleteTrailingURLPreservesPrecedingASCIIAndIsMonotonic(t *testi
 		"See (https://example.com/docs) for details.",
 		"Read [the guide](https://example.com/guide) next.",
 		`{"tool_calls":[{"name":"fetch","arguments":{"url":"https://example.com/api"}}]} `,
-		"👉 **视频链接**：[[https://www.youtube](https://www.youtube).",
+		"Video link: [[https://www.youtube](https://www.youtube).",
 	}
 	for _, full := range streams {
 		prev := ""
@@ -204,8 +204,8 @@ func TestTrimIncompleteTrailingURLPreservesPrecedingASCIIAndIsMonotonic(t *testi
 }
 
 func TestParseConversationPollResponseForRIDAndVideoHints(t *testing.T) {
-	if !PromptRequestsVideo("帮我生成一段小猫散步的视频") {
-		t.Fatal("expected Chinese video prompt to match PromptRequestsVideo")
+	if !PromptRequestsVideo("generate a short cat walking video") {
+		t.Fatal("expected video prompt to match PromptRequestsVideo")
 	}
 	if !isAsyncVideoPlaceholderText("") || !isAsyncVideoPlaceholderText("Generating your video...") || !isAsyncVideoPlaceholderText("正在为您生成视频，请稍候") {
 		t.Fatal("expected placeholder strings to match isAsyncVideoPlaceholderText")
@@ -239,10 +239,10 @@ func TestParseConversationPollResponseForRIDAndVideoHints(t *testing.T) {
 }
 
 func TestParseCandidateSliceStripsGeminiWebMediaComponentTagsCleanly(t *testing.T) {
-	// Real-world Gemini Web inline JSX image mount tag mixed with prose and <split/>.
+	// Gemini Web inline JSX media mount tags mixed with surrounding prose.
 	cReal := []any{
 		"rc_img_tag",
-		[]any{"画好啦，看看效果～\n<split/>\n<Image alt=\"伊珂丝怪萌平面海报\" src=\"image_generation_content/13909508822012476050\"/>\n<split/>\n觉得怎么样？"},
+		[]any{"Here is your generated image.\n\n<Image alt=\"Minimalist landscape poster\" src=\"image_generation_content/123456\"/>\n\nLet me know if you want changes."},
 		nil, nil, nil, nil, nil, nil,
 		[]any{float64(2)},
 	}
@@ -253,7 +253,7 @@ func TestParseCandidateSliceStripsGeminiWebMediaComponentTagsCleanly(t *testing.
 	if strings.Contains(fReal.Text, "<Image") || strings.Contains(fReal.Text, "image_generation_content/") {
 		t.Fatalf("expected Gemini Web <Image> mount tag stripped, got %q", fReal.Text)
 	}
-	if !strings.Contains(fReal.Text, "画好啦，看看效果～") || !strings.Contains(fReal.Text, "觉得怎么样？") {
+	if !strings.Contains(fReal.Text, "Here is your generated image.") || !strings.Contains(fReal.Text, "Let me know if you want changes.") {
 		t.Fatalf("expected surrounding prose preserved, got %q", fReal.Text)
 	}
 
@@ -264,25 +264,25 @@ func TestParseCandidateSliceStripsGeminiWebMediaComponentTagsCleanly(t *testing.
 		want string
 	}{
 		{
-			in:   "<Image alt=\"伊珂丝怪萌平面海报\" src=\"image_generation_content/13909508822012476050\"/>",
+			in:   "<Image alt=\"Generated artwork\" src=\"image_generation_content/123456\"/>",
 			want: "",
 		},
 		{
-			in:   "第一段\n\n<Image alt=\"海报\" src=\"image_generation_content/123456\"></Image>\n\n第二段",
-			want: "第一段\n\n第二段",
+			in:   "First paragraph.\n\n<Image alt=\"poster\" src=\"image_generation_content/123456\"></Image>\n\nSecond paragraph.",
+			want: "First paragraph.\n\nSecond paragraph.",
 		},
 		{
-			in:   "看看视频：\n<Video title=\"clip\" src=\"generated_video_content/98765\"/>\n还有吗？",
-			want: "看看视频：\n还有吗？",
+			in:   "Watch the clip:\n<Video title=\"clip\" src=\"generated_video_content/98765\"/>\nMore details below.",
+			want: "Watch the clip:\nMore details below.",
 		},
 		{
-			in:   "![poster](https://googleusercontent.com/image_generation_content/0)\n正文开始",
-			want: "正文开始",
+			in:   "![poster](https://googleusercontent.com/image_generation_content/0)\nBody starts here.",
+			want: "Body starts here.",
 		},
 		{
 			// Code blocks and normal external image tags must remain untouched.
-			in:   "示例：\n```tsx\n<Image alt=\"demo\" src=\"image_generation_content/123\"/>\n```\n普通标签：<Image alt=\"hero\" src=\"https://example.com/hero.png\"/>",
-			want: "示例：\n```tsx\n<Image alt=\"demo\" src=\"image_generation_content/123\"/>\n```\n普通标签：<Image alt=\"hero\" src=\"https://example.com/hero.png\"/>",
+			in:   "Example:\n```tsx\n<Image alt=\"demo\" src=\"image_generation_content/123\"/>\n```\nExternal image: <Image alt=\"hero\" src=\"https://example.com/hero.png\"/>",
+			want: "Example:\n```tsx\n<Image alt=\"demo\" src=\"image_generation_content/123\"/>\n```\nExternal image: <Image alt=\"hero\" src=\"https://example.com/hero.png\"/>",
 		},
 	}
 	for _, tc := range cases {
@@ -299,8 +299,8 @@ func TestParseCandidateSliceStripsGeminiWebMediaComponentTagsCleanly(t *testing.
 	// Streaming prefixes across a split <Image .../> tag and markdown embed must be monotonic
 	// and never emit partial <Image markup.
 	streams := []string{
-		"画好啦，看看效果～\n\n<Image alt=\"伊珂丝怪萌平面海报\" src=\"image_generation_content/13909508822012476050\"/>\n\n觉得怎么样？",
-		"看看这个 ![poster](image_generation_content/12345) 效果不错",
+		"Here is your generated image.\n\n<Image alt=\"Generated artwork\" src=\"image_generation_content/123456\"/>\n\nLet me know if you want changes.",
+		"Preview ![poster](image_generation_content/12345) looks sharp.",
 	}
 	for _, full := range streams {
 		prev := ""

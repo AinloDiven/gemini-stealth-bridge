@@ -67,7 +67,7 @@ func TestThinkingStreamEmitsReasoningLifecycleAndActionTitle(t *testing.T) {
 }
 
 // TestThinkingActionToolCardKeepsIconInputs verifies that a tool card relays
-// only the upstream provider/status-template pair the bot needs for its icon;
+// only the upstream provider/status-template pair clients need for their UI;
 // no icon or title is synthesized.
 func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
@@ -111,9 +111,9 @@ func TestThinkingActionToolCardKeepsIconInputs(t *testing.T) {
 // upstream_revision error frame after the reply.
 func TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
-	padding := strings.Repeat("这是一段关于视频内容的详细解析文字。", 10)
-	streamingText := padding + "\n* **核心概念** [00:00:16]：打破传统固定思维。\n* **扩展模式** [00:02:26]：支持双人同打。\n\n👉 **视频链接**：[[https://www.youtube](https://www.youtube)."
-	finalText := padding + "\n* **核心概念** [[00:16](https://www.youtube.com/watch?v=SntsJWcCEhs&t=16)]：打破传统固定思维。\n* **扩展模式** [[02:26](https://www.youtube.com/watch?v=SntsJWcCEhs&t=146)]：支持双人同打。\n\n👉 **视频链接**：[https://www.youtube.com/watch?v=SntsJWcCEhs](https://www.youtube.com/watch?v=SntsJWcCEhs)"
+	padding := strings.Repeat("This section summarizes the key points covered in the video breakdown. ", 4)
+	streamingText := padding + "\n* **Core Concept** [00:00:16]: Breaking fixed patterns.\n* **Extended Mode** [00:02:26]: Supports co-op play.\n\nVideo link: [[https://www.youtube](https://www.youtube)."
+	finalText := padding + "\n* **Core Concept** [[00:16](https://www.youtube.com/watch?v=test123&t=16)]: Breaking fixed patterns.\n* **Extended Mode** [[02:26](https://www.youtube.com/watch?v=test123&t=146)]: Supports co-op play.\n\nVideo link: [https://www.youtube.com/watch?v=test123](https://www.youtube.com/watch?v=test123)"
 
 	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
 		if err := onFrame(&gemini.LineParseResult{
@@ -121,7 +121,7 @@ func TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision(t *te
 			Action: &gemini.ActionStatus{
 				ToolID:         "youtube_tool",
 				ToolTitle:      "YouTube",
-				StatusTemplate: "正在连接 {tool_logo_placeholder} {tool_name_placeholder}",
+				StatusTemplate: "Connecting to {tool_logo_placeholder} {tool_name_placeholder}",
 			},
 		}); err != nil {
 			return nil, err
@@ -149,7 +149,7 @@ func TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision(t *te
 	}
 	for _, want := range []string{
 		`"provider":"youtube_tool"`,
-		`"status_template":"正在连接 {tool_logo_placeholder} YouTube"`,
+		`"status_template":"Connecting to {tool_logo_placeholder} YouTube"`,
 		`data: [DONE]`,
 	} {
 		if !strings.Contains(body, want) {
@@ -160,7 +160,7 @@ func TestYouTubeStreamTimestampLinkificationDoesNotTriggerUpstreamRevision(t *te
 
 func TestStreamParenthesizedURLAcrossFramesDoesNotTriggerUpstreamRevision(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
-	padding := strings.Repeat("这是一段足够超过流式缓冲阈值的说明文字。", 10)
+	padding := strings.Repeat("Introductory buffer text designed to exceed the streaming hold threshold. ", 4)
 	parseWireCandidate := func(text string, status float64) *gemini.LineParseResult {
 		inner, err := json.Marshal([]any{
 			nil,
@@ -186,9 +186,9 @@ func TestStreamParenthesizedURLAcrossFramesDoesNotTriggerUpstreamRevision(t *tes
 		return res
 	}
 
-	u1 := parseWireCandidate(padding+"详见 (", 1)
-	u2 := parseWireCandidate(padding+"详见 (https://example.com/docs/path", 1)
-	u3 := parseWireCandidate(padding+"详见 (https://example.com/docs/path) 说明。", 2)
+	u1 := parseWireCandidate(padding+"See (", 1)
+	u2 := parseWireCandidate(padding+"See (https://example.com/docs/path", 1)
+	u3 := parseWireCandidate(padding+"See (https://example.com/docs/path) for details.", 2)
 
 	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
 		for _, u := range []*gemini.LineParseResult{u1, u2, u3} {
@@ -204,7 +204,7 @@ func TestStreamParenthesizedURLAcrossFramesDoesNotTriggerUpstreamRevision(t *tes
 	if strings.Contains(body, "upstream_revision") || strings.Contains(body, `"error"`) {
 		t.Fatalf("unexpected error streaming parenthesized URL across frames:\n%s", body)
 	}
-	if !strings.Contains(body, "https://example.com/docs/path) 说明。") {
+	if !strings.Contains(body, "https://example.com/docs/path) for details.") {
 		t.Fatalf("expected held-back URL flushed intact on completion, got:\n%s", body)
 	}
 }
@@ -215,9 +215,9 @@ func TestStreamParenthesizedURLAcrossFramesDoesNotTriggerUpstreamRevision(t *tes
 // the turn, the stream completes cleanly without upstream_revision.
 func TestStreamTimestampStrippingDoesNotTriggerUpstreamRevision(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
-	padding := strings.Repeat("从医学和生理学角度来说，适度清理确实能让人身心放松、缓解压力。", 5)
-	streamingText := padding + "甚至对健康有一定的好处 [00:00:30]，完全属于正常需求。但如果在纯粹浪费体力了的说 [00:02:11]！"
-	finalText := padding + "甚至对健康有一定的好处，完全属于正常需求。但如果在纯粹浪费体力了的说！\n\n总之全凭个人习惯。"
+	padding := strings.Repeat("Detailed technical explanation exceeding the streaming flush threshold. ", 4)
+	streamingText := padding + "First point applies here [00:00:30], and second point applies next [00:02:11]!"
+	finalText := padding + "First point applies here, and second point applies next!\n\nConclusion follows."
 
 	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
 		if err := onFrame(&gemini.LineParseResult{
@@ -241,20 +241,20 @@ func TestStreamTimestampStrippingDoesNotTriggerUpstreamRevision(t *testing.T) {
 	if strings.Contains(body, "upstream_revision") || strings.Contains(body, `"error"`) {
 		t.Fatalf("unexpected error in SSE stream after timestamp stripping:\n%s", body)
 	}
-	if !strings.Contains(body, "总之全凭个人习惯。") || !strings.Contains(body, "data: [DONE]") {
+	if !strings.Contains(body, "Conclusion follows.") || !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("expected final tail and stream terminator, got:\n%s", body)
 	}
 
 	if tail, ok := remainingStreamTail("This has benefits for health.", "This has benefits [00:00:30] for"); !ok || tail != " health." {
 		t.Fatalf("expected English stripped timestamp tail ' health.', got ok=%v tail=%q", ok, tail)
 	}
-	if tail, ok := remainingStreamTail("好处", "好处 [00:00:30]"); !ok || tail != "" {
+	if tail, ok := remainingStreamTail("summary", "summary [00:00:30]"); !ok || tail != "" {
 		t.Fatalf("expected trailing stripped timestamp to match with empty tail, got ok=%v tail=%q", ok, tail)
 	}
-	if hasCompatibleStreamPrefix("好处，完全不同", "好处 [1]，完全不同") {
+	if hasCompatibleStreamPrefix("summary, first option", "summary [1], first option") {
 		t.Fatalf("non-clock bracket [1] should not be treated as stripped timestamp")
 	}
-	if hasCompatibleStreamPrefix("好处，其实不然", "好处 [00:00:30]，完全不同") {
+	if hasCompatibleStreamPrefix("summary, option A", "summary [00:00:30], option B") {
 		t.Fatalf("genuine text revision must still be rejected")
 	}
 }

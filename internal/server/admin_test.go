@@ -693,7 +693,7 @@ func TestMediaToolActivePreventsNewConversationRetry(t *testing.T) {
 		"model":  testModel.ModelName,
 		"stream": true,
 		"messages": []any{
-			map[string]any{"role": "user", "content": "帮我生成一个视频"},
+			map[string]any{"role": "user", "content": "generate a short video"},
 		},
 	}
 	srv.HandleChat(context.Background(), rec, body, scope)

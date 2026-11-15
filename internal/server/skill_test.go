@@ -38,7 +38,7 @@ func TestFormatSkillPromptIsIdempotentAndKeepsByteZero(t *testing.T) {
 		{"@researchhi", "@research hi"},
 		{"@research", "@research"},
 		{"", "@research"},
-		{"【用户消息】\nhi", "@research 【用户消息】\nhi"},
+		{"[user]\nhi", "@research [user]\nhi"},
 		{"<|im_start|>user\nhi", "@research <|im_start|>user\nhi"},
 	}
 	for _, tc := range cases {

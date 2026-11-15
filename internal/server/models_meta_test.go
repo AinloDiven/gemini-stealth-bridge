@@ -271,7 +271,7 @@ func TestStreamingMediaInIntermediateFrameDoesNotTriggerUpstreamRevision(t *test
 				Frames: []gemini.Frame{
 					{
 						RCID:            "rc_stream",
-						Text:            "前半句 ",
+						Text:            "First half ",
 						Done:            false,
 						AnsweredModelID: testModel.ModelID,
 						GeneratedImages: []gemini.GeneratedImage{img},
@@ -288,7 +288,7 @@ func TestStreamingMediaInIntermediateFrameDoesNotTriggerUpstreamRevision(t *test
 				Frames: []gemini.Frame{
 					{
 						RCID:            "rc_stream",
-						Text:            "前半句 后半句",
+						Text:            "First half second half",
 						Done:            true,
 						AnsweredModelID: testModel.ModelID,
 					},
@@ -309,16 +309,16 @@ func TestStreamingMediaInIntermediateFrameDoesNotTriggerUpstreamRevision(t *test
 	if strings.Contains(bodyStr, "upstream_revision") {
 		t.Fatalf("unexpected upstream_revision error in SSE stream:\n%s", bodyStr)
 	}
-	if !strings.Contains(bodyStr, "后半句") || !strings.Contains(bodyStr, "/v1/media/") {
+	if !strings.Contains(bodyStr, "second half") || !strings.Contains(bodyStr, "/v1/media/") {
 		t.Fatalf("expected streamed body to include continuation text and proxied /v1/media/ link, got:\n%s", bodyStr)
 	}
 }
 
 func TestStreamingImageGenerationHoldsIntermediateProseAndNeverLeaksComponentTag(t *testing.T) {
-	rawLongProse := "这是为你准备的超长前置说明文字，用来超过二百四十字节的流式阈值限制，" +
-		"如果服务端在图片生成完成之前就把中间帧内容推出去，就会提前触发客户端状态机切换并且可能暴露内部标签。\n\n" +
-		`<Image alt="伊珂丝怪萌平面海报" src="image_generation_content/13909508822012476050"/>` +
-		"\n\n海报做好啦，来看看吧！"
+	rawLongProse := "Intro text specifically padded well beyond the 240-byte streaming buffer threshold so we verify that intermediate generation frames are held back " +
+		"instead of flushing early before media attachment delivery completes and exposing internal mount tags.\n\n" +
+		`<Image alt="Generated artwork" src="image_generation_content/123456"/>` +
+		"\n\nYour image is ready."
 
 	for _, tc := range []struct {
 		name        string
@@ -336,14 +336,14 @@ func TestStreamingImageGenerationHoldsIntermediateProseAndNeverLeaksComponentTag
 						CID:             "c_img2",
 						RID:             "r_img2",
 						MediaToolActive: true,
-						Action:          &gemini.ActionStatus{ToolID: "image_generation", BranchTitle: "正在创建您的图片"},
+						Action:          &gemini.ActionStatus{ToolID: "image_generation", BranchTitle: "Creating your image"},
 					}); err != nil {
 						return nil, err
 					}
 					// Simulate Gemini streaming a candidate frame (>240 bytes) mid-generation while done=false
 					candStreaming := []any{
 						"rc_img2",
-						[]any{rawLongProse[:len(rawLongProse)-len("来看看吧！")]},
+						[]any{rawLongProse[:len(rawLongProse)-len("Your image is ready.")]},
 						nil, nil, nil, nil, nil, nil,
 						[]any{float64(1)},
 					}
@@ -368,7 +368,7 @@ func TestStreamingImageGenerationHoldsIntermediateProseAndNeverLeaksComponentTag
 									[]any{
 										[]any{nil, nil, nil, []any{nil, float64(1024), float64(1024), "https://lh3.googleusercontent.com/gg-dl/poster=s512"}},
 										nil, nil,
-										[]any{nil, nil, nil, nil, nil, []any{"海报"}, "伊珂丝怪萌平面海报"},
+										[]any{nil, nil, nil, nil, nil, []any{"Poster"}, "Generated artwork"},
 									},
 								},
 							},
@@ -412,18 +412,18 @@ func TestStreamingImageGenerationHoldsIntermediateProseAndNeverLeaksComponentTag
 				}
 			}
 			fullText := combined.String()
-			if !strings.Contains(fullText, "海报做好啦，来看看吧！") || !strings.Contains(fullText, "/v1/media/") {
+			if !strings.Contains(fullText, "Your image is ready.") || !strings.Contains(fullText, "/v1/media/") {
 				t.Fatalf("expected clean concatenated prose and proxied /v1/media/ link, got fullText=%q\nraw:\n%s", fullText, bodyStr)
 			}
 			if tc.wantSingle {
 				// In buffered mode, intermediate >240B prose is held while mediaToolUsed is active,
 				// so prose and /v1/media/ arrive together only on completion (one content delta).
-				contentCount := strings.Count(bodyStr, `"content":"这是为你准备的`)
+				contentCount := strings.Count(bodyStr, `"content":"Intro text specifically`)
 				mediaCount := strings.Count(bodyStr, "/v1/media/")
 				if contentCount != 1 || mediaCount == 0 {
 					t.Fatalf("expected single finalized content chunk in buffered media mode, contentCount=%d mediaCount=%d\n%s", contentCount, mediaCount, bodyStr)
 				}
-				proseIdx := strings.Index(bodyStr, "这是为你准备的")
+				proseIdx := strings.Index(bodyStr, "Intro text specifically")
 				if firstMediaIdx := strings.Index(bodyStr, "/v1/media/"); firstMediaIdx < proseIdx {
 					t.Fatalf("unexpected media ordering: %s", bodyStr)
 				}

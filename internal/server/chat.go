@@ -104,7 +104,7 @@ func buildActionStatusPayload(operationID string, a *gemini.ActionStatus) map[st
 	}
 	// A tool/thinking card is a progress observation, not the generation's
 	// terminal signal. The web client keeps the turn active after a tool card
-	// completes, and the bot treats a terminal frame as final for the whole
+	// completes, and clients treat a terminal frame as final for the whole
 	// operation, so these cards are always non-terminal.
 	state := "active"
 	terminal := false
