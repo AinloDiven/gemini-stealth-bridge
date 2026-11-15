@@ -111,3 +111,66 @@ func TestFrameWithoutGroundingHasNoSources(t *testing.T) {
 		t.Fatalf("expected no frame-level grounding sources, got %+v", r.Frames)
 	}
 }
+
+func TestParseFrameLineExtractsFileCitationsFromCandidate12(t *testing.T) {
+	candidate := make([]any, 13)
+	candidate[0] = "rc_file_1"
+	candidate[1] = []any{"See [cite: 9] and [cite: 14]."}
+	candidate[8] = []any{float64(2)}
+	candidate[12] = []any{
+		map[string]any{
+			"44": []any{
+				[]any{
+					[]any{"[cite: 9]", float64(11)},
+					[]any{
+						[]any{
+							nil,
+							[]any{
+								[]any{nil, float64(2), "attachment.mp4", nil, nil, nil, nil, nil, nil, nil, nil, "video/mp4"},
+								nil, nil, nil, nil, nil, "attachment.mp4",
+							},
+						},
+					},
+				},
+				[]any{
+					[]any{"[cite: 14]", float64(25)},
+					[]any{
+						[]any{
+							nil,
+							[]any{
+								[]any{nil, float64(1), "image_1.jpg", nil, nil, nil, nil, nil, nil, nil, nil, "image/jpeg"},
+								nil, nil, nil, nil, nil, "",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	line := groundingFrameLine(t, candidate)
+	r, err := ParseFrameLine(line)
+	if err != nil {
+		t.Fatalf("ParseFrameLine failed: %v", err)
+	}
+	if len(r.GroundingSources) != 2 {
+		t.Fatalf("expected 2 file citations, got %+v", r.GroundingSources)
+	}
+	if r.GroundingSources[0] != (GroundingSource{ID: 9, Title: "attachment.mp4", MimeType: "video/mp4"}) {
+		t.Fatalf("unexpected first file citation: %+v", r.GroundingSources[0])
+	}
+	if r.GroundingSources[1] != (GroundingSource{ID: 14, Title: "image_1.jpg", MimeType: "image/jpeg"}) {
+		t.Fatalf("unexpected second file citation: %+v", r.GroundingSources[1])
+	}
+
+	// GroundingCitationsWithIDs assigns web IDs without overriding claimed file IDs.
+	merged := MergeGroundingSources([]GroundingSource{
+		{URL: "https://example.com/a", Title: "Web A"},
+		{URL: "https://example.com/b", Title: "Web B"},
+	}, r.GroundingSources)
+	withIDs := GroundingCitationsWithIDs(merged)
+	if len(withIDs) != 4 || withIDs[0].ID != 1 || withIDs[1].ID != 2 || withIDs[2].ID != 9 || withIDs[3].ID != 14 {
+		t.Fatalf("unexpected assigned IDs: %+v", withIDs)
+	}
+}
+

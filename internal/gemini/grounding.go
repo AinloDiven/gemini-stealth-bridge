@@ -1,65 +1,148 @@
 package gemini
 
-import "strings"
+import (
+	"regexp"
+	"strconv"
+	"strings"
+)
 
-// GroundingSource is one web-search citation reported by Gemini Web's Google
-// Search grounding extension.
+var citeMarkerIDRe = regexp.MustCompile(`\d+`)
+
+// GroundingSource is one citation reported by Gemini Web, either from the Google
+// Search grounding slot (candidate[2]) or from inline attachment/file citation
+// metadata (candidate[12] field 44).
 type GroundingSource struct {
-	URL     string `json:"url"`
-	Title   string `json:"title,omitempty"`
-	Snippet string `json:"snippet,omitempty"`
+	ID       int    `json:"id,omitempty"`
+	URL      string `json:"url,omitempty"`
+	Title    string `json:"title,omitempty"`
+	Snippet  string `json:"snippet,omitempty"`
+	MimeType string `json:"mime_type,omitempty"`
 }
 
-// extractGroundingSources pulls the Google Search citations out of one
+// extractGroundingSources pulls Google Search grounding sources (candidate[2])
+// and inline file/media citation mappings (candidate[12] field 44) out of one
 // candidate slice.
-//
-// Gemini Web carries them at inner[4][0][2][1]: the candidate's slot 2 holds
-// an array whose second element is the list of grounding chunks, and each chunk
-// holds the source list in slot 2 as [url, title, favicon, snippet]. The slot
-// layout is identical whether the payload is dense or sparse (JSPB), so the
-// candidate lookup goes through jspbField.
-//
-// A candidate without search grounding has no such slot, so the result is
-// empty rather than an error.
 func extractGroundingSources(candidate []any) []GroundingSource {
-	slot := jspbField(candidate, 2)
-	holder, ok := slot.([]any)
-	if !ok || len(holder) < 2 {
+	var out []GroundingSource
+	if holder, ok := jspbField(candidate, 2).([]any); ok && len(holder) >= 2 {
+		if chunks, ok := holder[1].([]any); ok {
+			for _, chunkAny := range chunks {
+				chunk, ok := chunkAny.([]any)
+				if !ok || len(chunk) < 3 {
+					continue
+				}
+				sources, ok := chunk[2].([]any)
+				if !ok || len(sources) == 0 {
+					continue
+				}
+				for _, srcAny := range sources {
+					src, ok := srcAny.([]any)
+					if !ok || len(src) < 2 {
+						continue
+					}
+					url, _ := src[0].(string)
+					url = stripTextFragment(url)
+					if url == "" {
+						continue
+					}
+					title, _ := src[1].(string)
+					snippet := ""
+					if len(src) > 3 {
+						snippet, _ = src[3].(string)
+					}
+					out = append(out, GroundingSource{URL: url, Title: title, Snippet: snippet})
+				}
+			}
+		}
+	}
+	return MergeGroundingSources(out, extractFileCitations(candidate))
+}
+
+// extractFileCitations reads candidate[12] field 44 (1-based JSPB key "44" ->
+// 0-based index 43), where Gemini Web binds "[cite: N]" markers to uploaded
+// file names and MIME types:
+// [ ["[cite: 9]", occIdx], [ [null, [ [..., kind, fname, ..., mime], ..., title ]], ... ], ... ].
+func extractFileCitations(candidate []any) []GroundingSource {
+	c12 := jspbField(candidate, 12)
+	if c12 == nil {
 		return nil
 	}
-	chunks, ok := holder[1].([]any)
-	if !ok || len(chunks) == 0 {
+	raw, ok := jspbSubField(c12, 43).([]any)
+	if !ok || len(raw) == 0 {
 		return nil
 	}
 	var out []GroundingSource
-	for _, chunkAny := range chunks {
-		chunk, ok := chunkAny.([]any)
-		if !ok || len(chunk) < 3 {
+	for _, entryAny := range raw {
+		entry, ok := entryAny.([]any)
+		if !ok || len(entry) < 2 {
 			continue
 		}
-		sources, ok := chunk[2].([]any)
+		markerWrap, ok := entry[0].([]any)
+		if !ok || len(markerWrap) == 0 {
+			continue
+		}
+		marker, _ := markerWrap[0].(string)
+		ids := parseCiteIDs(marker)
+		if len(ids) == 0 {
+			continue
+		}
+		sources, ok := entry[1].([]any)
 		if !ok || len(sources) == 0 {
 			continue
 		}
-		for _, srcAny := range sources {
+		for idx, srcAny := range sources {
 			src, ok := srcAny.([]any)
-			if !ok || len(src) < 2 {
+			if !ok {
 				continue
 			}
-			url, _ := src[0].(string)
-			url = stripTextFragment(url)
-			if url == "" {
+			holder, ok := jspbField(src, 1).([]any)
+			if !ok {
 				continue
 			}
-			title, _ := src[1].(string)
-			snippet := ""
-			if len(src) > 3 {
-				snippet, _ = src[3].(string)
+			title, _ := jspbField(holder, 6).(string)
+			var mimeType string
+			if meta, ok := jspbField(holder, 0).([]any); ok {
+				if strings.TrimSpace(title) == "" {
+					title, _ = jspbField(meta, 2).(string)
+				}
+				mimeType, _ = jspbField(meta, 11).(string)
 			}
-			out = append(out, GroundingSource{URL: url, Title: title, Snippet: snippet})
+			title = strings.TrimSpace(title)
+			mimeType = strings.TrimSpace(mimeType)
+			if title == "" {
+				continue
+			}
+			if len(sources) == len(ids) {
+				out = append(out, GroundingSource{ID: ids[idx], Title: title, MimeType: mimeType})
+				continue
+			}
+			for _, id := range ids {
+				out = append(out, GroundingSource{ID: id, Title: title, MimeType: mimeType})
+			}
 		}
 	}
 	return out
+}
+
+func parseCiteIDs(marker string) []int {
+	if marker == "" || !strings.Contains(strings.ToLower(marker), "cite") {
+		return nil
+	}
+	rawIDs := citeMarkerIDRe.FindAllString(marker, -1)
+	if len(rawIDs) == 0 {
+		return nil
+	}
+	ids := make([]int, 0, len(rawIDs))
+	seen := make(map[int]bool, len(rawIDs))
+	for _, raw := range rawIDs {
+		id, err := strconv.Atoi(raw)
+		if err != nil || id <= 0 || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // stripTextFragment removes Google's "#:~:text=" scroll anchor from a URL so
@@ -72,17 +155,23 @@ func stripTextFragment(u string) string {
 }
 
 // MergeGroundingSources appends sources that are not already present, keyed by
-// URL, so the same citation is not repeated across stream frames.
-//
-// The dedupe scans the accumulated list, which holds one entry per distinct
-// citation. Gemini returns a handful of sources per search, so the scan stays
-// short, and it avoids a shared cache that would be a data race between
-// concurrent requests.
+// URL (or ID+Title for non-URL file citations), so citations do not repeat
+// across stream frames.
 func MergeGroundingSources(dst []GroundingSource, src []GroundingSource) []GroundingSource {
 	for _, s := range src {
 		dup := false
-		for _, existing := range dst {
-			if existing.URL == s.URL {
+		for i, existing := range dst {
+			if s.URL != "" && existing.URL == s.URL {
+				if existing.ID == 0 && s.ID > 0 {
+					dst[i].ID = s.ID
+				}
+				dup = true
+				break
+			}
+			if s.URL == "" && existing.URL == "" && existing.ID == s.ID && existing.Title == s.Title {
+				if existing.MimeType == "" && s.MimeType != "" {
+					dst[i].MimeType = s.MimeType
+				}
 				dup = true
 				break
 			}
@@ -94,3 +183,30 @@ func MergeGroundingSources(dst []GroundingSource, src []GroundingSource) []Groun
 	}
 	return dst
 }
+
+// GroundingCitationsWithIDs assigns 1-based fallback IDs to web grounding
+// sources whose ID was not explicitly bound by file citations.
+func GroundingCitationsWithIDs(sources []GroundingSource) []GroundingSource {
+	if len(sources) == 0 {
+		return nil
+	}
+	claimed := make(map[int]bool, len(sources))
+	for _, s := range sources {
+		if s.ID > 0 && s.URL == "" {
+			claimed[s.ID] = true
+		}
+	}
+	out := make([]GroundingSource, len(sources))
+	copy(out, sources)
+	webIdx := 0
+	for i := range out {
+		if out[i].URL != "" && out[i].ID == 0 {
+			webIdx++
+			if !claimed[webIdx] {
+				out[i].ID = webIdx
+			}
+		}
+	}
+	return out
+}
+

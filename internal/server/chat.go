@@ -49,12 +49,13 @@ type sseDeltaEmpty struct{}
 // inside the OpenAI-compatible chat SSE stream. choices is always [] on these
 // frames; existing OpenAI clients ignore them.
 type sseExtensionChunk struct {
-	Object          string           `json:"object"`
-	Choices         []sseChatChoice  `json:"choices"`
-	ProtocolVersion int              `json:"x_gemini_protocol_version"`
-	Reasoning       map[string]any   `json:"x_gemini_reasoning,omitempty"`
-	ActionStatus    map[string]any   `json:"x_gemini_action_status,omitempty"`
-	Media           []map[string]any `json:"x_gemini_media,omitempty"`
+	Object          string                   `json:"object"`
+	Choices         []sseChatChoice          `json:"choices"`
+	ProtocolVersion int                      `json:"x_gemini_protocol_version"`
+	Reasoning       map[string]any           `json:"x_gemini_reasoning,omitempty"`
+	ActionStatus    map[string]any           `json:"x_gemini_action_status,omitempty"`
+	Media           []map[string]any         `json:"x_gemini_media,omitempty"`
+	Citations       []gemini.GroundingSource `json:"x_gemini_citations,omitempty"`
 }
 
 func buildMediaExtensionPayload(images []gemini.GeneratedImage, videos []gemini.GeneratedVideo) []map[string]any {
@@ -466,6 +467,39 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			ActionStatus:    payload,
 		})
 	}
+	sentCitationKeys := make(map[string]bool)
+	emitCitations := func(sources []gemini.GroundingSource) {
+		if len(sources) == 0 {
+			return
+		}
+		withIDs := gemini.GroundingCitationsWithIDs(sources)
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		if !headersSent {
+			return
+		}
+		var unseen []gemini.GroundingSource
+		for _, src := range withIDs {
+			if src.URL == "" && src.Title == "" {
+				continue
+			}
+			key := strconv.Itoa(src.ID) + "\x00" + src.URL + "\x00" + src.Title + "\x00" + src.MimeType
+			if sentCitationKeys[key] {
+				continue
+			}
+			sentCitationKeys[key] = true
+			unseen = append(unseen, src)
+		}
+		if len(unseen) == 0 {
+			return
+		}
+		writeExtensionLocked(sseExtensionChunk{
+			Object:          "chat.completion.chunk",
+			Choices:         []sseChatChoice{},
+			ProtocolVersion: 3,
+			Citations:       unseen,
+		})
+	}
 
 	var pinger *streamPinger
 	var pingerMu sync.Mutex
@@ -711,6 +745,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					lastContextToken = update.ContextToken
 				}
 				grounding = gemini.MergeGroundingSources(grounding, update.GroundingSources)
+				if stream && !buffered {
+					emitCitations(grounding)
+				}
 				for _, frame := range update.Frames {
 					if !selected {
 						candidateID = frame.RCID
@@ -765,6 +802,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 						if tail != "" || (s.Cfg.LiveThoughts && len(thoughts) > len(sentThought)) {
 							startStream(false)
+							emitCitations(grounding)
 							if tail != "" {
 								emit(sseDeltaContent{Content: tail}, nil, nil)
 								sentText = text
@@ -784,6 +822,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if identityVerified {
 							startStream(false)
+							emitCitations(grounding)
 						}
 						if identityVerified && s.Cfg.LiveThoughts {
 							if hasTools && !s.Cfg.KeepToolPreamble && sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) {
@@ -1300,6 +1339,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				}
 			}
 			if len(calls) == 0 {
+				emitCitations(grounding)
 				// The citations are part of the answer, so whatever has not been
 				// streamed yet (the answer tail in eager mode, the citation list
 				// in both modes) is emitted here.
@@ -1363,6 +1403,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			if len(calls) == 0 {
 				if mediaPayload := buildMediaExtensionPayload(lastImages, lastVideos); len(mediaPayload) > 0 {
 					payload["x_gemini_media"] = mediaPayload
+				}
+				if citPayload := gemini.GroundingCitationsWithIDs(grounding); len(citPayload) > 0 {
+					payload["x_gemini_citations"] = citPayload
 				}
 			}
 			if served != nil && (servedID != model.ModelID || labelMismatch) {

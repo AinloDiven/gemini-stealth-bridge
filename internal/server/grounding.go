@@ -13,14 +13,25 @@ import (
 // The citations are a plain numbered list at the end of the answer: clients
 // that render markdown show them as links, and clients that only read plain
 // text still get the source URLs.
+func webGroundingSources(sources []gemini.GroundingSource) []gemini.GroundingSource {
+	var out []gemini.GroundingSource
+	for _, s := range sources {
+		if s.URL != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func appendGroundingCitations(text string, sources []gemini.GroundingSource) string {
-	if len(sources) == 0 {
+	webSources := webGroundingSources(sources)
+	if len(webSources) == 0 {
 		return text
 	}
 	var b strings.Builder
 	b.WriteString(strings.TrimRight(text, " \t\r\n"))
 	b.WriteString("\n\n---\nSources:\n")
-	for i, s := range sources {
+	for i, s := range webSources {
 		title := strings.TrimSpace(s.Title)
 		if title == "" {
 			title = s.URL

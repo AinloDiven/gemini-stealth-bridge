@@ -525,11 +525,12 @@ func upstreamHeaders(upstream *gemini.StreamResponse) map[string]string {
 func formatSearchResult(text string, sources []gemini.GroundingSource) string {
 	var b strings.Builder
 	b.WriteString(strings.TrimSpace(text))
-	if len(sources) == 0 {
+	webSources := webGroundingSources(sources)
+	if len(webSources) == 0 {
 		return b.String()
 	}
 	b.WriteString("\n\n---\nSources:\n")
-	for i, s := range sources {
+	for i, s := range webSources {
 		title := strings.TrimSpace(s.Title)
 		if title == "" {
 			title = s.URL

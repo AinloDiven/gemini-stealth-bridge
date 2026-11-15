@@ -532,3 +532,78 @@ func TestStructuredMediaExtensionAndHeaderMode(t *testing.T) {
 		t.Fatalf("expected 400 for invalid X-GSB-Media-Mode, got %d: %s", recBad.Code, recBad.Body.String())
 	}
 }
+
+func TestCitationsExtensionAndSourcesFiltering(t *testing.T) {
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			sources := []gemini.GroundingSource{
+				{ID: 9, Title: "attachment.mp4", MimeType: "video/mp4"},
+				{URL: "https://example.com/a", Title: "Web A"},
+			}
+			frame := gemini.Frame{
+				RCID:               "rc_cite_1",
+				Text:               "Check [cite: 9] and [cite: 1].",
+				Done:               true,
+				AnsweredModelID:    testModel.ModelID,
+				AnsweredModelLabel: testModel.ModelName,
+				GroundingSources:   sources,
+			}
+			_ = onFrame(&gemini.LineParseResult{
+				CID:              "c_cite",
+				RID:              "r_cite",
+				GroundingSources: sources,
+				Frames:           []gemini.Frame{frame},
+			})
+			return &gemini.StreamResponse{Status: 200, GroundingSources: sources}, nil
+		},
+	}
+	srv := mcpTestServer(t, client)
+	srv.Cfg.IncludeGrounding = true
+
+	doReq := func(stream bool) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]any{
+			"model":    testModel.ModelName,
+			"stream":   stream,
+			"messages": []any{map[string]any{"role": "user", "content": "describe media"}},
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer audit")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	recStream := doReq(true)
+	if recStream.Code != 200 {
+		t.Fatalf("expected 200 stream, got %d: %s", recStream.Code, recStream.Body.String())
+	}
+	streamBody := recStream.Body.String()
+	citeIdx := strings.Index(streamBody, `"x_gemini_citations"`)
+	deltaIdx := strings.Index(streamBody, "Check [cite: 9] and [cite: 1].")
+	if citeIdx < 0 || deltaIdx < 0 || citeIdx >= deltaIdx {
+		t.Fatalf("expected x_gemini_citations before content delta, got:\n%s", streamBody)
+	}
+	if !strings.Contains(streamBody, `"title":"attachment.mp4"`) || !strings.Contains(streamBody, `"mime_type":"video/mp4"`) {
+		t.Fatalf("expected file citation metadata in SSE, got:\n%s", streamBody)
+	}
+	if strings.Contains(streamBody, "2. attachment.mp4") || !strings.Contains(streamBody, "1. Web A — https://example.com/a") {
+		t.Fatalf("expected Sources footer only for web URL, got:\n%s", streamBody)
+	}
+
+	recJSON := doReq(false)
+	if recJSON.Code != 200 {
+		t.Fatalf("expected 200 JSON, got %d: %s", recJSON.Code, recJSON.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recJSON.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	cits, ok := payload["x_gemini_citations"].([]any)
+	if !ok || len(cits) != 2 {
+		t.Fatalf("expected 2 x_gemini_citations entries in JSON, got %#v", payload["x_gemini_citations"])
+	}
+	if fileOnly := appendGroundingCitations("Plain [cite: 9]", []gemini.GroundingSource{{ID: 9, Title: "attachment.mp4"}}); fileOnly != "Plain [cite: 9]" {
+		t.Fatalf("expected file-only grounding not to append Sources section, got %q", fileOnly)
+	}
+}
+
