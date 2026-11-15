@@ -202,3 +202,39 @@ func TestTrimIncompleteTrailingURLPreservesPrecedingASCIIAndIsMonotonic(t *testi
 		}
 	}
 }
+
+func TestParseConversationPollResponseForRIDAndVideoHints(t *testing.T) {
+	if !PromptRequestsVideo("帮我生成一段小猫散步的视频") {
+		t.Fatal("expected Chinese video prompt to match PromptRequestsVideo")
+	}
+	if !isAsyncVideoPlaceholderText("") || !isAsyncVideoPlaceholderText("Generating your video...") || !isAsyncVideoPlaceholderText("正在为您生成视频，请稍候") {
+		t.Fatal("expected placeholder strings to match isAsyncVideoPlaceholderText")
+	}
+	if isAsyncVideoPlaceholderText("I cannot generate that video because of policy.") {
+		t.Fatal("did not expect refusal text to match isAsyncVideoPlaceholderText")
+	}
+
+	// Build a multi-turn hNvQHb response where turns[0] is an older turn (r_old)
+	// and turns[1] is the active turn (r_new).
+	makeCand := func(rcid, text string) []any {
+		return []any{rcid, []any{text}, nil, nil, nil, nil, nil, nil, []any{float64(2)}}
+	}
+	turnOld := []any{[]any{"c_1", "r_old"}, nil, nil, []any{[]any{makeCand("rc_old", "older answer")}}}
+	turnNew := []any{[]any{"c_1", "r_new"}, nil, nil, []any{[]any{makeCand("rc_new", "video done")}}}
+	innerJSON, _ := json.Marshal([]any{[]any{turnOld, turnNew}})
+	bodyBytes, _ := json.Marshal([]any{[]any{"wrb.fr", "hNvQHb", string(innerJSON)}})
+
+	res, err := ParseConversationPollResponseForRID(string(bodyBytes), "r_new")
+	if err != nil || res == nil || len(res.Frames) != 1 {
+		t.Fatalf("expected target RID frame, got res=%+v err=%v", res, err)
+	}
+	if res.RID != "r_new" || res.Frames[0].Text != "video done" {
+		t.Fatalf("expected r_new 'video done', got RID=%q Text=%q", res.RID, res.Frames[0].Text)
+	}
+
+	missing, err := ParseConversationPollResponseForRID(string(bodyBytes), "r_pending")
+	if err != nil || missing != nil {
+		t.Fatalf("expected nil result when active RID is not yet present among RID-bearing turns, got %+v err=%v", missing, err)
+	}
+}
+

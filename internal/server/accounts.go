@@ -375,6 +375,18 @@ func (s *Server) EnsureModels(ctx context.Context, force bool) []*AccountState {
 	return accts
 }
 
+// modelNames returns the model ids in registry order, for callers that need the
+// same list the API serves rather than a written-out copy that can go stale.
+func modelNames(models []gemini.ModelInfo) []string {
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		if name := strings.TrimSpace(m.ModelName); name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 func (s *Server) allModels() []gemini.ModelInfo {
 	accts := s.Accounts()
 	seen := make(map[string]bool)
@@ -748,8 +760,17 @@ func (s *Server) classifyEmpty(ctx context.Context, a *AccountState, modelName s
 func modelFamilyTokens(modelName string) []string {
 	name := strings.ToLower(modelName)
 	var family []string
-	if strings.Contains(name, "argon") {
-		family = append(family, "argon", "pro")
+	// The frontier tier is billed against the "Gemini Pro" quota bucket. Upstream
+	// renamed it (Argon, now Carbon) while keeping that bucket name, so both names
+	// must map to the same family or an exhausted bucket is reported against the
+	// wrong model.
+	if strings.Contains(name, "argon") || strings.Contains(name, "carbon") {
+		family = append(family, "argon", "carbon", "pro")
+	}
+	// The everyday tier was renamed from Flash to Hydrogen on 2026-11-13. It
+	// still spends the "Gemini Flash" bucket, so the new name keeps that token.
+	if strings.Contains(name, "hydrogen") {
+		family = append(family, "hydrogen", "flash")
 	}
 	for _, tok := range []string{"pro", "flash", "thinking"} {
 		if strings.Contains(name, tok) {
@@ -1823,7 +1844,7 @@ func (s *Server) prepareGeneration(
 		effortVal = "low"
 		tempReq = true
 	}
-	thinkLvl := gemini.ThinkingLevelFor(effortVal, mid, strconv.Itoa(s.Cfg.DefaultThinking))
+	thinkLvl := gemini.ThinkingLevelForModel(effortVal, *model, strconv.Itoa(s.Cfg.DefaultThinking))
 	effortStr := "low"
 	switch thinkLvl {
 	case 4:

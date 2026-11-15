@@ -58,25 +58,59 @@ type ModelLimits struct {
 // with a smaller window must not silently inherit another model's limit.
 var documentedModelLimits = map[string]ModelLimits{
 	"gemini-3.5-flash-lite":  {ContextWindow: 1048576, MaxOutput: 65536},
-	"gemini-3.8-flash":       {ContextWindow: 1048576, MaxOutput: 65536},
 	"gemini-3.1-pro":         {ContextWindow: 1048576, MaxOutput: 65536},
 	"gemini-3.1-pro-preview": {ContextWindow: 1048576, MaxOutput: 65536},
-	"gemini-4-argon":         {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-4-carbon":        {ContextWindow: 1048576, MaxOutput: 65536},
+	// The everyday tier was renamed from Flash to Hydrogen on 2026-11-13.
+	"gemini-4-hydrogen":          {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-4-hydrogen-thinking": {ContextWindow: 1048576, MaxOutput: 65536},
+	// Retained so an account that still serves an older catalogue keeps its
+	// documented limits rather than falling back to the configured guess.
+	"gemini-3.8-flash": {ContextWindow: 1048576, MaxOutput: 65536},
+	"gemini-4-argon":   {ContextWindow: 1048576, MaxOutput: 65536},
+}
+
+// DocumentedModelKeys lists the documented model ids a registry entry could
+// correspond to, most specific first.
+//
+// The live registry carries the versioned name in the description field ("4
+// Carbon") while the display name holds the UI label ("Most complex work"), and
+// older registries had the two the other way round. Every candidate is tried so
+// a labels-are-descriptive response does not silently downgrade all models to
+// the configured fallback.
+func DocumentedModelKeys(m ModelInfo) []string {
+	seen := make(map[string]bool, 3)
+	keys := make([]string, 0, 3)
+	for _, raw := range []string{m.Description, m.DisplayName, m.ModelName} {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+		name = strings.TrimPrefix(name, "gemini-")
+		slug := whitespaceRe.ReplaceAllString(strings.ToLower(name), "-")
+		if slug == "" {
+			continue
+		}
+		key := "gemini-" + slug
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 // DocumentedModelKey derives the documented model id for a registry entry, e.g.
-// "3.5 Flash-Lite" becomes "gemini-3.5-flash-lite".
+// "3.5 Flash-Lite" becomes "gemini-3.5-flash-lite". It returns the first
+// candidate, which is only meaningful for display; use DocumentedModelKeys when
+// the value drives a lookup.
 func DocumentedModelKey(m ModelInfo) string {
-	name := strings.TrimSpace(m.DisplayName)
-	if name == "" {
-		name = strings.TrimSpace(m.ModelName)
-		name = strings.TrimPrefix(name, "gemini-")
-	}
-	slug := whitespaceRe.ReplaceAllString(strings.ToLower(name), "-")
-	if slug == "" {
+	keys := DocumentedModelKeys(m)
+	if len(keys) == 0 {
 		return ""
 	}
-	return "gemini-" + slug
+	return keys[0]
 }
 
 // ResolveModelLimits returns the documented limits for a model, falling back to
@@ -84,8 +118,10 @@ func DocumentedModelKey(m ModelInfo) string {
 // reports which of the two was used so callers can tell a verified number from a
 // configured guess.
 func ResolveModelLimits(m ModelInfo, fallbackContext, fallbackOutput int) (ModelLimits, string) {
-	if lim, ok := documentedModelLimits[DocumentedModelKey(m)]; ok {
-		return lim, "documented"
+	for _, key := range DocumentedModelKeys(m) {
+		if lim, ok := documentedModelLimits[key]; ok {
+			return lim, "documented"
+		}
 	}
 	if fallbackContext <= 0 {
 		fallbackContext = 1048576
@@ -208,14 +244,18 @@ var ThinkingLevels = map[string]int{
 // SupportedThinkingEfforts lists the 3 valid thinking effort levels in order.
 var SupportedThinkingEfforts = []string{"low", "medium", "high"}
 
-var reThinkingCapable = regexp.MustCompile(`(?i)thinking|pro|argon|flash`)
+var reThinkingCapable = regexp.MustCompile(`(?i)thinking|pro|argon|carbon|hydrogen|flash`)
 
 var explicitReasoningModels = map[string]bool{
 	"gemini-pro":                true,
 	"gemini-flash":              true,
 	"gemini-thinking":           true,
+	"gemini-carbon":             true,
+	"gemini-4-carbon":           true,
 	"gemini-argon":              true,
 	"gemini-4-argon":            true,
+	"gemini-hydrogen":           true,
+	"gemini-4-hydrogen":         true,
 	"gemini-3-pro":              true,
 	"gemini-2.5-pro":            true,
 	"gemini-2.5-flash":          true,
@@ -381,6 +421,103 @@ func MatchesModel(m ModelInfo, wanted string) bool {
 			return true
 		}
 	}
+	// The registry keeps the tier name in the description ("4 Hydrogen") while
+	// the category holds the short name ("Hydrogen"), so a client using the
+	// versioned id from /v1/models must match through the documented key too.
+	for _, key := range DocumentedModelKeys(m) {
+		if strings.EqualFold(key, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeServedLabel reduces a served model label to a comparable slug:
+// "Gemini 4 Argon High" -> "argon", "3.5 Flash-Lite" -> "flash-lite".
+func normalizeServedLabel(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	s = strings.TrimPrefix(s, "gemini")
+	s = strings.TrimLeft(s, " -")
+	return strings.Join(strings.Fields(s), "-")
+}
+
+// stripVersionTokens removes pure version tokens ("4", "3.5") from a label slug
+// so "4 Carbon" and "carbon" compare equal.
+func stripVersionTokens(s string) string {
+	parts := strings.Split(s, "-")
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p == "" {
+			continue
+		}
+		isVer := true
+		for i := range len(p) {
+			if (p[i] < '0' || p[i] > '9') && p[i] != '.' {
+				isVer = false
+				break
+			}
+		}
+		if !isVer {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, "-")
+}
+
+// servedLabelNames lists the slugs a served label may legitimately carry for
+// this registry entry: the model name, the display name, and the versioned
+// description. The registry moved the tier name into the description ("4
+// Carbon") while the display name became a UI phrase ("Most complex work"), so
+// comparing against the display name alone would reject every real answer.
+func servedLabelNames(m ModelInfo) []string {
+	names := make([]string, 0, 3)
+	for _, raw := range []string{m.ModelName, m.DisplayName, m.Description} {
+		if s := normalizeServedLabel(raw); s != "" {
+			names = append(names, s)
+		}
+	}
+	return names
+}
+
+// stripThinkingSuffix drops a trailing thinking-level word from a label slug.
+// Upstream labels an answer with the effort it used ("4 Argon High"), and that
+// suffix says nothing about which tier answered.
+func stripThinkingSuffix(s string) string {
+	for _, suffix := range []string{"-low", "-medium", "-high", "-thinking"} {
+		if strings.HasSuffix(s, suffix) {
+			return strings.TrimSuffix(s, suffix)
+		}
+	}
+	return s
+}
+
+// labelVariants lists the forms of a label that may be compared: the slug as
+// published, and the same slug without one trailing effort word.
+//
+// Both sides of a comparison are expanded, never just the served label. A tier
+// whose own name ends in "Thinking" ("4 Hydrogen Thinking") would otherwise be
+// stripped down to "4-hydrogen" and could never match its own catalogue entry,
+// producing a false relabel report on a request upstream answered correctly.
+func labelVariants(slug string) []string {
+	out := []string{slug}
+	if stripped := stripThinkingSuffix(slug); stripped != slug {
+		out = append(out, stripped)
+	}
+	return out
+}
+
+// labelMatches reports whether a served slug names one of the entry's labels,
+// comparing the raw and effort-suffix-free forms on both sides.
+func labelMatches(served string, names []string) bool {
+	for _, name := range names {
+		for _, a := range labelVariants(served) {
+			for _, b := range labelVariants(name) {
+				if a == b {
+					return true
+				}
+			}
+		}
+	}
 	return false
 }
 
@@ -393,46 +530,71 @@ func IsMatchingServedModel(m ModelInfo, servedID, servedLabel string) bool {
 		}
 	}
 	if servedLabel != "" {
-		norm := func(s string) string {
-			s = strings.TrimSpace(strings.ToLower(s))
-			s = strings.TrimPrefix(s, "gemini")
-			s = strings.TrimLeft(s, " -")
-			return strings.Join(strings.Fields(s), "-")
-		}
-		stripVer := func(s string) string {
-			parts := strings.Split(s, "-")
-			var kept []string
-			for _, p := range parts {
-				if p == "" {
-					continue
-				}
-				isVer := true
-				for i := range len(p) {
-					if (p[i] < '0' || p[i] > '9') && p[i] != '.' {
-						isVer = false
-						break
-					}
-				}
-				if !isVer {
-					kept = append(kept, p)
-				}
-			}
-			return strings.Join(kept, "-")
-		}
-		s := norm(servedLabel)
-		d := norm(m.DisplayName)
-		n := norm(m.ModelName)
-		if s != "" && (s == d || s == n) {
+		s := normalizeServedLabel(servedLabel)
+		names := servedLabelNames(m)
+		if labelMatches(s, names) {
 			return true
 		}
 		if servedID == "" || m.ModelID == "" {
-			sv := stripVer(s)
-			if sv != "" && (sv == stripVer(d) || sv == stripVer(n)) {
+			sv := stripVersionTokens(stripThinkingSuffix(s))
+			for _, name := range names {
+				if sv != "" && sv == stripVersionTokens(stripThinkingSuffix(name)) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// isRouterTier reports whether the catalogue entry is an aggregator tier rather
+// than one fixed model. `gemini-auto` ("Auto — adapts to your needs") picks a
+// backing model per request, so an answer labelled "3.5 Flash-Lite" is its
+// documented behaviour, not a relabel. Without this exemption every auto request
+// was reported as a tier mismatch even though the id named the requested slot.
+func isRouterTier(m ModelInfo) bool {
+	for _, raw := range []string{m.ModelName, m.DisplayName} {
+		for _, seg := range strings.Split(normalizeServedLabel(raw), "-") {
+			if seg == "auto" {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// ServedLabelMismatch reports whether the upstream answer was labelled with a
+// different tier than the registry entry names, while the model id still
+// matched. Upstream renames a tier in place: on 2026-11-10 the slot kept id
+// 95a4c0abcba24364 but the catalogue called it Carbon while answers still said
+// "4 Argon". The id comparison alone accepted that silently, so a client asking
+// for the new tier could not tell it was still served the old one.
+func ServedLabelMismatch(m ModelInfo, servedID, servedLabel string) bool {
+	if servedLabel == "" || isRouterTier(m) {
+		return false
+	}
+	if servedID != "" && m.ModelID != "" && !strings.EqualFold(servedID, m.ModelID) {
+		// A different backend id is a substitution, not a relabel; the
+		// downgrade check already covers it.
+		return false
+	}
+	s := normalizeServedLabel(servedLabel)
+	if s == "" {
+		return false
+	}
+	names := servedLabelNames(m)
+	if labelMatches(s, names) {
+		return false
+	}
+	sv := stripVersionTokens(stripThinkingSuffix(s))
+	if sv != "" {
+		for _, name := range names {
+			if sv == stripVersionTokens(stripThinkingSuffix(name)) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // resolveDefaultThinkingLevel maps a default effort string or enum number to 1 (low), 4 (medium), or 2 (high).
@@ -447,9 +609,80 @@ func resolveDefaultThinkingLevel(defaultEffort string) int {
 	}
 }
 
+// ThinkingLevelForModel resolves the thinking level for a registry entry.
+//
+// It exists so the level comes from what upstream published for this model
+// rather than from its name. The name-based heuristics in ThinkingLevelFor are a
+// fallback for a registry that carries no thinking policy; when the registry
+// does answer, a model that was renamed or newly introduced is described
+// correctly without a code change.
+func ThinkingLevelForModel(rawEffort any, m ModelInfo, defaultEffort string) int {
+	caps := ResolveModelCapabilities(m)
+	if len(caps.EffortLevels) == 0 {
+		// No levels advertised for this entry: it cannot think, so any effort the
+		// caller asked for would be a request upstream cannot represent.
+		return 1
+	}
+	want := ""
+	if rawEffort != nil {
+		if s, ok := rawEffort.(string); ok {
+			want = strings.ToLower(strings.TrimSpace(s))
+		}
+	}
+	if want == "" {
+		want = strings.ToLower(strings.TrimSpace(defaultEffortOf(caps, defaultEffort)))
+	}
+	level := normalizeEffortKey(want)
+	for _, advertised := range caps.EffortLevels {
+		if advertised == level {
+			return ThinkingLevels[advertised]
+		}
+	}
+	// The requested level is not one this model offers (a tier may carry only
+	// low/high). Use the model's own advertised default instead of inventing one.
+	if def := caps.DefaultEffort; def != "" {
+		if lvl, ok := ThinkingLevels[def]; ok {
+			return lvl
+		}
+	}
+	if lvl, ok := ThinkingLevels[caps.EffortLevels[0]]; ok {
+		return lvl
+	}
+	return 1
+}
+
+// defaultEffortOf prefers the daemon default when the model offers it, else the
+// model's own advertised default.
+func defaultEffortOf(caps ModelCapabilities, daemonDefault string) string {
+	want := normalizeEffortKey(daemonDefault)
+	for _, advertised := range caps.EffortLevels {
+		if advertised == want {
+			return advertised
+		}
+	}
+	return caps.DefaultEffort
+}
+
+// normalizeEffortKey maps the loose spellings a client may send onto the three
+// Gemini level names.
+func normalizeEffortKey(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "medium", "4", "med":
+		return "medium"
+	case "high", "2", "max", "xhigh", "extended", "enabled", "adaptive", "true":
+		return "high"
+	case "low", "1", "0", "min", "minimal", "none", "off", "disabled", "false":
+		return "low"
+	}
+	return ""
+}
+
 // ThinkingLevelFor resolves the thinking level from a request body effort value
 // and model ID, strictly using Gemini Web's 3 levels: low (1), medium (4), high (2),
 // with default low (1).
+//
+// Prefer ThinkingLevelForModel when a ModelInfo is available: this variant has
+// only a name to go on, so it falls back to name heuristics.
 func ThinkingLevelFor(rawEffort any, modelName, defaultEffort string) int {
 	defLvl := resolveDefaultThinkingLevel(defaultEffort)
 	if rawEffort == nil || rawEffort == "" {

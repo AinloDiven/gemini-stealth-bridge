@@ -73,6 +73,21 @@ Compatibility covers the endpoints and fields documented here, not the entire Op
 - Audio input/output, embeddings, and the general OpenAI Files API are not exposed. Internal text-attachment offloading is not a general file-upload API.
 - The daemon serves plain HTTP. It does not terminate TLS.
 
+### What's new in v0.4.4
+- **The SSE grace timer actually runs in a default deployment**: `BRIDGE_EARLY_SSE_GRACE_MS` was gated on downgrade rejection being disabled, and that guard is on by default, so the timer never fired where it was needed. A thinking-heavy tier therefore held its response headers for minutes and a reverse proxy abandoned the request with "timeout awaiting response headers" while the bridge was still working. The grace flush now applies whenever buffering would otherwise outlast it; the downgrade guard keeps running on the stream body, which stops a mismatch just as the status line did.
+### What's new in v0.4.3
+- **The published model id is the versioned one**: the catalogue keeps the short tier name in the category (`Carbon`) while the description carries the product name (`4 Carbon`). `GET /v1/models` now publishes `gemini-4-carbon`, `gemini-3.1-pro` and `gemini-3.5-flash-lite`, which is what a capability table downstream is keyed by. The bare spellings (`gemini-carbon`, `gemini-pro`, `gemini-flash-lite`) remain as aliases and still resolve.
+- **Why it mattered**: a bare id matched no versioned capability row in front of the bridge, so `reasoning_effort` was dropped before it arrived and the model was advertised with a 128k window and no thinking levels. Requests to a bare id now reach the bridge with the effort the client asked for.
+### What's new in v0.4.2
+- **The 2026-11-13 catalogue release**: Google renamed the everyday tier from `3.8 Flash` to `4 Hydrogen`, moved `4 Argon` to code-and-analysis, and kept `4 Carbon` for the most complex work. The new names resolve, keep their thinking levels, and still map to the `Gemini Flash` and `Gemini Pro` quota buckets, so an exhausted bucket is reported against the model that spends it.
+- **Router tiers are exempt from the label guard**: `gemini-auto` picks a backing model per request and labels the answer with the model it chose, so an `Auto` request answered as `3.5 Flash-Lite` is correct behaviour. It had been reported as `label_mismatch` on every response, and `BRIDGE_REJECT_LABEL_MISMATCH=1` would have taken those accounts offline entirely.
+- **Thinking-suffixed tier names match themselves**: `4 Hydrogen Thinking` was stripped to `4-hydrogen` before comparison, so it never matched its own catalogue entry. Both sides of the comparison are now expanded.
+- **The offline fallback matches the live registry**: `gsb --models-json` with no loaded accounts previously reported invented model IDs and marked Flash-Lite as non-reasoning while the registry gives it all three levels.
+### What's new in v0.4.1
+- **Frontier model tier tracked through the rename**: upstream renamed the top tier from `gemini-argon` to `gemini-carbon` on 2026-11-10. Thinking level and model selection now come from the live registry instead of name tables, so a renamed or newly introduced tier is described correctly without a code change. The name tables remain only as a fallback for a registry that publishes no thinking policy. Pin clients from `GET /v1/models`; a name upstream has dropped returns `404 model_not_found`.
+- **Documented limits actually apply**: the limit table was keyed from `displayName`, but the live registry carries the versioned name in `description` and a UI label in `displayName`, so every model silently reported `limitsSource: config`. Each candidate is now tried in turn.
+- **Frontier quota attribution**: the quota bucket behind the top tier is still named "Gemini Pro", so both the current and previous tier names map to it when reporting an exhausted bucket.
+
 ### What's new in v0.4.0
 
 - **Web search grounding**: answers include a `Sources:` list; `BRIDGE_INCLUDE_GROUNDING=0` suppresses it.
@@ -278,7 +293,7 @@ The resulting buckets are exposed in `/v1/accounts`, `/v1/quota`, `gsb --account
 
 The 5-hour window is nested under the weekly allowance, so `gsb` caps effective 5-hour remaining credits to the weekly remaining credits when the weekly pool runs lower.
 
-When an account reaches `0` credits, non-lite models (`gemini-flash`, `gemini-pro`, `gemini-argon`) are blocked or downgraded upstream until `resetAt`, while `gemini-flash-lite` remains usable. `gsb` also records synthetic per-model cooldowns when upstream silently substitutes a model, escalating `1m → 5m → 15m → 1h → 6h → 24h` across repeated observations.
+When an account reaches `0` credits, non-lite models (`gemini-hydrogen`, `gemini-flash`, `gemini-pro`, `gemini-carbon`) are blocked or downgraded upstream until `resetAt`, while `gemini-flash-lite` remains usable. `gsb` also records synthetic per-model cooldowns when upstream silently substitutes a model, escalating `1m → 5m → 15m → 1h → 6h → 24h` across repeated observations.
 
 `quotaWindow` in `/v1/accounts` describes what the numbers cover, including `weeklyExposed`, `weeklyRemaining`, `weeklyTotal`, `nextResetAt`, and `nextResetInSeconds`.
 
@@ -376,6 +391,7 @@ The UI can change these settings live and optionally persist them to `$BRIDGE_HO
 | Max RPM per Account | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `0`–`600` (`0` disables) |
 | Max Concurrent Streams | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `0`–`64` (`0` disables) |
 | Reject Downgrade | `BRIDGE_REJECT_DOWNGRADE` | Boolean |
+| Reject Label Mismatch | `BRIDGE_REJECT_LABEL_MISMATCH` | Boolean |
 | Stream `reasoning_content` | `BRIDGE_LIVE_THOUGHTS` | Boolean |
 | Stream `tool_calls` deltas | `BRIDGE_LIVE_TOOL_CALLS` | Boolean |
 | Keep pre-tool preamble | `BRIDGE_TOOL_PREAMBLE` | Boolean |
@@ -666,7 +682,7 @@ Chat, Responses, and MCP responses can include:
 | `Retry-After` | Seconds to wait when quota/rate limited |
 | `X-Resets-At` | RFC 3339 quota reset timestamp, when known |
 
-Chat and Responses stream headers flush as soon as the served model identity is verified. When downgrade rejection is disabled or `BRIDGE_STREAM_BUFFER=eager` is set, `BRIDGE_EARLY_SSE` and `BRIDGE_EARLY_SSE_GRACE_MS` can flush them earlier so long thinking turns do not hit proxy header timeouts.
+Chat and Responses stream headers flush as soon as the served model identity is verified. If that takes longer than `BRIDGE_EARLY_SSE_GRACE_MS` (20000 by default), the headers and a keep-alive ping flush anyway and the downgrade check continues on the stream body, so a thinking-heavy tier does not lose the client to a reverse proxy's response-header timeout. `0` disables the early flush and holds the headers until the first frame.
 
 ### 8.3 Error format and codes
 
@@ -741,7 +757,11 @@ Returns an OpenAI-style list plus OpenRouter-style metadata:
 
 Responses carry an `ETag`; send `If-None-Match` to get `304`. The HTTP response is cacheable for 60 seconds (`Cache-Control: max-age=60`), while the per-account upstream model registry is cached for 10 minutes and refreshed in the background every `BRIDGE_MODEL_REFRESH_MS`. `?fresh=1` forces live discovery.
 
-Model IDs are whatever Gemini Web currently advertises, for example `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, or `gemini-argon`. Aliases and display names are matched too. Prefixes `gsb/`, `google/`, `models/`, `vx/`, and `vertex/` are stripped before matching; a `@think=<level>` suffix sets thinking effort for that request.
+Model IDs are whatever Gemini Web currently advertises, for example `gemini-4-hydrogen`, `gemini-hydrogen-thinking`, `gemini-pro`, `gemini-flash-lite`, `gemini-argon`, `gemini-carbon`, or the free tier's `gemini-auto`. Aliases and display names are matched too. Prefixes `gsb/`, `google/`, `models/`, `vx/`, and `vertex/` are stripped before matching; a `@think=<level>` suffix sets thinking effort for that request.
+
+`gemini-auto` is an aggregator tier rather than one fixed model: upstream picks a backing model per request and labels the answer with the model it chose, so an `Auto` request commonly comes back labelled `3.5 Flash-Lite`. That is its documented behaviour, not a substitution, and the label guard and `BRIDGE_REJECT_LABEL_MISMATCH` both leave it alone. Every other tier answers under its own label.
+
+Upstream renames a model in place without notice: on 2026-11-10 the frontier tier moved from `gemini-argon` to `gemini-carbon`, and on 2026-11-13 the everyday tier moved from `3.8 Flash` to `4 Hydrogen` while `4 Argon` became the code-and-analysis tier. A name that upstream has stopped advertising no longer resolves and returns `404 model_not_found`. Pin clients to a name after checking `GET /v1/models` rather than assuming one lasts across an upstream release.
 
 `gsb --models-json` prints the same payload without starting the daemon. With no loaded accounts it prints a static fallback list.
 
@@ -918,6 +938,7 @@ Streaming behavior:
 ```
 
 If the served model differs from the requested one, the payload also includes `requested_model` and `model_served`.
+The same fields appear when the backend id matched but the answer was labelled with a different tier, with `model_served.label_mismatch: true`. That case is reported because the id alone cannot tell a rename in place from the tier the client asked for; the request still succeeds unless `BRIDGE_REJECT_LABEL_MISMATCH=1`. Router tiers are exempt: `gemini-auto` (the free tier's `Auto — adapts to your needs` entry, id `cf41b0e0dd7d53e5` on the 2026-11-13 registry) picks a backing model per request and labels the answer with the model it chose, so an `Auto` request answered as `3.5 Flash-Lite` is its documented behaviour rather than a relabel.
 
 #### Function calling behavior
 
@@ -1085,7 +1106,7 @@ Behavior:
 | Argument | Required | Notes |
 |---|---|---|
 | `query` | Yes | Search query or question |
-| `model` | No | `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-argon` |
+| `model` | No | Any id from `GET /v1/models`; omit to use the account's default model |
 | `timeout_seconds` | No | 10–600 seconds; defaults to `BRIDGE_SEARCH_TIMEOUT_MS` (180 s) |
 
 A search runs as a temporary chat on the same account pool, quota accounting, and failover as normal requests. It does not add threads to the user's Gemini history. The result text is the synthesized answer followed by a `Sources:` list; snippets are included when Gemini provided them.
@@ -1269,6 +1290,7 @@ An unknown value falls back to `chrome_150_psk`. User-Agent and `Sec-CH-UA*` ver
 | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `24` | Per-account requests per rolling minute; `0` disables |
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | Per-account concurrent active streams; `0` disables |
 | `BRIDGE_REJECT_DOWNGRADE` | `true` | Reject detected upstream model substitution instead of silently returning another model |
+| `BRIDGE_REJECT_LABEL_MISMATCH` | `false` | Fail a request whose answer is labelled with a different tier than the registry entry, even though the backend id matched. Off by default: upstream renames a tier in place, so rejecting takes the renamed tier offline |
 | `BRIDGE_QUIET_HOURS` | Empty | `HH:MM-HH:MM` window in which background rotation/model refresh pauses (requests still work) |
 
 ### 11.7 Generation and history
@@ -1303,8 +1325,8 @@ Models with documented limits always use the documented value; `capabilities.lim
 | `BRIDGE_TOOL_SCHEMA_COMPACT` | `true` | Compact tool schemas in the prompt contract |
 | `BRIDGE_TOOL_DESC_MAX_CHARS` | `400` | Maximum tool-description length in the compact contract (minimum 64) |
 | `BRIDGE_STREAM_BUFFER` | `verified` | `verified` buffers until model identity is verified; `eager` streams earlier |
-| `BRIDGE_EARLY_SSE` | `false` | Flush streaming headers immediately when downgrade rejection is disabled or `BRIDGE_STREAM_BUFFER=eager` |
-| `BRIDGE_EARLY_SSE_GRACE_MS` | `20000` | Under the same conditions, flush headers after this long even if the first frame has not arrived; `0` keeps them buffered |
+| `BRIDGE_EARLY_SSE` | `false` | Flush streaming headers immediately instead of waiting for the identity check (requires `BRIDGE_STREAM_BUFFER=eager` or downgrade rejection off) |
+| `BRIDGE_EARLY_SSE_GRACE_MS` | `20000` | Flush headers after this long even if identity is unverified and no frame has arrived; the downgrade check then runs on the body. `0` keeps them buffered |
 | `BRIDGE_MAX_ATTEMPTS` | `3` | Total attempts per request, including failover (1–10) |
 | `BRIDGE_MAX_UPSTREAM_ATTEMPTS` | `3` | Maximum upstream calls per request (1–10) |
 | `BRIDGE_RETRY_BUDGET_MS` | `150000` | Total wall-clock budget for retries; `0` disables the deadline |

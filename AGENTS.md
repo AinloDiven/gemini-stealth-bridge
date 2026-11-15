@@ -278,7 +278,9 @@ Sources: `batchexecute` RPC `qpEbW` (`CHECK_GEMINI_QUOTA`) plus GraphQL `GetUser
 
 The 5-hour window is nested under the weekly allowance, so effective 5-hour remaining is capped at weekly remaining.
 
-When an account reaches `0` credits, non-lite models (`gemini-flash`, `gemini-pro`, `gemini-argon`) are blocked or downgraded until `resetAt`; `gemini-flash-lite` remains usable.
+When an account reaches `0` credits, non-lite models (`gemini-hydrogen`, `gemini-flash`, `gemini-pro`, `gemini-carbon`) are blocked or downgraded until `resetAt`; `gemini-flash-lite` remains usable.
+
+The catalogue changes without notice. On 2026-11-13 Google renamed the everyday tier from `3.8 Flash` to `4 Hydrogen`, made `4 Argon` the code-and-analysis tier, and kept `4 Carbon` for the most complex work. Catalogues are per-account, so an entitlement difference is not a bug: on that date a single free-tier account advertised only `gemini-4-hydrogen`, `gemini-hydrogen-thinking`, and `gemini-pro`, while an 8-account Gemini Pro pool advertised `gemini-flash-lite`, `gemini-4-hydrogen`, `gemini-pro`, and `gemini-carbon`. A free account advertised `gemini-auto` (id `cf41b0e0dd7d53e5`), a router tier that answers labelled with whichever backing model it chose. Names come from the live registry, so always resolve model IDs with `GET /v1/models` instead of hard-coding a tier; asking for a tier an account does not advertise returns `404 model_not_found`.
 
 ### 7.2 Synthetic cooldowns
 
@@ -617,7 +619,7 @@ A grounded answer is a **full model turn**, not a search-API lookup. Measured se
 | Argument | Required | Notes |
 |---|---|---|
 | `query` | Yes | Search query or question |
-| `model` | No | `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-argon` |
+| `model` | No | Any id from `GET /v1/models`; omit to use the account's default model |
 | `timeout_seconds` | No | 10–600; default from `BRIDGE_SEARCH_TIMEOUT_MS` (180 s) |
 
 Client config:
@@ -638,7 +640,7 @@ Search behavior:
 
 - runs as a temporary chat, so it does not add threads to the user's Gemini history,
 - uses the same account pool, quota accounting, and failover as chat,
-- model preference order when no override: `gemini-flash`, `gemini-flash-lite`, `gemini-pro`, `gemini-argon`, then the account's first model,
+- with no override it uses the account's default model, the same one an unspecified chat request gets, so there is no separate search list to keep in sync,
 - returns `search failed: …` as an MCP tool error (`isError: true`), not a JSON-RPC error,
 - diagnostic headers: `X-GSB-Account`, `X-GSB-Model`, `X-GSB-Duration-Ms`, `X-GSB-Sources`.
 
@@ -789,6 +791,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 | `BRIDGE_MAX_RPM_PER_ACCOUNT` | `24` | `0` disables |
 | `BRIDGE_MAX_CONCURRENT_PER_ACCOUNT` | `2` | `0` disables |
 | `BRIDGE_REJECT_DOWNGRADE` | `true` | Reject silent substitution |
+| `BRIDGE_REJECT_LABEL_MISMATCH` | `false` | Reject an answer labelled with a different tier than the registry entry, same backend id included. Router tiers such as `gemini-auto` are never rejected: they label the answer with whichever backing model they chose |
 | `BRIDGE_QUIET_HOURS` | empty | `HH:MM-HH:MM`; pauses background work only |
 
 ### 15.6 Generation, history, tools

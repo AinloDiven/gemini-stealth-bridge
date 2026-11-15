@@ -924,9 +924,12 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 					if !selected {
 						candidateID = frame.RCID
 						selected = true
-					}
-					if frame.RCID != candidateID {
-						continue
+					} else if frame.RCID != candidateID {
+						if len(frame.GeneratedVideos) > 0 && len(lastVideos) == 0 && text == "" && sentText == "" {
+							candidateID = frame.RCID
+						} else {
+							continue
+						}
 					}
 					attemptStateMu.Lock()
 					s.rewriteFrameMedia(ctx, account.ID, &frame)
@@ -1068,20 +1071,20 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			}
 			if errCode == "account_banned" {
 				s.markAccountQuarantined(account, runCheck.Error())
-			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" {
+			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" && errCode != "model_label_mismatch" {
 				s.markAccountFailure(account, runCheck.Error())
 				if errCode != "empty_upstream_response" {
 					s.refreshQuotaAsync(account, c)
 				}
 			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+			if cacheKey != "" && len(opts.Metadata) > 0 && !mediaToolUsed && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 				s.deleteSessionCache(cacheKey)
 				s.deleteSessionBinding(prep.sessionBindingKey)
 				cacheKey = ""
 			}
 
 			payloadCommitted := func() bool {
-				return sentText != "" || messageAdded
+				return sentText != "" || messageAdded || mediaToolUsed
 			}
 			responseCommitted := func() bool {
 				streamMu.Lock()
@@ -1346,6 +1349,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 				"account_switches":   accountSwitches.Load(),
 				"requested_model":    mid,
 				"served_model":       servedID,
+				"served_label":       servedLabel,
+				"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
 			})
 			if ctx.Err() == nil {
 				sendChatError(w, headersSent, runCheck)
@@ -1702,6 +1707,8 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 			"account_switches":   accountSwitches.Load(),
 			"requested_model":    mid,
 			"served_model":       servedID,
+			"served_label":       servedLabel,
+			"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
 		})
 
 		account.mu.Lock()

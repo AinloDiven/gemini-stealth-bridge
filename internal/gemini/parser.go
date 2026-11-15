@@ -1179,6 +1179,12 @@ func firstActionString(value any) string {
 // ParseConversationPollResponse parses an hNvQHb batchexecute response payload
 // when polling for an asynchronous video generation turn.
 func ParseConversationPollResponse(body string) (*LineParseResult, error) {
+	return ParseConversationPollResponseForRID(body, "")
+}
+
+// ParseConversationPollResponseForRID parses an hNvQHb batchexecute response
+// payload, preferring the turn matching targetRID when present.
+func ParseConversationPollResponseForRID(body, targetRID string) (*LineParseResult, error) {
 	for _, rawLine := range strings.Split(body, "\n") {
 		s := strings.TrimSpace(rawLine)
 		if !strings.HasPrefix(s, "[[") || !strings.Contains(s, "hNvQHb") {
@@ -1210,8 +1216,8 @@ func ParseConversationPollResponse(body string) (*LineParseResult, error) {
 			if !ok || len(turns) == 0 {
 				continue
 			}
-			turn, ok := turns[0].([]any)
-			if !ok || len(turn) <= 3 {
+			turn := selectPolledTurn(turns, targetRID)
+			if len(turn) <= 3 {
 				continue
 			}
 			res := &LineParseResult{}
@@ -1240,6 +1246,34 @@ func ParseConversationPollResponse(body string) (*LineParseResult, error) {
 		}
 	}
 	return nil, nil
+}
+
+func selectPolledTurn(turns []any, targetRID string) []any {
+	if len(turns) == 0 {
+		return nil
+	}
+	if targetRID != "" {
+		sawAnyRID := false
+		for _, tAny := range turns {
+			t, ok := tAny.([]any)
+			if !ok {
+				continue
+			}
+			if ids, ok := t[0].([]any); ok && len(ids) > 1 {
+				if rid, _ := ids[1].(string); rid != "" {
+					sawAnyRID = true
+					if rid == targetRID {
+						return t
+					}
+				}
+			}
+		}
+		if sawAnyRID {
+			return nil
+		}
+	}
+	first, _ := turns[0].([]any)
+	return first
 }
 
 func extractGeneratedImages(c []any) []GeneratedImage {

@@ -485,12 +485,17 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 
 	if stream && s.Cfg.EarlySSE && (eagerStream || !s.Cfg.RejectDowngrade) {
 		startStream(false)
-	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 && (eagerStream || !s.Cfg.RejectDowngrade) {
-		// Buffered mode normally holds the response headers until the first frame so
-		// a detected model downgrade can still become an HTTP error. Thinking-heavy
-		// models can exceed a proxy's response-header timeout, so flush headers once
-		// the grace period elapses and keep the remaining downgrade check on the
-		// stream body instead.
+	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 {
+		// Buffered mode normally holds the response headers until the first frame
+		// so a detected model downgrade can still become an HTTP error. That only
+		// works while the upstream answers inside the proxy's response-header
+		// timeout: a thinking-heavy model can sit for minutes, and the client
+		// abandons the request with "timeout awaiting response headers" while gsb
+		// is still waiting. Flush headers once the grace period elapses and keep
+		// the remaining downgrade check on the stream body instead — the body
+		// check is strictly stronger than the status-line one, because a
+		// downgrade detected there still stops the stream and the client sees the
+		// mismatch in the frames.
 		go func() {
 			timer := time.NewTimer(s.Cfg.EarlySSEGrace)
 			defer timer.Stop()
@@ -659,9 +664,12 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					if !selected {
 						candidateID = frame.RCID
 						selected = true
-					}
-					if frame.RCID != candidateID {
-						continue
+					} else if frame.RCID != candidateID {
+						if len(frame.GeneratedVideos) > 0 && len(lastVideos) == 0 && text == "" && sentText == "" {
+							candidateID = frame.RCID
+						} else {
+							continue
+						}
 					}
 					attemptStateMu.Lock()
 					s.rewriteFrameMedia(ctx, account.ID, &frame)
@@ -818,22 +826,22 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			}
 			if errCode == "account_banned" {
 				s.markAccountQuarantined(account, runCheck.Error())
-			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" {
+			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" && errCode != "model_label_mismatch" {
 				s.markAccountFailure(account, runCheck.Error())
 				if errCode != "empty_upstream_response" {
 					s.refreshQuotaAsync(account, c)
 				}
 			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+			if cacheKey != "" && len(opts.Metadata) > 0 && !mediaToolUsed && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 				s.deleteSessionCache(cacheKey)
 				s.deleteSessionBinding(prep.sessionBindingKey)
 				cacheKey = ""
 			}
 
-			// Content or tool-call deltas already shown to the client commit the
-			// answer payload; a retry would duplicate or contradict it.
+			// Content, tool-call deltas, or started media tools already commit the
+			// upstream turn; retrying into a new conversation would duplicate it.
 			payloadCommitted := func() bool {
-				return sentText != "" || (toolStreamer != nil && toolStreamer.SentAny())
+				return sentText != "" || (toolStreamer != nil && toolStreamer.SentAny()) || mediaToolUsed
 			}
 			responseCommitted := func() bool {
 				streamMu.Lock()
@@ -1102,6 +1110,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"account_switches":   accountSwitches.Load(),
 				"requested_model":    mid,
 				"served_model":       servedID,
+				"served_label":       servedLabel,
+				"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
 			})
 			if ctx.Err() == nil {
 				closeReasoningIfStarted()
@@ -1169,9 +1179,17 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				content = appendGroundingCitations(textStr, grounding)
 			}
 		}
+		// A relabel is not a substitution: the backend id still names the slot the
+		// client asked for, so the request succeeds, but the label that came back
+		// named a different tier. Reporting it keeps the difference visible
+		// instead of letting "gemini-carbon" silently answer as "4 Argon".
+		labelMismatch := gemini.ServedLabelMismatch(*model, servedID, servedLabel)
 		var served map[string]any
 		if servedID != "" {
 			served = map[string]any{"id": servedID, "label": servedLabel}
+			if labelMismatch {
+				served["label_mismatch"] = true
+			}
 		}
 
 		usage := s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, text, thoughts)
@@ -1240,12 +1258,10 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 					}
 				}
 			}
-			if served != nil && servedID != model.ModelID {
+			closeReasoningIfStarted()
+			if served != nil && (servedID != model.ModelID || labelMismatch) {
 				emit(map[string]any{"model_served": served}, nil, nil)
 			}
-			streamMu.Lock()
-			closeReasoningLocked()
-			streamMu.Unlock()
 			emit(sseDeltaEmpty{}, finish, usage)
 			streamMu.Lock()
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
@@ -1278,7 +1294,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				},
 				"usage": usage,
 			}
-			if served != nil && servedID != model.ModelID {
+			if served != nil && (servedID != model.ModelID || labelMismatch) {
 				payload["requested_model"] = mid
 				payload["model_served"] = served
 			}
@@ -1322,6 +1338,8 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			"account_switches":   accountSwitches.Load(),
 			"requested_model":    mid,
 			"served_model":       servedID,
+			"served_label":       servedLabel,
+			"label_mismatch":     labelMismatch,
 		})
 
 		account.mu.Lock()
@@ -1368,6 +1386,18 @@ func (s *Server) evaluateAttemptCompletion(
 			subErr.Headers = qHdrs
 		}
 		return nil, subErr
+	}
+	if s.Cfg.RejectLabelMismatch && gemini.ServedLabelMismatch(model, servedID, servedLabel) {
+		// Opt-in strictness: the id named the requested slot, but the label says a
+		// different tier answered. That is only detectable from the label, so a
+		// deployment that needs certainty about the tier must fail here.
+		return nil, transport.NewUpstreamError(
+			fmt.Sprintf("requested %s but upstream answered as %q on account %s", mid, servedLabel, account.ID),
+			502,
+			"model_label_mismatch",
+			nil,
+			nil,
+		)
 	}
 	if streamErr != nil && !errors.Is(streamErr, transport.ErrStopStreaming) {
 		return nil, streamErr

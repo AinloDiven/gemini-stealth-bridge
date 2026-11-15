@@ -18,11 +18,22 @@ import (
 	"github.com/google/uuid"
 )
 
-var videoPromptHintRe = regexp.MustCompile(`(?i)\b(video|videos|veo|mp4|clip|clips|animasi|animation|footage)\b`)
+var videoPromptHintRe = regexp.MustCompile(`(?i)(?:\b(?:video|videos|veo|mp4|clip|clips|animasi|animation|footage)\b|视频|影片|短片|动画|ビデオ|動画|영상)`)
 
 // PromptRequestsVideo reports whether prompt likely asks Gemini Web to generate a video.
 func PromptRequestsVideo(prompt string) bool {
 	return videoPromptHintRe.MatchString(prompt)
+}
+
+func isAsyncVideoPlaceholderText(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	return strings.Contains(lower, "generating your video") ||
+		strings.Contains(trimmed, "正在生成您的视频") ||
+		strings.Contains(trimmed, "正在为您生成视频")
 }
 
 // UploadedFile represents the [[uploadPath], safeName] tuple expected in inner[0][3].
@@ -409,15 +420,18 @@ func (ac *AccountClient) streamGenerateLocked(
 		headers["x-goog-ext-525001261-jspb"] = modelHeader
 	}
 	var (
-		lineBuf         strings.Builder
-		inOuterArray    bool
-		cid, rid        string
-		asyncVideoCID   string
-		frameCount      int
-		sawDone         bool
-		sawContextToken bool
-		sawStreamEnd    bool
-		grounding       []GroundingSource
+		lineBuf            strings.Builder
+		inOuterArray       bool
+		cid, rid           string
+		firstRCID          string
+		asyncVideoCID      string
+		frameCount         int
+		sawDone            bool
+		sawGeneratedVideo  bool
+		sawFinalVideoReply bool
+		sawContextToken    bool
+		sawStreamEnd       bool
+		grounding          []GroundingSource
 	)
 
 	emitLine := func(line string) error {
@@ -442,8 +456,17 @@ func (ac *AccountClient) streamGenerateLocked(
 			asyncVideoCID = parsed.AsyncVideoCID
 		}
 		for _, f := range parsed.Frames {
+			if firstRCID == "" && f.RCID != "" {
+				firstRCID = f.RCID
+			}
+			if len(f.GeneratedVideos) > 0 {
+				sawGeneratedVideo = true
+			}
 			if f.Done {
 				sawDone = true
+				if len(f.GeneratedVideos) > 0 || !isAsyncVideoPlaceholderText(f.Text) {
+					sawFinalVideoReply = true
+				}
 			}
 		}
 		if sawDone && parsed.ContextToken != "" {
@@ -515,10 +538,10 @@ func (ac *AccountClient) streamGenerateLocked(
 				}
 			}
 		}
-		if frameCount == 0 && asyncVideoCID != "" {
+		if asyncVideoCID != "" && !sawGeneratedVideo && !sawFinalVideoReply {
 			// If Temporary was enabled and inner[45] was 1, Google does not persist the conversation for hNvQHb polling.
 			// Re-run once with Temporary=false and clean up the conversation afterward.
-			usedTemp := opts.Temporary && !PromptRequestsVideo(prompt)
+			usedTemp := opts.Temporary && len(opts.Metadata) == 0 && !PromptRequestsVideo(prompt)
 			if usedTemp {
 				retryOpts := opts
 				retryOpts.Temporary = false
@@ -528,7 +551,7 @@ func (ac *AccountClient) streamGenerateLocked(
 				}
 				return retryRes, retryErr
 			}
-			polled, pollErr := ac.pollAsyncVideoGenerationLocked(ctx, sc, cookie, at, bl, fSid, lang, asyncVideoCID)
+			polled, pollErr := ac.pollAsyncVideoGenerationLocked(ctx, sc, cookie, at, bl, fSid, lang, asyncVideoCID, rid, firstRCID)
 			if pollErr != nil {
 				if opts.Temporary {
 					go ac.deleteConversationAsync(asyncVideoCID)
@@ -711,7 +734,7 @@ func findBalancedJSONArrayEnd(s string, start int) int {
 func (ac *AccountClient) pollAsyncVideoGenerationLocked(
 	ctx context.Context,
 	sc *transport.StealthClient,
-	cookie, at, bl, fSid, lang, cid string,
+	cookie, at, bl, fSid, lang, cid, rid, preferredRCID string,
 ) (*LineParseResult, error) {
 	pollCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
@@ -761,15 +784,28 @@ func (ac *AccountClient) pollAsyncVideoGenerationLocked(
 				continue
 			}
 			ac.absorbAndPersistCookies(res.SetCookies)
-			parsed, parseErr := ParseConversationPollResponse(res.Body)
+			parsed, parseErr := ParseConversationPollResponseForRID(res.Body, rid)
 			if parseErr != nil {
 				return nil, parseErr
 			}
 			if parsed != nil && len(parsed.Frames) > 0 {
-				f := parsed.Frames[0]
-				if len(f.GeneratedVideos) > 0 || (f.Done && strings.TrimSpace(f.Text) != "" && !strings.Contains(strings.ToLower(f.Text), "generating your video")) {
-					f.Done = true
-					parsed.Frames[0] = f
+				var chosen *Frame
+				for i := range parsed.Frames {
+					f := parsed.Frames[i]
+					if len(f.GeneratedVideos) == 0 && (!f.Done || isAsyncVideoPlaceholderText(f.Text)) {
+						continue
+					}
+					if chosen == nil || (preferredRCID != "" && f.RCID == preferredRCID) {
+						copyFrame := f
+						chosen = &copyFrame
+						if preferredRCID != "" && f.RCID == preferredRCID {
+							break
+						}
+					}
+				}
+				if chosen != nil {
+					chosen.Done = true
+					parsed.Frames = []Frame{*chosen}
 					return parsed, nil
 				}
 			}
