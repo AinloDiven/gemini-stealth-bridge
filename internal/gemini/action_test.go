@@ -238,3 +238,88 @@ func TestParseConversationPollResponseForRIDAndVideoHints(t *testing.T) {
 	}
 }
 
+func TestParseCandidateSliceStripsGeminiWebMediaComponentTagsCleanly(t *testing.T) {
+	// Real-world Gemini Web inline JSX image mount tag mixed with prose and <split/>.
+	cReal := []any{
+		"rc_img_tag",
+		[]any{"画好啦，看看效果～\n<split/>\n<Image alt=\"伊珂丝怪萌平面海报\" src=\"image_generation_content/13909508822012476050\"/>\n<split/>\n觉得怎么样？"},
+		nil, nil, nil, nil, nil, nil,
+		[]any{float64(2)},
+	}
+	fReal, ok := parseCandidateSlice(cReal, "id1", "4 Hydrogen Medium")
+	if !ok {
+		t.Fatal("expected parseCandidateSlice ok")
+	}
+	if strings.Contains(fReal.Text, "<Image") || strings.Contains(fReal.Text, "image_generation_content/") {
+		t.Fatalf("expected Gemini Web <Image> mount tag stripped, got %q", fReal.Text)
+	}
+	if !strings.Contains(fReal.Text, "画好啦，看看效果～") || !strings.Contains(fReal.Text, "觉得怎么样？") {
+		t.Fatalf("expected surrounding prose preserved, got %q", fReal.Text)
+	}
+
+	// Standalone placeholder between paragraphs must not leave triple blank lines,
+	// and paired/markdown/googleusercontent tag forms must all be stripped.
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{
+			in:   "<Image alt=\"伊珂丝怪萌平面海报\" src=\"image_generation_content/13909508822012476050\"/>",
+			want: "",
+		},
+		{
+			in:   "第一段\n\n<Image alt=\"海报\" src=\"image_generation_content/123456\"></Image>\n\n第二段",
+			want: "第一段\n\n第二段",
+		},
+		{
+			in:   "看看视频：\n<Video title=\"clip\" src=\"generated_video_content/98765\"/>\n还有吗？",
+			want: "看看视频：\n还有吗？",
+		},
+		{
+			in:   "![poster](https://googleusercontent.com/image_generation_content/0)\n正文开始",
+			want: "正文开始",
+		},
+		{
+			// Code blocks and normal external image tags must remain untouched.
+			in:   "示例：\n```tsx\n<Image alt=\"demo\" src=\"image_generation_content/123\"/>\n```\n普通标签：<Image alt=\"hero\" src=\"https://example.com/hero.png\"/>",
+			want: "示例：\n```tsx\n<Image alt=\"demo\" src=\"image_generation_content/123\"/>\n```\n普通标签：<Image alt=\"hero\" src=\"https://example.com/hero.png\"/>",
+		},
+	}
+	for _, tc := range cases {
+		c := []any{"rc_case", []any{tc.in}, nil, nil, nil, nil, nil, nil, []any{float64(2)}}
+		f, ok := parseCandidateSlice(c, "id1", "Flash")
+		if !ok {
+			t.Fatalf("expected parseCandidateSlice ok for %q", tc.in)
+		}
+		if f.Text != tc.want {
+			t.Fatalf("parseCandidateSlice(%q) = %q, want %q", tc.in, f.Text, tc.want)
+		}
+	}
+
+	// Streaming prefixes across a split <Image .../> tag and markdown embed must be monotonic
+	// and never emit partial <Image markup.
+	streams := []string{
+		"画好啦，看看效果～\n\n<Image alt=\"伊珂丝怪萌平面海报\" src=\"image_generation_content/13909508822012476050\"/>\n\n觉得怎么样？",
+		"看看这个 ![poster](image_generation_content/12345) 效果不错",
+	}
+	for _, full := range streams {
+		prev := ""
+		for k := 1; k <= len(full); k++ {
+			if k < len(full) && (full[k]&0xc0) == 0x80 {
+				continue
+			}
+			cur := cleanGeminiMediaPlaceholders(full[:k], false)
+			if strings.Contains(cur, "<Image") || strings.Contains(cur, "image_generation_content") {
+				t.Fatalf("streaming prefix %d leaked mount placeholder: %q", k, cur)
+			}
+			if !strings.HasPrefix(cur, prev) {
+				t.Fatalf("non-monotonic streaming cleanup at %d on %q: prev=%q cur=%q", k, full, prev, cur)
+			}
+			prev = cur
+		}
+		final := cleanGeminiMediaPlaceholders(full, true)
+		if !strings.HasPrefix(final, prev) {
+			t.Fatalf("final cleanup broke monotonicity on %q: prev=%q final=%q", full, prev, final)
+		}
+	}
+}

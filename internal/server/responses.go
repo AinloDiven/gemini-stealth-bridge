@@ -1009,7 +1009,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 						}
 						canStreamText := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
 						if canStreamText {
-							if !hasTools && len(text) > 240 && gemini.GeminiErrorReply(text) == "" {
+							if !hasTools && !mediaToolUsed && len(text) > 240 && gemini.GeminiErrorReply(text) == "" {
 								if tail, ok := remainingStreamTail(text, sentText); ok && tail != "" {
 									emitTextDelta(tail)
 									sentText = text

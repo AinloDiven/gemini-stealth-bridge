@@ -151,16 +151,15 @@ var (
 			`i\s+(?:can't|cannot)\s+help[^\n]*because\s+(?:i'm|i\s+am)\s+(?:only|just|a)\s+(?:a\s+)?language\s+model` +
 			`)[.!]?$`,
 	)
-	hex16Re                       = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
-	googleUserContentRe           = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
-	imageSizeSuffixRe             = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
-	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)[ \t]*\r?\n*https?://googleusercontent\.com/(?:image_generation_content|generated_video_content|youtube_content|map_content)/\S*`)
-	closedThinkBlockRe            = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
-	codeEventBlockRe              = regexp.MustCompile("(?is)```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+\\s*([\\s\\S]*?)```\\s*")
-	openThinkStartRe              = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
-	openThinkTagOnlyRe            = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b[^\\n]*|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)\\s*")
-	trailingOpenThinkRe           = regexp.MustCompile("(?is)(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b[^\\n]*|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)([\\s\\S]*)$")
-	thinkingProcessHeaderRe       = regexp.MustCompile(
+	hex16Re                 = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
+	googleUserContentRe     = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
+	imageSizeSuffixRe       = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
+	closedThinkBlockRe      = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
+	codeEventBlockRe        = regexp.MustCompile("(?is)```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+\\s*([\\s\\S]*?)```\\s*")
+	openThinkStartRe        = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
+	openThinkTagOnlyRe      = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b[^\\n]*|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)\\s*")
+	trailingOpenThinkRe     = regexp.MustCompile("(?is)(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b[^\\n]*|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)([\\s\\S]*)$")
+	thinkingProcessHeaderRe = regexp.MustCompile(
 		"(?is)^\\s*(?:#{1,6}\\s*)?(?:(?:💭|🧠)\\s*)?(?:\\*\\*|__)?" +
 			"(?:thinking\\s+process|thought\\s+process|internal\\s+reasoning|thought|" +
 			"思考过程|思考過程|思维链|思維鏈|推理过程|推理過程|内部推理|內部推理|思考|" +
@@ -945,9 +944,6 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 			text, _ = tArr[0].(string)
 		}
 	}
-	if googleGenContentPlaceholderRe.MatchString(text) {
-		text = strings.TrimSpace(googleGenContentPlaceholderRe.ReplaceAllString(text, ""))
-	}
 
 	var thoughts string
 	if tf, ok := jspbField(c, 37).([]any); ok && len(tf) > 0 {
@@ -965,6 +961,7 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 		}
 	}
 
+	text = cleanGeminiMediaPlaceholders(text, done)
 	if !done {
 		text = trimIncompleteTrailingURL(text)
 	}
@@ -1155,6 +1152,575 @@ func trailingPartialHTTPURL(lower string) int {
 		return len(lower)
 	}
 	return -1
+}
+
+var geminiMediaNamespaces = []string{
+	"image_generation_content/",
+	"generated_video_content/",
+	"youtube_content/",
+	"map_content/",
+}
+
+func isGeminiMediaPlaceholderRef(ref string) bool {
+	s := strings.ToLower(strings.TrimSpace(ref))
+	switch {
+	case strings.HasPrefix(s, "https://"):
+		s = strings.TrimPrefix(s, "https://")
+	case strings.HasPrefix(s, "http://"):
+		s = strings.TrimPrefix(s, "http://")
+	case strings.HasPrefix(s, "//"):
+		s = strings.TrimPrefix(s, "//")
+	default:
+		return hasGeminiMediaNamespace(s)
+	}
+	if !strings.HasPrefix(s, "googleusercontent.com/") {
+		return false
+	}
+	return hasGeminiMediaNamespace(strings.TrimPrefix(s, "googleusercontent.com/"))
+}
+
+func hasGeminiMediaNamespace(s string) bool {
+	for _, ns := range geminiMediaNamespaces {
+		if strings.HasPrefix(s, ns) {
+			return true
+		}
+	}
+	return false
+}
+
+func isGeminiMediaPlaceholderRefPrefix(ref string) bool {
+	s := strings.ToLower(strings.TrimSpace(ref))
+	if s == "" {
+		return false
+	}
+	if isGeminiMediaPlaceholderRef(s) {
+		return true
+	}
+	for _, full := range []string{
+		"image_generation_content/",
+		"generated_video_content/",
+		"youtube_content/",
+		"map_content/",
+		"http://googleusercontent.com/",
+		"https://googleusercontent.com/",
+	} {
+		if strings.HasPrefix(full, s) {
+			return true
+		}
+	}
+	for _, host := range []string{"http://googleusercontent.com/", "https://googleusercontent.com/"} {
+		if strings.HasPrefix(s, host) {
+			rest := strings.TrimPrefix(s, host)
+			for _, ns := range geminiMediaNamespaces {
+				if strings.HasPrefix(ns, rest) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// cleanGeminiMediaPlaceholders strips Gemini Web's internal media-mount
+// artifacts (both bare googleusercontent.com/* placeholders and JSX/HTML tags
+// such as <Image ... src="image_generation_content/..."/> or markdown embeds)
+// outside code spans, while holding back partial mount openers during streaming.
+func cleanGeminiMediaPlaceholders(text string, done bool) string {
+	if text == "" {
+		return text
+	}
+	var buf []byte
+	changed := false
+	for i := 0; i < len(text); {
+		if i == 0 || text[i-1] == '\n' {
+			if end, ok := skipMarkdownCodeFence(text, i); ok {
+				buf = append(buf, text[i:end]...)
+				i = end
+				continue
+			}
+		}
+		if text[i] == '`' {
+			if end, ok := skipInlineCodeSpan(text, i); ok {
+				buf = append(buf, text[i:end]...)
+				i = end
+				continue
+			}
+			run := 1
+			for i+run < len(text) && text[i+run] == '`' {
+				run++
+			}
+			buf = append(buf, text[i:i+run]...)
+			i += run
+			continue
+		}
+		if text[i] == '<' {
+			end, strip, holdBack := parseGeminiMediaTag(text, i, done)
+			if holdBack {
+				break
+			}
+			if strip {
+				i = consumeRemovedPlaceholder(&buf, text, end, done)
+				changed = true
+				continue
+			}
+		}
+		if text[i] == '!' {
+			end, strip, holdBack := parseMarkdownMediaEmbed(text, i, done)
+			if holdBack {
+				break
+			}
+			if strip {
+				i = consumeRemovedPlaceholder(&buf, text, end, done)
+				changed = true
+				continue
+			}
+		}
+		if end, ok := parseBareGeminiMediaURL(text, i); ok {
+			i = consumeRemovedPlaceholder(&buf, text, end, done)
+			changed = true
+			continue
+		}
+		buf = append(buf, text[i])
+		i++
+	}
+	out := string(buf)
+	if changed && done {
+		return strings.TrimSpace(out)
+	}
+	return out
+}
+
+func skipMarkdownCodeFence(s string, lineStart int) (int, bool) {
+	pos := lineStart
+	for spaces := 0; spaces < 3 && pos < len(s) && s[pos] == ' '; spaces++ {
+		pos++
+	}
+	if pos >= len(s) || (s[pos] != '`' && s[pos] != '~') {
+		return 0, false
+	}
+	fenceChar := s[pos]
+	fenceLen := 0
+	for pos+fenceLen < len(s) && s[pos+fenceLen] == fenceChar {
+		fenceLen++
+	}
+	if fenceLen < 3 {
+		return 0, false
+	}
+	if fenceChar == '`' && strings.IndexByte(lineRest(s, pos+fenceLen), '`') >= 0 {
+		return 0, false
+	}
+	cur := advancePastLine(s, pos+fenceLen)
+	for cur < len(s) {
+		c := cur
+		for spaces := 0; spaces < 3 && c < len(s) && s[c] == ' '; spaces++ {
+			c++
+		}
+		closeLen := 0
+		for c+closeLen < len(s) && s[c+closeLen] == fenceChar {
+			closeLen++
+		}
+		if closeLen >= fenceLen {
+			tail := lineRest(s, c+closeLen)
+			if strings.Trim(tail, " \t\r") == "" {
+				return advancePastLine(s, c+closeLen), true
+			}
+		}
+		cur = advancePastLine(s, cur)
+	}
+	return len(s), true
+}
+
+func skipInlineCodeSpan(s string, start int) (int, bool) {
+	ticks := 0
+	for start+ticks < len(s) && s[start+ticks] == '`' {
+		ticks++
+	}
+	if ticks == 0 {
+		return 0, false
+	}
+	for i := start + ticks; i < len(s); i++ {
+		if s[i] == '\n' && (i+1 < len(s) && (s[i+1] == '\n' || (s[i+1] == '\r' && i+2 < len(s) && s[i+2] == '\n'))) {
+			return 0, false
+		}
+		if s[i] == '`' {
+			closeTicks := 0
+			for i+closeTicks < len(s) && s[i+closeTicks] == '`' {
+				closeTicks++
+			}
+			if closeTicks == ticks {
+				return i + closeTicks, true
+			}
+			i += closeTicks - 1
+		}
+	}
+	return 0, false
+}
+
+func lineRest(s string, pos int) string {
+	if nl := strings.IndexByte(s[pos:], '\n'); nl >= 0 {
+		return s[pos : pos+nl]
+	}
+	return s[pos:]
+}
+
+func advancePastLine(s string, pos int) int {
+	if nl := strings.IndexByte(s[pos:], '\n'); nl >= 0 {
+		return pos + nl + 1
+	}
+	return len(s)
+}
+
+func isASCIILetter(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+func isTagNameByte(b byte) bool {
+	return isASCIILetter(b) || (b >= '0' && b <= '9') || b == '_' || b == '-'
+}
+
+func isMediaTagPrefix(tagName string) bool {
+	lower := strings.ToLower(tagName)
+	for _, candidate := range []string{"image", "video", "img"} {
+		if strings.HasPrefix(candidate, lower) || lower == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func parseGeminiMediaTag(s string, start int, done bool) (end int, strip bool, holdBack bool) {
+	if start >= len(s) || s[start] != '<' {
+		return 0, false, false
+	}
+	if start+1 == len(s) {
+		if !done {
+			return 0, false, true
+		}
+		return 0, false, false
+	}
+	if !isASCIILetter(s[start+1]) {
+		return 0, false, false
+	}
+	nameEnd := start + 2
+	for nameEnd < len(s) && isTagNameByte(s[nameEnd]) {
+		nameEnd++
+	}
+	tagName := s[start+1 : nameEnd]
+	if nameEnd == len(s) {
+		if !done && isMediaTagPrefix(tagName) {
+			return 0, false, true
+		}
+		return 0, false, false
+	}
+	next := s[nameEnd]
+	if next != ' ' && next != '\t' && next != '\r' && next != '\n' && next != '/' && next != '>' {
+		return 0, false, false
+	}
+
+	var quote byte
+	gt := -1
+	for i := nameEnd; i < len(s); i++ {
+		ch := s[i]
+		if quote != 0 {
+			if ch == '\\' && i+1 < len(s) {
+				i++
+				continue
+			}
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '"' || ch == '\'' {
+			quote = ch
+			continue
+		}
+		if ch == '\n' && i+1 < len(s) && (s[i+1] == '\n' || (s[i+1] == '\r' && i+2 < len(s) && s[i+2] == '\n')) {
+			return 0, false, false
+		}
+		if ch == '>' {
+			gt = i
+			break
+		}
+	}
+	if gt < 0 {
+		if !done && (isMediaTagPrefix(tagName) || partialTagMentionsGeminiMedia(s[nameEnd:])) {
+			return 0, false, true
+		}
+		return 0, false, false
+	}
+
+	if !tagAttrsMatchGeminiMedia(s[nameEnd:gt]) {
+		return 0, false, false
+	}
+	end = gt + 1
+	selfClosing := gt > nameEnd && s[gt-1] == '/'
+	if !selfClosing {
+		wsEnd := end
+		for wsEnd < len(s) && (s[wsEnd] == ' ' || s[wsEnd] == '\t' || s[wsEnd] == '\r' || s[wsEnd] == '\n') {
+			wsEnd++
+		}
+		closePrefix := "</" + tagName
+		if len(s)-wsEnd >= len(closePrefix)+1 && strings.EqualFold(s[wsEnd:wsEnd+len(closePrefix)], closePrefix) {
+			k := wsEnd + len(closePrefix)
+			for k < len(s) && (s[k] == ' ' || s[k] == '\t') {
+				k++
+			}
+			if k < len(s) && s[k] == '>' {
+				end = k + 1
+			}
+		} else if !done && wsEnd == len(s) {
+			return 0, false, true
+		} else if !done && strings.HasPrefix(strings.ToLower(closePrefix+">"), strings.ToLower(s[wsEnd:])) {
+			return 0, false, true
+		}
+	}
+	return end, true, false
+}
+
+func partialTagMentionsGeminiMedia(body string) bool {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "googleusercontent.com") {
+		return true
+	}
+	for _, ns := range geminiMediaNamespaces {
+		if strings.Contains(lower, ns) {
+			return true
+		}
+	}
+	return false
+}
+
+func tagAttrsMatchGeminiMedia(attrs string) bool {
+	for i := 0; i < len(attrs); {
+		for i < len(attrs) && (attrs[i] == ' ' || attrs[i] == '\t' || attrs[i] == '\r' || attrs[i] == '\n' || attrs[i] == '/') {
+			i++
+		}
+		nameStart := i
+		for i < len(attrs) && (isTagNameByte(attrs[i]) || attrs[i] == ':') {
+			i++
+		}
+		if i == nameStart {
+			if i < len(attrs) {
+				i++
+			}
+			continue
+		}
+		attrName := strings.ToLower(attrs[nameStart:i])
+		for i < len(attrs) && (attrs[i] == ' ' || attrs[i] == '\t' || attrs[i] == '\r' || attrs[i] == '\n') {
+			i++
+		}
+		if i >= len(attrs) || attrs[i] != '=' {
+			continue
+		}
+		i++
+		for i < len(attrs) && (attrs[i] == ' ' || attrs[i] == '\t' || attrs[i] == '\r' || attrs[i] == '\n') {
+			i++
+		}
+		var val string
+		if i < len(attrs) && (attrs[i] == '"' || attrs[i] == '\'') {
+			q := attrs[i]
+			i++
+			valStart := i
+			for i < len(attrs) && attrs[i] != q {
+				if attrs[i] == '\\' && i+1 < len(attrs) {
+					i += 2
+					continue
+				}
+				i++
+			}
+			val = attrs[valStart:i]
+			if i < len(attrs) && attrs[i] == q {
+				i++
+			}
+		} else {
+			valStart := i
+			for i < len(attrs) && attrs[i] != ' ' && attrs[i] != '\t' && attrs[i] != '\r' && attrs[i] != '\n' && attrs[i] != '/' {
+				i++
+			}
+			val = attrs[valStart:i]
+		}
+		if (attrName == "src" || attrName == "href" || attrName == "data-src") && isGeminiMediaPlaceholderRef(val) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseMarkdownMediaEmbed(s string, start int, done bool) (end int, strip bool, holdBack bool) {
+	if start >= len(s) || s[start] != '!' {
+		return 0, false, false
+	}
+	if start+1 == len(s) {
+		return 0, false, !done
+	}
+	if s[start+1] != '[' {
+		return 0, false, false
+	}
+	closeBracket := -1
+	for i := start + 2; i < len(s); i++ {
+		if s[i] == '\n' {
+			return 0, false, false
+		}
+		if s[i] == '\\' {
+			if i+1 >= len(s) {
+				return 0, false, !done
+			}
+			i++
+			continue
+		}
+		if s[i] == ']' {
+			closeBracket = i
+			break
+		}
+	}
+	if closeBracket < 0 {
+		return 0, false, !done
+	}
+	if closeBracket+1 == len(s) {
+		return 0, false, !done
+	}
+	if s[closeBracket+1] != '(' {
+		return 0, false, false
+	}
+	urlStart := closeBracket + 2
+	if urlStart == len(s) {
+		return 0, false, !done
+	}
+	for i := urlStart; i < len(s); i++ {
+		ch := s[i]
+		if ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' {
+			return 0, false, false
+		}
+		if ch == ')' {
+			if isGeminiMediaPlaceholderRef(s[urlStart:i]) {
+				return i + 1, true, false
+			}
+			return 0, false, false
+		}
+	}
+	if !done && isGeminiMediaPlaceholderRefPrefix(s[urlStart:]) {
+		return 0, false, true
+	}
+	return 0, false, false
+}
+
+func parseBareGeminiMediaURL(s string, start int) (int, bool) {
+	if start > 0 {
+		prev := s[start-1]
+		if prev != ' ' && prev != '\t' && prev != '\n' && prev != '\r' {
+			return 0, false
+		}
+	}
+	if !strings.HasPrefix(strings.ToLower(s[start:]), "http://googleusercontent.com/") &&
+		!strings.HasPrefix(strings.ToLower(s[start:]), "https://googleusercontent.com/") {
+		return 0, false
+	}
+	end := start
+	for end < len(s) && s[end] != ' ' && s[end] != '\t' && s[end] != '\r' && s[end] != '\n' {
+		end++
+	}
+	if !isGeminiMediaPlaceholderRef(s[start:end]) {
+		return 0, false
+	}
+	return end, true
+}
+
+func consumeRemovedPlaceholder(buf *[]byte, text string, end int, done bool) int {
+	b := *buf
+	lastNL := bytesLastIndexByte(b, '\n')
+	linePrefixStart := lastNL + 1
+	onlySpacesBefore := allHorizSpaces(b[linePrefixStart:])
+
+	afterSpaces := end
+	for afterSpaces < len(text) && (text[afterSpaces] == ' ' || text[afterSpaces] == '\t') {
+		afterSpaces++
+	}
+	lineEndAfter := afterSpaces == len(text) ||
+		text[afterSpaces] == '\n' ||
+		(text[afterSpaces] == '\r' && afterSpaces+1 < len(text) && text[afterSpaces+1] == '\n')
+
+	if onlySpacesBefore && lineEndAfter {
+		b = b[:linePrefixStart]
+		end = afterSpaces
+		if len(b) == 0 {
+			for end < len(text) && (text[end] == '\r' || text[end] == '\n') {
+				end++
+			}
+		} else if end == len(text) {
+			if done {
+				for len(b) > 0 && (b[len(b)-1] == ' ' || b[len(b)-1] == '\t' || b[len(b)-1] == '\r' || b[len(b)-1] == '\n') {
+					b = b[:len(b)-1]
+				}
+			}
+		} else {
+			if text[end] == '\r' {
+				end++
+			}
+			if end < len(text) && text[end] == '\n' {
+				end++
+			}
+			if endsWithBlankLine(b) {
+				for end < len(text) {
+					k := end
+					for k < len(text) && (text[k] == ' ' || text[k] == '\t') {
+						k++
+					}
+					if k == len(text) {
+						break
+					}
+					if text[k] == '\r' && k+1 < len(text) && text[k+1] == '\n' {
+						end = k + 2
+						continue
+					}
+					if text[k] == '\n' {
+						end = k + 1
+						continue
+					}
+					break
+				}
+			}
+		}
+		*buf = b
+		return end
+	}
+
+	if len(b) > 0 && (b[len(b)-1] == ' ' || b[len(b)-1] == '\t') {
+		for end < len(text) && (text[end] == ' ' || text[end] == '\t') {
+			end++
+		}
+	}
+	*buf = b
+	return end
+}
+
+func bytesLastIndexByte(b []byte, c byte) int {
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+func allHorizSpaces(b []byte) bool {
+	for _, ch := range b {
+		if ch != ' ' && ch != '\t' && ch != '\r' {
+			return false
+		}
+	}
+	return true
+}
+
+func endsWithBlankLine(b []byte) bool {
+	n := len(b)
+	if n >= 2 && b[n-1] == '\n' && b[n-2] == '\n' {
+		return true
+	}
+	if n >= 4 && b[n-1] == '\n' && b[n-2] == '\r' && b[n-3] == '\n' && b[n-4] == '\r' {
+		return true
+	}
+	return false
 }
 
 func actionArray(frame []any, slot, field int) []any {

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -311,4 +312,136 @@ func TestStreamingMediaInIntermediateFrameDoesNotTriggerUpstreamRevision(t *test
 	if !strings.Contains(bodyStr, "后半句") || !strings.Contains(bodyStr, "/v1/media/") {
 		t.Fatalf("expected streamed body to include continuation text and proxied /v1/media/ link, got:\n%s", bodyStr)
 	}
+}
+
+func TestStreamingImageGenerationHoldsIntermediateProseAndNeverLeaksComponentTag(t *testing.T) {
+	rawLongProse := "这是为你准备的超长前置说明文字，用来超过二百四十字节的流式阈值限制，" +
+		"如果服务端在图片生成完成之前就把中间帧内容推出去，就会提前触发客户端状态机切换并且可能暴露内部标签。\n\n" +
+		`<Image alt="伊珂丝怪萌平面海报" src="image_generation_content/13909508822012476050"/>` +
+		"\n\n海报做好啦，来看看吧！"
+
+	for _, tc := range []struct {
+		name        string
+		eagerStream bool
+		wantSingle  bool
+	}{
+		{name: "buffered_holds_until_done", eagerStream: false, wantSingle: true},
+		{name: "eager_strips_without_revision", eagerStream: true, wantSingle: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, acct := newTestHarness(tc.eagerStream, true)
+			up := &mockUpstream{
+				streamFn: func(ctx context.Context, promptText string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+					if err := onFrame(&gemini.LineParseResult{
+						CID:             "c_img2",
+						RID:             "r_img2",
+						MediaToolActive: true,
+						Action:          &gemini.ActionStatus{ToolID: "image_generation", BranchTitle: "正在创建您的图片"},
+					}); err != nil {
+						return nil, err
+					}
+					// Simulate Gemini streaming a candidate frame (>240 bytes) mid-generation while done=false
+					candStreaming := []any{
+						"rc_img2",
+						[]any{rawLongProse[:len(rawLongProse)-len("来看看吧！")]},
+						nil, nil, nil, nil, nil, nil,
+						[]any{float64(1)},
+					}
+					streamParsed, err := gemini.ParseFrameLine(mustMarshalWrbFrame(t, "c_img2", "r_img2", candStreaming))
+					if err != nil {
+						return nil, err
+					}
+					if err := onFrame(streamParsed); err != nil {
+						return nil, err
+					}
+					// Final done=true frame carries the real c[12] image attachment.
+					candDone := []any{
+						"rc_img2",
+						[]any{rawLongProse},
+						nil, nil, nil, nil, nil, nil,
+						[]any{float64(2)},
+						nil, nil, nil,
+						[]any{
+							nil, nil, nil, nil, nil, nil, nil,
+							[]any{
+								[]any{
+									[]any{
+										[]any{nil, nil, nil, []any{nil, float64(1024), float64(1024), "https://lh3.googleusercontent.com/gg-dl/poster=s512"}},
+										nil, nil,
+										[]any{nil, nil, nil, nil, nil, []any{"海报"}, "伊珂丝怪萌平面海报"},
+									},
+								},
+							},
+						},
+					}
+					doneParsed, err := gemini.ParseFrameLine(mustMarshalWrbFrame(t, "c_img2", "r_img2", candDone))
+					if err != nil {
+						return nil, err
+					}
+					if err := onFrame(doneParsed); err != nil {
+						return nil, err
+					}
+					return &gemini.StreamResponse{Status: 200, CID: "c_img2", RID: "r_img2"}, nil
+				},
+			}
+
+			rec := runChat(t, srv, acct, up, map[string]any{"stream": true})
+			if rec.Code != 200 {
+				t.Fatalf("expected HTTP 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			bodyStr := rec.Body.String()
+			for _, forbidden := range []string{"<Image", "image_generation_content/", "upstream_revision"} {
+				if strings.Contains(bodyStr, forbidden) {
+					t.Fatalf("SSE stream must not contain %q, got:\n%s", forbidden, bodyStr)
+				}
+			}
+			var combined strings.Builder
+			for _, line := range strings.Split(bodyStr, "\n") {
+				if !strings.HasPrefix(line, "data: {") {
+					continue
+				}
+				var chunk struct {
+					Choices []struct {
+						Delta struct {
+							Content string `json:"content"`
+						} `json:"delta"`
+					} `json:"choices"`
+				}
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err == nil && len(chunk.Choices) > 0 {
+					combined.WriteString(chunk.Choices[0].Delta.Content)
+				}
+			}
+			fullText := combined.String()
+			if !strings.Contains(fullText, "海报做好啦，来看看吧！") || !strings.Contains(fullText, "/v1/media/") {
+				t.Fatalf("expected clean concatenated prose and proxied /v1/media/ link, got fullText=%q\nraw:\n%s", fullText, bodyStr)
+			}
+			if tc.wantSingle {
+				// In buffered mode, intermediate >240B prose is held while mediaToolUsed is active,
+				// so prose and /v1/media/ arrive together only on completion (one content delta).
+				contentCount := strings.Count(bodyStr, `"content":"这是为你准备的`)
+				mediaCount := strings.Count(bodyStr, "/v1/media/")
+				if contentCount != 1 || mediaCount == 0 {
+					t.Fatalf("expected single finalized content chunk in buffered media mode, contentCount=%d mediaCount=%d\n%s", contentCount, mediaCount, bodyStr)
+				}
+				proseIdx := strings.Index(bodyStr, "这是为你准备的")
+				if firstMediaIdx := strings.Index(bodyStr, "/v1/media/"); firstMediaIdx < proseIdx {
+					t.Fatalf("unexpected media ordering: %s", bodyStr)
+				}
+			}
+		})
+	}
+}
+
+func mustMarshalWrbFrame(t *testing.T, cid, rid string, cand []any) string {
+	t.Helper()
+	pj := []any{nil, []any{cid, rid}, nil, nil, []any{cand}}
+	inner, err := json.Marshal(pj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, err := json.Marshal([]any{[]any{"wrb.fr", nil, string(inner)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(outer)
 }

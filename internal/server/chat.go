@@ -760,7 +760,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 						}
 						canStreamText := identityVerified
 						if canStreamText {
-							if !hasTools && len(text) > 240 && gemini.GeminiErrorReply(text) == "" {
+							if !hasTools && !mediaToolUsed && len(text) > 240 && gemini.GeminiErrorReply(text) == "" {
 								if tail, ok := remainingStreamTail(text, sentText); ok && tail != "" {
 									startStream(false)
 									emit(sseDeltaContent{Content: tail}, nil, nil)
