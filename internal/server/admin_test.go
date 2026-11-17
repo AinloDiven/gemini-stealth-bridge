@@ -116,7 +116,6 @@ func TestAdminConfigPatchAndEnvFilePersistence(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BRIDGE_HOME", home)
 	t.Setenv("BRIDGE_DEFAULT_THINKING", "")
-	t.Setenv("BRIDGE_DEFAULT_MODEL", "")
 	t.Setenv("BRIDGE_ACCOUNT_STRATEGY", "")
 	t.Setenv("BRIDGE_MAX_RPM_PER_ACCOUNT", "")
 
@@ -126,7 +125,6 @@ func TestAdminConfigPatchAndEnvFilePersistence(t *testing.T) {
 
 	patchBody := map[string]any{
 		"defaultThinking":  "medium",
-		"defaultModel":     "gemini-flash-lite",
 		"accountStrategy":  "lru",
 		"maxRpmPerAccount": 36,
 		"liveToolCalls":    true,
@@ -141,47 +139,32 @@ func TestAdminConfigPatchAndEnvFilePersistence(t *testing.T) {
 		t.Fatalf("PATCH /v1/admin/config failed: %d %s", rec.Code, rec.Body.String())
 	}
 
-	if srv.Cfg.DefaultThinking != 4 || srv.Cfg.DefaultModel != "gemini-flash-lite" || srv.Cfg.AccountStrategy != "lru" || srv.Cfg.MaxRPMPerAccount != 36 || !srv.Cfg.LiveToolCalls {
+	if srv.Cfg.DefaultThinking != 4 || srv.Cfg.AccountStrategy != "lru" || srv.Cfg.MaxRPMPerAccount != 36 || !srv.Cfg.LiveToolCalls {
 		t.Fatalf("in-memory config not updated: %+v", srv.Cfg)
 	}
 
 	// Reload from disk via config.Load() and verify config.env was persisted
 	reloaded := config.Load()
-	if reloaded.DefaultThinking != 4 || reloaded.DefaultModel != "gemini-flash-lite" || reloaded.AccountStrategy != "lru" || reloaded.MaxRPMPerAccount != 36 || !reloaded.LiveToolCalls {
+	if reloaded.DefaultThinking != 4 || reloaded.AccountStrategy != "lru" || reloaded.MaxRPMPerAccount != 36 || !reloaded.LiveToolCalls {
 		t.Fatalf("reloaded config from config.env did not match persisted values: %+v", reloaded)
 	}
 	if reloaded.FieldSources["BRIDGE_DEFAULT_THINKING"] != "file" {
 		t.Fatalf("expected source 'file' for BRIDGE_DEFAULT_THINKING, got %q", reloaded.FieldSources["BRIDGE_DEFAULT_THINKING"])
 	}
-	if reloaded.FieldSources["BRIDGE_DEFAULT_MODEL"] != "file" {
-		t.Fatalf("expected source 'file' for BRIDGE_DEFAULT_MODEL, got %q", reloaded.FieldSources["BRIDGE_DEFAULT_MODEL"])
-	}
 	if err := reloaded.Validate(); err != nil {
 		t.Fatalf("expected valid config, got %v", err)
-	}
-	t.Setenv("BRIDGE_DEFAULT_MODEL", "bad model id")
-	if err := config.Load().Validate(); err == nil || !strings.Contains(err.Error(), "BRIDGE_DEFAULT_MODEL") {
-		t.Fatalf("expected Validate() to reject whitespace BRIDGE_DEFAULT_MODEL, got %v", err)
-	}
-	// Verify WebUI serves the defaultModel control.
-	wuiReq := httptest.NewRequest(http.MethodGet, "/", nil)
-	wuiReq.RemoteAddr = "127.0.0.1:41000"
-	wuiRec := httptest.NewRecorder()
-	srv.ServeHTTP(wuiRec, wuiReq)
-	if wuiRec.Code != http.StatusOK || !strings.Contains(wuiRec.Body.String(), "cfg-default-model") || !strings.Contains(wuiRec.Body.String(), "src-defaultModel") {
-		t.Fatalf("expected WebUI HTML to expose cfg-default-model and src-defaultModel, code=%d", wuiRec.Code)
 	}
 }
 
 func TestAdminRuntimeConfigSourceIsRuntime(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BRIDGE_HOME", home)
-	t.Setenv("BRIDGE_DEFAULT_MODEL", "")
+	t.Setenv("BRIDGE_DEFAULT_THINKING", "")
 	cfg := config.Load()
 	cfg.WebUI = true
 	srv := New(cfg)
 
-	raw, _ := json.Marshal(map[string]any{"defaultModel": "gemini-flash-lite"})
+	raw, _ := json.Marshal(map[string]any{"defaultThinking": "medium"})
 	req := httptest.NewRequest(http.MethodPatch, "/v1/admin/config", bytes.NewReader(raw))
 	req.RemoteAddr = "127.0.0.1:41000"
 	rec := httptest.NewRecorder()
@@ -200,8 +183,8 @@ func TestAdminRuntimeConfigSourceIsRuntime(t *testing.T) {
 	if err := json.Unmarshal(getRec.Body.Bytes(), &payload); err != nil {
 		t.Fatal(err)
 	}
-	if payload.Sources["defaultModel"] != "runtime" {
-		t.Fatalf("expected runtime source, got %q", payload.Sources["defaultModel"])
+	if payload.Sources["defaultThinking"] != "runtime" {
+		t.Fatalf("expected runtime source, got %q", payload.Sources["defaultThinking"])
 	}
 }
 

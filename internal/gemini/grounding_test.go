@@ -172,5 +172,18 @@ func TestParseFrameLineExtractsFileCitationsFromCandidate12(t *testing.T) {
 	if len(withIDs) != 4 || withIDs[0].ID != 1 || withIDs[1].ID != 2 || withIDs[2].ID != 9 || withIDs[3].ID != 14 {
 		t.Fatalf("unexpected assigned IDs: %+v", withIDs)
 	}
+
+	// Claimed ID 1 on a file attachment must cause web IDs to skip 1 instead of staying 0.
+	colliding := MergeGroundingSources(
+		[]GroundingSource{{ID: 1, Title: "inline.png", MimeType: "image/png"}},
+		[]GroundingSource{
+			{URL: "https://example.com/a", Title: "Web A"},
+			{URL: "https://example.com/b", Title: "Web B"},
+		},
+	)
+	collidingIDs := GroundingCitationsWithIDs(colliding)
+	if len(collidingIDs) != 3 || collidingIDs[0].ID != 1 || collidingIDs[1].ID != 2 || collidingIDs[2].ID != 3 {
+		t.Fatalf("expected claimed file ID 1 to push web IDs to 2 and 3, got %+v", collidingIDs)
+	}
 }
 

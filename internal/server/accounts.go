@@ -1670,11 +1670,6 @@ func (s *Server) prepareGeneration(
 	toolChoiceRaw any,
 ) (*preparedGeneration, error) {
 	rawModel, _ := body["model"].(string)
-	rawModel = strings.TrimSpace(rawModel)
-	modelFromDefault := rawModel == "" && strings.TrimSpace(s.Cfg.DefaultModel) != ""
-	if modelFromDefault {
-		rawModel = strings.TrimSpace(s.Cfg.DefaultModel)
-	}
 	requested, inlineThink := gemini.ParseModelRequest(rawModel)
 
 	// The scope decides which accounts this request may touch: an account key
@@ -1707,12 +1702,6 @@ func (s *Server) prepareGeneration(
 	}
 
 	account := s.resolveChatAccountPreferred(accts, scope, requested, hasher, preferredAccountID)
-	if account == nil && modelFromDefault {
-		if fallback := s.resolveChatAccountPreferred(accts, scope, "", hasher, preferredAccountID); fallback != nil {
-			log.Printf("configured default model %q is unavailable; using account default", s.Cfg.DefaultModel)
-			account, requested = fallback, ""
-		}
-	}
 	if account == nil {
 		for _, a := range accts {
 			a.mu.RLock()
@@ -1766,12 +1755,6 @@ func (s *Server) prepareGeneration(
 	}
 
 	model := resolveModelOnAccount(account, requested)
-	if model == nil && modelFromDefault {
-		if fallback := resolveModelOnAccount(account, ""); fallback != nil {
-			log.Printf("configured default model %q is unavailable on account %s; using account default", s.Cfg.DefaultModel, account.ID)
-			model, requested = fallback, ""
-		}
-	}
 	if model == nil {
 		reqLabel := requested
 		if reqLabel == "" {

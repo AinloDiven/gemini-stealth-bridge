@@ -201,10 +201,14 @@ func GroundingCitationsWithIDs(sources []GroundingSource) []GroundingSource {
 	webIdx := 0
 	for i := range out {
 		if out[i].URL != "" && out[i].ID == 0 {
-			webIdx++
-			if !claimed[webIdx] {
-				out[i].ID = webIdx
+			for {
+				webIdx++
+				if !claimed[webIdx] {
+					break
+				}
 			}
+			claimed[webIdx] = true
+			out[i].ID = webIdx
 		}
 	}
 	return out

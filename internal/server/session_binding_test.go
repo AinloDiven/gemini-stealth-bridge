@@ -244,30 +244,6 @@ func TestSessionHeaderValidationAndPersistenceAcrossRestart(t *testing.T) {
 	}
 }
 
-func TestDefaultModelSelectionAndFallback(t *testing.T) {
-	srv, acct := newTestHarness(false, false)
-	alt := testModel
-	alt.ModelName, alt.ModelID, alt.DisplayName, alt.ModelNumber = "gemini-flash-alt", "cccccccccccccccc", "Alt", 2
-	acct.Models = []gemini.ModelInfo{testModel, alt}
-
-	var got string
-	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
-		got = opts.Model.ModelName
-		_ = onFrame(&gemini.LineParseResult{CID: "c", RID: "r", AnsweredModelID: opts.Model.ModelID, Frames: []gemini.Frame{makeFrame("ok", "", true, opts.Model.ModelID)}})
-		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
-	}}
-	acct.Client = client
-
-	srv.Cfg.DefaultModel = alt.ModelName
-	if rec := runChat(t, srv, acct, client, map[string]any{"model": ""}); rec.Code != 200 || got != alt.ModelName {
-		t.Fatalf("expected configured default %q, got code=%d model=%q", alt.ModelName, rec.Code, got)
-	}
-
-	srv.Cfg.DefaultModel = "missing-model"
-	if rec := runChat(t, srv, acct, client, map[string]any{"model": ""}); rec.Code != 200 || got != testModel.ModelName {
-		t.Fatalf("expected fallback to %q, got code=%d model=%q", testModel.ModelName, rec.Code, got)
-	}
-}
 
 func TestPoolKeySessionBindingSurvivesPoolGrowthAndLeavesRotateCursorIntact(t *testing.T) {
 	srv, acct1 := newTestHarness(false, true)
