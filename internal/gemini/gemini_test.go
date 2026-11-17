@@ -678,6 +678,47 @@ func TestParseCandidateSliceExposesStructuredMediaWithoutMarkdown(t *testing.T) 
 	}
 }
 
+func TestParseCandidateSliceStripsGenericWidgetContentPlaceholders(t *testing.T) {
+	c := []any{
+		"rc_widget",
+		[]any{"Summary line\nhttps://googleusercontent.com/youtube_content/0\nhttp://googleusercontent.com/map_content/1\nKeep https://lh3.googleusercontent.com/avatar/a.png"},
+		nil, nil, nil, nil, nil, nil,
+		[]any{float64(2)},
+	}
+	f, ok := parseCandidateSlice(c, "id1", "Pro")
+	if !ok {
+		t.Fatal("expected parseCandidateSlice ok")
+	}
+	if strings.Contains(f.Text, "youtube_content") || strings.Contains(f.Text, "map_content") {
+		t.Fatalf("expected internal *_content placeholders stripped, got %q", f.Text)
+	}
+	if !strings.Contains(f.Text, "https://lh3.googleusercontent.com/avatar/a.png") {
+		t.Fatalf("expected real lh3.googleusercontent.com URL preserved, got %q", f.Text)
+	}
+
+	cStreaming := []any{
+		"rc_widget_stream",
+		[]any{"Summary line\nhttps://googleusercontent.com/youtube_"},
+		nil, nil, nil, nil, nil, nil,
+		[]any{float64(1)},
+	}
+	fStream, ok := parseCandidateSlice(cStreaming, "id1", "Pro")
+	if !ok || fStream.Text != "Summary line" {
+		t.Fatalf("expected incomplete trailing widget URL held during !done, got ok=%v text=%q", ok, fStream.Text)
+	}
+
+	cLH3 := []any{
+		"rc_lh3_stream",
+		[]any{"Avatar: https://lh3.googleusercontent.com/avatar/a.png"},
+		nil, nil, nil, nil, nil, nil,
+		[]any{float64(1)},
+	}
+	fLH3, ok := parseCandidateSlice(cLH3, "id1", "Pro")
+	if !ok || !strings.Contains(fLH3.Text, "https://lh3.googleusercontent.com/avatar/a.png") {
+		t.Fatalf("expected real lh3 URL preserved during !done, got ok=%v text=%q", ok, fLH3.Text)
+	}
+}
+
 func TestParseActionStatusAndAsyncVideoPoll(t *testing.T) {
 	marshalInner := func(inner any) string {
 		innerJSON, err := json.Marshal(inner)

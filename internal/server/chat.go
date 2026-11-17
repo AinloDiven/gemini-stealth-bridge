@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/prompt"
@@ -1575,6 +1576,100 @@ func (s *Server) evaluateAttemptCompletion(
 	return interpreted, nil
 }
 
+func snapUTF8Start(s string, i int) int {
+	if i <= 0 {
+		return 0
+	}
+	if i >= len(s) {
+		return len(s)
+	}
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return i
+}
+
+func nextAnchorEnd(s string, start, minBytes int) (int, bool) {
+	end := start
+	for end < len(s) && end-start < minBytes {
+		_, w := utf8.DecodeRuneInString(s[end:])
+		end += max(w, 1)
+	}
+	return end, end-start >= minBytes
+}
+
+func findSnapshotAnchor(sent string, si int, window string, minAnchor, maxSkip int) (nextS, offsetF int, ok bool) {
+	maxProbe := min(len(sent), si+maxSkip)
+	for probe := si; probe < maxProbe; {
+		anchorEnd, enough := nextAnchorEnd(sent, probe, minAnchor)
+		if !enough {
+			break
+		}
+		if idx := strings.Index(window, sent[probe:anchorEnd]); idx >= 0 {
+			return probe, idx, true
+		}
+		_, w := utf8.DecodeRuneInString(sent[probe:])
+		probe += max(w, 1)
+	}
+	return 0, 0, false
+}
+
+// resyncSnapshotTail aligns sent inside full when Gemini Web applies localized
+// in-place revisions across cumulative snapshots while preserving most of sent
+// in order; broad rewrites still fail closed as upstream_revision.
+func resyncSnapshotTail(full, sent string) (string, bool) {
+	if sent == "" || full == "" {
+		return "", false
+	}
+	const (
+		minAnchorBytes = 12
+		maxSentSkip    = 160
+		lookaheadBytes = 4096
+		minCoveragePct = 80
+		maxTailUnmatch = 20
+	)
+	limit := min(len(sent), len(full))
+	lcp := 0
+	for lcp < limit && sent[lcp] == full[lcp] {
+		lcp++
+	}
+	lcp = snapUTF8Start(sent, lcp)
+
+	si, fi := lcp, lcp
+	matched := lcp
+	lastS, lastF := lcp, lcp
+
+	for si < len(sent) && fi < len(full) {
+		if sent[si] == full[fi] {
+			startS := si
+			for si < len(sent) && fi < len(full) && sent[si] == full[fi] {
+				si++
+				fi++
+			}
+			delta := si - max(snapUTF8Start(sent, si), startS)
+			si -= delta
+			fi -= delta
+			if si > startS {
+				matched += si - startS
+				lastS, lastF = si, fi
+				continue
+			}
+		}
+		window := full[fi:min(len(full), fi+lookaheadBytes)]
+		nextS, offsetF, ok := findSnapshotAnchor(sent, si, window, minAnchorBytes, maxSentSkip)
+		if !ok {
+			break
+		}
+		si = nextS
+		fi += offsetF
+	}
+
+	if matched*100 < len(sent)*minCoveragePct || len(sent)-lastS > maxTailUnmatch {
+		return "", false
+	}
+	return full[lastF:], true
+}
+
 func remainingStreamTail(full, sent string) (string, bool) {
 	if sent == "" {
 		return full, true
@@ -1591,6 +1686,9 @@ func remainingStreamTail(full, sent string) (string, bool) {
 	sentTrimBoth := strings.TrimRight(sentTrimLeft, " \t\r\n")
 	if fullTrimBoth != "" && fullTrimBoth == sentTrimBoth {
 		return "", true
+	}
+	if tail, ok := resyncSnapshotTail(fullTrimLeft, sentTrimLeft); ok {
+		return tail, true
 	}
 	return "", false
 }

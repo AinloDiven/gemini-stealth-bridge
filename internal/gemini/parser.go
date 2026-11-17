@@ -154,7 +154,8 @@ var (
 	hex16Re                 = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
 	googleUserContentRe           = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
 	imageSizeSuffixRe             = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
-	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)https?://googleusercontent\.com/(?:image_generation_content|generated_video_content)/\S*`)
+	googleGenContentPlaceholderRe    = regexp.MustCompile(`(?i)https?://googleusercontent\.com/[a-z0-9_]+_content/\S*`)
+	trailingIncompleteGoogleGenRe  = regexp.MustCompile(`(?i)(?:^|[ \t\r\n])https?://googleusercontent(?:\.com(?:/\S*)?)?$`)
 	closedThinkBlockRe            = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
 	codeEventBlockRe        = regexp.MustCompile("(?is)```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+\\s*([\\s\\S]*?)```\\s*")
 	openThinkStartRe        = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
@@ -966,6 +967,11 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 			if f, ok := stArr[0].(float64); ok && int(f) == 2 {
 				done = true
 			}
+		}
+	}
+	if !done {
+		if loc := trailingIncompleteGoogleGenRe.FindStringIndex(text); len(loc) == 2 {
+			text = strings.TrimRight(text[:loc[0]], " \t\r\n")
 		}
 	}
 

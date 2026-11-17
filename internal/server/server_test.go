@@ -2629,3 +2629,58 @@ func TestStreamClosesReasoningBeforeMidStreamErrorAndFlushesMediaAction(t *testi
 	}
 }
 
+func TestBufferedStreamSnapshotResyncAndRevisionRejection(t *testing.T) {
+	padding := strings.Repeat("Streaming summary paragraph with enough length to exceed flush threshold. ", 4)
+
+	// 1. Localized inline refinement mid-stream + trailing continuation (Chat Completions)
+	srv, acct := newTestHarness(false, true)
+	draft := padding + "中文内容把示例标记 [00:16] 放在这里，随后说明细节。"
+	revised := padding + "中文内容把示例标记 [[00:16](https://example.com/watch?t=16)] 放在这里，随后说明细节。\n补充最终结论。"
+	rec := runChat(t, srv, acct, clientFromFrames([]gemini.Frame{
+		makeFrame(draft, "", false, testModel.ModelID),
+		makeFrame(revised, "", true, testModel.ModelID),
+	}), map[string]any{"stream": true})
+	body := rec.Body.String()
+	if strings.Contains(body, "upstream_revision") {
+		t.Fatalf("unexpected upstream_revision after localized snapshot edit:\n%s", body)
+	}
+	if !strings.Contains(body, "补充最终结论。") || !strings.Contains(body, "data: [DONE]") {
+		t.Fatalf("expected post-edit continuation and [DONE], got:\n%s", body)
+	}
+
+	// 2. Same localized edit path on /v1/responses + final authoritative output_text.done
+	acct.Client = clientFromFrames([]gemini.Frame{
+		makeFrame(draft, "", false, testModel.ModelID),
+		makeFrame(revised, "", true, testModel.ModelID),
+	})
+	respRec := httptest.NewRecorder()
+	srv.HandleResponses(context.Background(), respRec, map[string]any{
+		"model":  testModel.ModelName,
+		"stream": true,
+		"input":  "test",
+	}, AuthScope{OK: true, AccountID: acct.ID})
+	respBody := respRec.Body.String()
+	if strings.Contains(respBody, "upstream_revision") {
+		t.Fatalf("unexpected upstream_revision in responses stream:\n%s", respBody)
+	}
+	if !strings.Contains(respBody, "补充最终结论。") || !strings.Contains(respBody, "response.output_text.done") {
+		t.Fatalf("expected responses continuation and output_text.done, got:\n%s", respBody)
+	}
+
+	// 3. UTF-8 rune-boundary divergence must stay valid UTF-8 and handle tail trimming cleanly.
+	tail, ok := remainingStreamTail(padding+"结尾标点。", padding+"结尾标点 [00:30]")
+	if !ok || tail != "。" {
+		t.Fatalf("expected clean resync tail %q, got ok=%v tail=%q", "。", ok, tail)
+	}
+	utf8Tail, ok := remainingStreamTail(padding+"抱住不放\n后续", padding+"把")
+	if !ok || !strings.Contains(utf8Tail, "后续") || strings.ContainsRune(utf8Tail, '\uFFFD') {
+		t.Fatalf("expected valid UTF-8 resync after leading-byte collision, got ok=%v tail=%q", ok, utf8Tail)
+	}
+
+	// 4. Broad tail/body rewrite must still fail closed as upstream_revision.
+	if hasCompatibleStreamPrefix(padding+"Second conclusion completely replacing earlier claim and continuing.", padding+"First conclusion completely wrong, discard above and ignore.") {
+		t.Fatal("expected broad tail rewrite to be rejected as upstream_revision")
+	}
+}
+
+
