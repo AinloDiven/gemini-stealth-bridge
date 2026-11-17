@@ -2,6 +2,7 @@ package gemini
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/cookies"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
@@ -676,3 +677,68 @@ func TestParseCandidateSliceExposesStructuredMediaWithoutMarkdown(t *testing.T) 
 		t.Fatalf("decoder must expose media structurally, not append presentation markdown; got %q", f2.Text)
 	}
 }
+
+func TestParseActionStatusAndAsyncVideoPoll(t *testing.T) {
+	marshalInner := func(inner any) string {
+		innerJSON, err := json.Marshal(inner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env, err := json.Marshal([]any{[]any{"wrb.fr", nil, string(innerJSON)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(env)
+	}
+
+	// Thinking title + tool card with data_analysis_tool mode 20 -> image_generation.
+	rImg, err := ParseFrameLine(marshalInner([]any{
+		nil,
+		[]any{"c_img", "r_img"},
+		map[string]any{"7": []any{
+			"Working",
+			[]any{"data_analysis_tool", []any{nil, nil, "Tool", ""}, float64(1), []any{nil, []any{nil, nil, nil, nil, nil, nil, nil, []any{float64(20)}}, false}},
+			nil, nil, nil, []any{"Thinking"},
+		}},
+	}))
+	if err != nil || rImg.Action == nil || rImg.Action.ToolID != "image_generation" || !rImg.MediaToolActive || rImg.Action.ThinkingTitle != "Thinking" {
+		t.Fatalf("unexpected image_generation action parse: %+v err=%v", rImg, err)
+	}
+
+	// Mirror slot action card + orphan template suppression.
+	inner := make([]any, 12)
+	inner[1] = []any{"c_1", "r_1"}
+	inner[11] = []any{[]any{nil, nil, nil, nil, nil, []any{"Mirrored"}}}
+	rMir, err := ParseFrameLine(marshalInner(inner))
+	if err != nil || rMir.Action == nil || rMir.Action.ThinkingTitle != "Mirrored" {
+		t.Fatalf("expected mirrored title, got %+v err=%v", rMir, err)
+	}
+	rOrphan, err := ParseFrameLine(marshalInner([]any{
+		nil, []any{"c_1", "r_1"},
+		map[string]any{"7": []any{nil, nil, nil, nil, nil, []any{"{tool_logo_placeholder} {tool_name_placeholder}"}}},
+	}))
+	if err != nil || rOrphan.Action != nil {
+		t.Fatalf("expected orphan template dropped, got %+v err=%v", rOrphan, err)
+	}
+
+	// Pending async video helper + RID selection on multi-turn hNvQHb response.
+	if !PromptRequestsVideo("生成一段短视频") || !isPendingAsyncVideoFrame(Frame{Done: true, Text: "Working..."}, "Working", "") {
+		t.Fatal("expected video prompt and pending wire status detection")
+	}
+	if isPendingAsyncVideoFrame(Frame{Done: true, Text: "Cannot generate video", GeneratedVideos: []GeneratedVideo{{URL: "https://example.com/v.mp4"}}}, "Working", "") {
+		t.Fatal("did not expect completed video frame to stay pending")
+	}
+	makeCand := func(rcid, text string) []any {
+		return []any{rcid, []any{text}, nil, nil, nil, nil, nil, nil, []any{float64(2)}}
+	}
+	pollInner, _ := json.Marshal([]any{[]any{
+		[]any{[]any{"c_1", "r_old"}, nil, nil, []any{[]any{makeCand("rc_old", "old")}}},
+		[]any{[]any{"c_1", "r_new"}, nil, nil, []any{[]any{makeCand("rc_new", "done")}}},
+	}})
+	pollEnv, _ := json.Marshal([]any{[]any{"wrb.fr", "hNvQHb", string(pollInner)}})
+	res, err := ParseConversationPollResponseForRID(string(pollEnv), "r_new")
+	if err != nil || res == nil || len(res.Frames) != 1 || res.Frames[0].Text != "done" {
+		t.Fatalf("expected r_new frame 'done', got %+v err=%v", res, err)
+	}
+}
+

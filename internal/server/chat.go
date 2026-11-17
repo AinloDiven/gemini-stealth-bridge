@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1576,84 +1575,6 @@ func (s *Server) evaluateAttemptCompletion(
 	return interpreted, nil
 }
 
-var (
-	streamClockPrefixRe = regexp.MustCompile(`^[ \t]*\[\d+(?::\d+)+\][ \t]*`)
-	streamLinkTokenRe   = regexp.MustCompile(`^\[((?:\[[^\[\]\r\n]*\]\([^\s)\r\n]+\)|[^\[\]\r\n])*)\](?:\([^\s)\r\n]+\))?`)
-	streamLinkLabelRe   = regexp.MustCompile(`^\[([^\[\]\r\n]*)\]\([^\s)\r\n]+\)`)
-)
-
-func bracketRewriteSpan(s string) (spanLen int, label string, isLink, ok bool) {
-	if loc := streamLinkTokenRe.FindStringSubmatchIndex(s); loc != nil {
-		inner := s[loc[2]:loc[3]]
-		if m := streamLinkLabelRe.FindStringSubmatchIndex(inner); m != nil && m[1] == len(inner) {
-			inner = inner[m[2]:m[3]]
-		}
-		return loc[1], inner, strings.Contains(s[:loc[1]], "]("), true
-	}
-	if strings.HasPrefix(s, "[[") && !strings.ContainsAny(s, "\r\n") {
-		if m := streamLinkLabelRe.FindStringSubmatchIndex(s[1:]); m != nil && strings.TrimRight(s[1+m[1]:], ".)]") == "" {
-			return len(s), s[1+m[2] : 1+m[3]], true, true
-		}
-	}
-	return 0, "", false, false
-}
-
-func skipStrippedClockAt(sent string, si int, full string, fi int) (int, bool) {
-	m := streamClockPrefixRe.FindStringIndex(sent[si:])
-	if m == nil {
-		return si, false
-	}
-	spanEnd := si + m[1]
-	if (sent[si] == ' ' && fi < len(full) && full[fi] != ' ') ||
-		fi == len(full) || (fi > 0 && full[fi-1] == ' ') || full[fi] != ' ' {
-		return spanEnd, true
-	}
-	return si + len(strings.TrimRight(sent[si:spanEnd], " \t")), true
-}
-
-func matchStreamPrefixWithLinkRewrites(full, sent string) (string, bool) {
-	if !strings.Contains(full, "[") && !strings.Contains(sent, "[") {
-		return "", false
-	}
-	fi, si := 0, 0
-	matched := false
-	for si < len(sent) && fi < len(full) {
-		if full[fi] == '[' && sent[si] == '[' {
-			fSpan, fLabel, fLink, fOK := bracketRewriteSpan(full[fi:])
-			sSpan, sLabel, sLink, sOK := bracketRewriteSpan(sent[si:])
-			if fOK && sOK && (fLabel == sLabel || fLink || sLink) {
-				fi += fSpan
-				si += sSpan
-				matched = true
-				continue
-			}
-		}
-		if full[fi] == sent[si] {
-			fi++
-			si++
-			continue
-		}
-		if nextSI, ok := skipStrippedClockAt(sent, si, full, fi); ok {
-			si = nextSI
-			matched = true
-			continue
-		}
-		return "", false
-	}
-	for si < len(sent) {
-		nextSI, ok := skipStrippedClockAt(sent, si, full, fi)
-		if !ok || nextSI == si {
-			break
-		}
-		si = nextSI
-		matched = true
-	}
-	if !matched || si < len(sent) {
-		return "", false
-	}
-	return full[fi:], true
-}
-
 func remainingStreamTail(full, sent string) (string, bool) {
 	if sent == "" {
 		return full, true
@@ -1661,23 +1582,14 @@ func remainingStreamTail(full, sent string) (string, bool) {
 	if strings.HasPrefix(full, sent) {
 		return full[len(sent):], true
 	}
-	if tail, ok := matchStreamPrefixWithLinkRewrites(full, sent); ok {
-		return tail, true
-	}
 	fullTrimLeft := strings.TrimLeft(full, " \t\r\n")
 	sentTrimLeft := strings.TrimLeft(sent, " \t\r\n")
 	if strings.HasPrefix(fullTrimLeft, sentTrimLeft) {
 		return fullTrimLeft[len(sentTrimLeft):], true
 	}
-	if tail, ok := matchStreamPrefixWithLinkRewrites(fullTrimLeft, sentTrimLeft); ok {
-		return tail, true
-	}
 	fullTrimBoth := strings.TrimRight(fullTrimLeft, " \t\r\n")
 	sentTrimBoth := strings.TrimRight(sentTrimLeft, " \t\r\n")
 	if fullTrimBoth != "" && fullTrimBoth == sentTrimBoth {
-		return "", true
-	}
-	if tail, ok := matchStreamPrefixWithLinkRewrites(fullTrimBoth, sentTrimBoth); ok && strings.TrimSpace(tail) == "" {
 		return "", true
 	}
 	return "", false

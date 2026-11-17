@@ -1,7 +1,6 @@
 package gemini
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
@@ -153,9 +152,10 @@ var (
 			`)[.!]?$`,
 	)
 	hex16Re                 = regexp.MustCompile(`^[0-9a-f]{14,16}$`)
-	googleUserContentRe     = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
-	imageSizeSuffixRe       = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
-	closedThinkBlockRe      = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
+	googleUserContentRe           = regexp.MustCompile(`^https://lh3\.googleusercontent\.com/`)
+	imageSizeSuffixRe             = regexp.MustCompile(`=s\d+(-[a-z0-9]+)*$`)
+	googleGenContentPlaceholderRe = regexp.MustCompile(`(?i)https?://googleusercontent\.com/(?:image_generation_content|generated_video_content)/\S*`)
+	closedThinkBlockRe            = regexp.MustCompile("(?is)(?:<(think|thinking|thought)(?:\\s[^>]*)?>\\s*([\\s\\S]*?)</(?:think|thinking|thought)\\s*>|```(?:thinking|thought)\\b[^\\n]*\\s*([\\s\\S]*?)```)\\s*")
 	codeEventBlockRe        = regexp.MustCompile("(?is)```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+\\s*([\\s\\S]*?)```\\s*")
 	openThinkStartRe        = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)[\\s\\S]*$")
 	openThinkTagOnlyRe      = regexp.MustCompile("(?is)^\\s*(?:<(?:think|thinking|thought)(?:\\s[^>]*)?>|```(?:thinking|thought)\\b[^\\n]*|```[a-z0-9_+-]*\\?code_(?:reference|stdout|stderr)&code_event_index=\\d+)\\s*")
@@ -949,6 +949,9 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 			text, _ = tArr[0].(string)
 		}
 	}
+	if googleGenContentPlaceholderRe.MatchString(text) {
+		text = strings.TrimSpace(googleGenContentPlaceholderRe.ReplaceAllString(text, ""))
+	}
 
 	var thoughts string
 	if tf, ok := jspbField(c, 37).([]any); ok && len(tf) > 0 {
@@ -964,11 +967,6 @@ func parseCandidateSlice(c []any, answeredID, answeredLabel string) (Frame, bool
 				done = true
 			}
 		}
-	}
-
-	text = cleanGeminiMediaPlaceholders(text, done)
-	if !done {
-		text = trimIncompleteTrailingURL(text)
 	}
 
 	images := extractGeneratedImages(c)
@@ -1106,267 +1104,6 @@ func interpolateToolNamePlaceholder(s, toolTitle string) string {
 		return s
 	}
 	return strings.TrimSpace(strings.ReplaceAll(s, "{tool_name_placeholder}", strings.TrimSpace(toolTitle)))
-}
-
-var (
-	partialHTTPTailRe        = regexp.MustCompile(`(?i)\[{0,2}(?:https?://\S*|h(?:t(?:t(?:p(?:s?(?::/?)?)?)?)?)?|\[)$`)
-	geminiMediaNamespaces    = []string{"image_generation_content/", "generated_video_content/", "youtube_content/", "map_content/"}
-	geminiMediaRefRe         = regexp.MustCompile(`(?i)^(?:https?:)?(?://googleusercontent\.com/)?(?:image_generation_content|generated_video_content|youtube_content|map_content)/[^\s"'<>)]*$`)
-	geminiMediaAttrRe        = regexp.MustCompile(`(?is)\b(?:src|href|data-src)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'/>]+))`)
-	geminiMediaCompleteTagRe = regexp.MustCompile(`(?is)^<(image|video|img)\b((?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^"'>])*)>`)
-	geminiMediaCloseTagRe    = regexp.MustCompile(`(?is)^\s*</(image|video|img)\s*>`)
-	geminiMediaMarkdownRe    = regexp.MustCompile(`^!\[(?:\\.|[^\]\r\n\\])*\]\(([^\s)\r\n]+)\)`)
-	geminiMediaBareURLRe     = regexp.MustCompile(`(?i)^https?://googleusercontent\.com/(?:image_generation_content|generated_video_content|youtube_content|map_content)/\S+`)
-	geminiPartialMediaTagRe  = regexp.MustCompile(`(?is)^<(?:i(?:m(?:a(?:g(?:e)?)?|g)?)?|v(?:i(?:d(?:e(?:o)?)?)?)?)?$`)
-	geminiPartialOpenTagRe   = regexp.MustCompile(`(?is)^<(?:image|video|img)(?:[\s/][^>]*)?$`)
-)
-
-func trimIncompleteTrailingURL(text string) string {
-	loc := partialHTTPTailRe.FindStringIndex(text)
-	if loc == nil {
-		return text
-	}
-	if loc[0] > 0 && ((text[loc[0]] == 'h' || text[loc[0]] == 'H') &&
-		((text[loc[0]-1] >= 'a' && text[loc[0]-1] <= 'z') ||
-			(text[loc[0]-1] >= 'A' && text[loc[0]-1] <= 'Z') ||
-			(text[loc[0]-1] >= '0' && text[loc[0]-1] <= '9'))) {
-		return text
-	}
-	return text[:loc[0]]
-}
-
-// cleanGeminiMediaPlaceholders strips Gemini Web's internal media-mount tags,
-// markdown embeds, and bare placeholder URLs outside code spans, holding back
-// partial openers while streaming so output prefixes remain monotonic.
-func cleanGeminiMediaPlaceholders(text string, done bool) string {
-	if text == "" {
-		return ""
-	}
-	buf := make([]byte, 0, len(text))
-	changed := false
-	for i := 0; i < len(text); {
-		if end, ok := skipCodeSpan(text, i); ok {
-			buf = append(buf, text[i:end]...)
-			i = end
-			continue
-		}
-		if !done && hasIncompleteMediaOpener(text, i) {
-			break
-		}
-		if end, hold := matchCompleteMediaMount(text, i, done); hold {
-			break
-		} else if end > i {
-			i = collapseRemovedMount(&buf, text, end, done)
-			changed = true
-			continue
-		}
-		buf = append(buf, text[i])
-		i++
-	}
-	if changed && done {
-		return strings.TrimSpace(string(buf))
-	}
-	return string(buf)
-}
-
-func skipCodeSpan(s string, i int) (int, bool) {
-	if i == 0 || s[i-1] == '\n' {
-		trimmed := strings.TrimLeft(s[i:], " ")
-		if indent := len(s[i:]) - len(trimmed); indent <= 3 && len(trimmed) >= 3 && (trimmed[0] == '`' || trimmed[0] == '~') {
-			ch := trimmed[0]
-			n := 0
-			for n < len(trimmed) && trimmed[n] == ch {
-				n++
-			}
-			nl := strings.IndexByte(trimmed[n:], '\n')
-			info := trimmed[n:]
-			if nl >= 0 {
-				info = trimmed[n : n+nl]
-			}
-			if ch != '`' || !strings.ContainsRune(info, '`') {
-				if nl < 0 {
-					return len(s), true
-				}
-				closeFence := strings.Repeat(string(ch), n)
-				for cur := i + indent + n + nl + 1; cur < len(s); {
-					nextNL := strings.IndexByte(s[cur:], '\n')
-					line, next := s[cur:], len(s)
-					if nextNL >= 0 {
-						line, next = s[cur:cur+nextNL], cur+nextNL+1
-					}
-					tl := strings.TrimLeft(line, " ")
-					if len(line)-len(tl) <= 3 && strings.HasPrefix(tl, closeFence) && strings.Trim(strings.TrimLeft(tl, string(ch)), " \t\r") == "" {
-						return next, true
-					}
-					cur = next
-				}
-				return len(s), true
-			}
-		}
-	}
-	if s[i] != '`' {
-		return 0, false
-	}
-	ticks := 0
-	for i+ticks < len(s) && s[i+ticks] == '`' {
-		ticks++
-	}
-	fence := s[i : i+ticks]
-	for j := i + ticks; j < len(s); j++ {
-		if s[j] == '\n' && hasBlankLineBreak(s, j) {
-			return 0, false
-		}
-		if strings.HasPrefix(s[j:], fence) && (j+ticks == len(s) || s[j+ticks] != '`') {
-			return j + ticks, true
-		}
-		for j < len(s) && s[j] == '`' {
-			j++
-		}
-	}
-	return 0, false
-}
-
-func hasBlankLineBreak(s string, nl int) bool {
-	return nl+1 < len(s) && (s[nl+1] == '\n' || (s[nl+1] == '\r' && nl+2 < len(s) && s[nl+2] == '\n'))
-}
-
-func matchCompleteMediaMount(s string, i int, done bool) (int, bool) {
-	switch s[i] {
-	case '<':
-		m := geminiMediaCompleteTagRe.FindStringSubmatchIndex(s[i:])
-		if m == nil || strings.Contains(s[i:i+m[1]], "\n\n") {
-			return 0, false
-		}
-		matched := false
-		for _, a := range geminiMediaAttrRe.FindAllStringSubmatch(s[i+m[4]:i+m[5]], -1) {
-			if geminiMediaRefRe.MatchString(strings.TrimSpace(a[1] + a[2] + a[3])) {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return 0, false
-		}
-		tagName := s[i+m[2] : i+m[3]]
-		end := i + m[1]
-		if !strings.HasSuffix(strings.TrimSpace(s[i:end]), "/>") {
-			if cm := geminiMediaCloseTagRe.FindStringSubmatchIndex(s[end:]); cm != nil && strings.EqualFold(s[end+cm[2]:end+cm[3]], tagName) {
-				end += cm[1]
-			} else if !done {
-				rest := strings.TrimLeft(s[end:], " \t\r\n")
-				closePrefix := "</" + strings.ToLower(tagName) + ">"
-				if rest == "" || strings.HasPrefix(closePrefix, strings.ToLower(rest)) {
-					return 0, true
-				}
-			}
-		}
-		return end, false
-	case '!':
-		m := geminiMediaMarkdownRe.FindStringSubmatchIndex(s[i:])
-		if m != nil && geminiMediaRefRe.MatchString(strings.TrimSpace(s[i+m[2]:i+m[3]])) {
-			return i + m[1], false
-		}
-	case 'h', 'H':
-		if i == 0 || strings.ContainsRune(" \t\r\n", rune(s[i-1])) {
-			if loc := geminiMediaBareURLRe.FindStringIndex(s[i:]); loc != nil {
-				return i + loc[1], false
-			}
-		}
-	}
-	return 0, false
-}
-
-func hasIncompleteMediaOpener(s string, i int) bool {
-	tail := s[i:]
-	switch s[i] {
-	case '<':
-		return !strings.Contains(tail, "\n\n") &&
-			(geminiPartialMediaTagRe.MatchString(tail) || geminiPartialOpenTagRe.MatchString(tail))
-	case '!':
-		if tail == "!" || (strings.HasPrefix(tail, "![") && !strings.Contains(tail, "\n") && !strings.Contains(tail, "]")) {
-			return true
-		}
-		if strings.HasPrefix(tail, "![") && !strings.Contains(tail, "\n") {
-			if closeIdx := strings.Index(tail, "]("); closeIdx >= 0 {
-				urlPart := tail[closeIdx+2:]
-				return !strings.ContainsAny(urlPart, " \t\r\n)") && (urlPart == "" || isMediaRefPrefix(urlPart))
-			}
-			return strings.HasSuffix(tail, "]")
-		}
-	case 'h', 'H':
-		if (i == 0 || strings.ContainsRune(" \t\r\n", rune(s[i-1]))) && !strings.ContainsAny(tail, " \t\r\n") {
-			return isMediaRefPrefix(tail)
-		}
-	}
-	return false
-}
-
-func isMediaRefPrefix(s string) bool {
-	lower := strings.ToLower(strings.TrimSpace(s))
-	if lower == "" || geminiMediaRefRe.MatchString(lower) || strings.Contains(lower, "googleusercontent.com") {
-		return lower != ""
-	}
-	for _, host := range []string{"http://googleusercontent.com/", "https://googleusercontent.com/"} {
-		if strings.HasPrefix(host, lower) {
-			return true
-		}
-		if rest, ok := strings.CutPrefix(lower, host); ok {
-			lower = rest
-			break
-		}
-	}
-	for _, ns := range geminiMediaNamespaces {
-		if strings.HasPrefix(ns, lower) || strings.Contains(lower, strings.TrimSuffix(ns, "/")) {
-			return true
-		}
-	}
-	return false
-}
-
-func leadingLineBreakLen(s string) int {
-	if strings.HasPrefix(s, "\r\n") {
-		return 2
-	}
-	if strings.HasPrefix(s, "\n") {
-		return 1
-	}
-	return 0
-}
-
-func collapseRemovedMount(buf *[]byte, text string, end int, done bool) int {
-	b := *buf
-	lineStart := bytes.LastIndexByte(b, '\n') + 1
-	after := text[end:]
-	afterTrim := strings.TrimLeft(after, " \t")
-	standalone := len(bytes.Trim(b[lineStart:], " \t\r")) == 0 && (afterTrim == "" || leadingLineBreakLen(afterTrim) > 0)
-	if !standalone {
-		if len(b) > 0 && (b[len(b)-1] == ' ' || b[len(b)-1] == '\t') {
-			end += len(after) - len(afterTrim)
-		}
-		return end
-	}
-	b = b[:lineStart]
-	end += len(after) - len(afterTrim)
-	switch {
-	case len(b) == 0:
-		end += len(text[end:]) - len(strings.TrimLeft(text[end:], "\r\n"))
-	case end == len(text):
-		if done {
-			b = bytes.TrimRight(b, " \t\r\n")
-		}
-	default:
-		end += leadingLineBreakLen(text[end:])
-		for bytes.HasSuffix(b, []byte("\n\n")) || bytes.HasSuffix(b, []byte("\r\n\r\n")) {
-			trimmed := strings.TrimLeft(text[end:], " \t")
-			lb := leadingLineBreakLen(trimmed)
-			if lb == 0 {
-				break
-			}
-			end += len(text[end:]) - len(trimmed) + lb
-		}
-	}
-	*buf = b
-	return end
 }
 
 func actionArray(frame []any, slot, field int) []any {

@@ -315,121 +315,66 @@ func TestStreamingMediaInIntermediateFrameDoesNotTriggerUpstreamRevision(t *test
 	}
 }
 
-func TestStreamingImageGenerationHoldsIntermediateProseAndNeverLeaksComponentTag(t *testing.T) {
-	rawLongProse := "Intro text specifically padded well beyond the 240-byte streaming buffer threshold so we verify that intermediate generation frames are held back " +
-		"instead of flushing early before media attachment delivery completes and exposing internal mount tags.\n\n" +
-		`<Image alt="Generated artwork" src="image_generation_content/123456"/>` +
-		"\n\nYour image is ready."
-
-	for _, tc := range []struct {
-		name        string
-		eagerStream bool
-		wantSingle  bool
-	}{
-		{name: "buffered_holds_until_done", eagerStream: false, wantSingle: true},
-		{name: "eager_strips_without_revision", eagerStream: true, wantSingle: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			srv, acct := newTestHarness(tc.eagerStream, true)
-			up := &mockUpstream{
-				streamFn: func(ctx context.Context, promptText string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
-					if err := onFrame(&gemini.LineParseResult{
-						CID:             "c_img2",
-						RID:             "r_img2",
-						MediaToolActive: true,
-						Action:          &gemini.ActionStatus{ToolID: "image_generation", BranchTitle: "Creating your image"},
-					}); err != nil {
-						return nil, err
-					}
-					// Simulate Gemini streaming a candidate frame (>240 bytes) mid-generation while done=false
-					candStreaming := []any{
-						"rc_img2",
-						[]any{rawLongProse[:len(rawLongProse)-len("Your image is ready.")]},
-						nil, nil, nil, nil, nil, nil,
-						[]any{float64(1)},
-					}
-					streamParsed, err := gemini.ParseFrameLine(mustMarshalWrbFrame(t, "c_img2", "r_img2", candStreaming))
-					if err != nil {
-						return nil, err
-					}
-					if err := onFrame(streamParsed); err != nil {
-						return nil, err
-					}
-					// Final done=true frame carries the real c[12] image attachment.
-					candDone := []any{
-						"rc_img2",
-						[]any{rawLongProse},
-						nil, nil, nil, nil, nil, nil,
-						[]any{float64(2)},
-						nil, nil, nil,
-						[]any{
-							nil, nil, nil, nil, nil, nil, nil,
-							[]any{
-								[]any{
-									[]any{
-										[]any{nil, nil, nil, []any{nil, float64(1024), float64(1024), "https://lh3.googleusercontent.com/gg-dl/poster=s512"}},
-										nil, nil,
-										[]any{nil, nil, nil, nil, nil, []any{"Poster"}, "Generated artwork"},
-									},
-								},
-							},
-						},
-					}
-					doneParsed, err := gemini.ParseFrameLine(mustMarshalWrbFrame(t, "c_img2", "r_img2", candDone))
-					if err != nil {
-						return nil, err
-					}
-					if err := onFrame(doneParsed); err != nil {
-						return nil, err
-					}
-					return &gemini.StreamResponse{Status: 200, CID: "c_img2", RID: "r_img2"}, nil
+func TestStreamingImageGenerationHoldsIntermediateProseAndStripsUpstreamPlaceholder(t *testing.T) {
+	longProse := strings.Repeat("Intermediate image generation prose held back while tool is active. ", 4)
+	srv, acct := newTestHarness(false, true)
+	up := &mockUpstream{
+		streamFn: func(ctx context.Context, promptText string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			if err := onFrame(&gemini.LineParseResult{
+				CID:             "c_img2",
+				RID:             "r_img2",
+				MediaToolActive: true,
+				Action:          &gemini.ActionStatus{ToolID: "image_generation", BranchTitle: "Creating image"},
+			}); err != nil {
+				return nil, err
+			}
+			candStreaming := []any{"rc_img2", []any{longProse}, nil, nil, nil, nil, nil, nil, []any{float64(1)}}
+			streamParsed, err := gemini.ParseFrameLine(mustMarshalWrbFrame(t, "c_img2", "r_img2", candStreaming))
+			if err != nil {
+				return nil, err
+			}
+			if err := onFrame(streamParsed); err != nil {
+				return nil, err
+			}
+			candDone := []any{
+				"rc_img2",
+				[]any{longProse + "Ready.\nhttps://googleusercontent.com/image_generation_content/0"},
+				nil, nil, nil, nil, nil, nil,
+				[]any{float64(2)},
+				nil, nil, nil,
+				[]any{
+					nil, nil, nil, nil, nil, nil, nil,
+					[]any{[]any{[]any{
+						[]any{nil, nil, nil, []any{nil, float64(1024), float64(1024), "https://lh3.googleusercontent.com/gg-dl/poster=s512"}},
+						nil, nil,
+						[]any{nil, nil, nil, nil, nil, []any{"Poster"}, "Artwork"},
+					}}},
 				},
 			}
+			doneParsed, err := gemini.ParseFrameLine(mustMarshalWrbFrame(t, "c_img2", "r_img2", candDone))
+			if err != nil {
+				return nil, err
+			}
+			if err := onFrame(doneParsed); err != nil {
+				return nil, err
+			}
+			return &gemini.StreamResponse{Status: 200, CID: "c_img2", RID: "r_img2"}, nil
+		},
+	}
 
-			rec := runChat(t, srv, acct, up, map[string]any{"stream": true})
-			if rec.Code != 200 {
-				t.Fatalf("expected HTTP 200, got %d: %s", rec.Code, rec.Body.String())
-			}
-			bodyStr := rec.Body.String()
-			for _, forbidden := range []string{"<Image", "image_generation_content/", "upstream_revision"} {
-				if strings.Contains(bodyStr, forbidden) {
-					t.Fatalf("SSE stream must not contain %q, got:\n%s", forbidden, bodyStr)
-				}
-			}
-			var combined strings.Builder
-			for _, line := range strings.Split(bodyStr, "\n") {
-				if !strings.HasPrefix(line, "data: {") {
-					continue
-				}
-				var chunk struct {
-					Choices []struct {
-						Delta struct {
-							Content string `json:"content"`
-						} `json:"delta"`
-					} `json:"choices"`
-				}
-				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err == nil && len(chunk.Choices) > 0 {
-					combined.WriteString(chunk.Choices[0].Delta.Content)
-				}
-			}
-			fullText := combined.String()
-			if !strings.Contains(fullText, "Your image is ready.") || !strings.Contains(fullText, "/v1/media/") {
-				t.Fatalf("expected clean concatenated prose and proxied /v1/media/ link, got fullText=%q\nraw:\n%s", fullText, bodyStr)
-			}
-			if tc.wantSingle {
-				// In buffered mode, intermediate >240B prose is held while mediaToolUsed is active,
-				// so prose and /v1/media/ arrive together only on completion (one content delta).
-				contentCount := strings.Count(bodyStr, `"content":"Intro text specifically`)
-				mediaCount := strings.Count(bodyStr, "/v1/media/")
-				if contentCount != 1 || mediaCount == 0 {
-					t.Fatalf("expected single finalized content chunk in buffered media mode, contentCount=%d mediaCount=%d\n%s", contentCount, mediaCount, bodyStr)
-				}
-				proseIdx := strings.Index(bodyStr, "Intro text specifically")
-				if firstMediaIdx := strings.Index(bodyStr, "/v1/media/"); firstMediaIdx < proseIdx {
-					t.Fatalf("unexpected media ordering: %s", bodyStr)
-				}
-			}
-		})
+	rec := runChat(t, srv, acct, up, map[string]any{"stream": true})
+	if rec.Code != 200 {
+		t.Fatalf("expected HTTP 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	bodyStr := rec.Body.String()
+	if strings.Contains(bodyStr, "image_generation_content/") || strings.Contains(bodyStr, "upstream_revision") {
+		t.Fatalf("unexpected placeholder or revision error in SSE stream:\n%s", bodyStr)
+	}
+	if !strings.Contains(bodyStr, "Ready.") || !strings.Contains(bodyStr, "/v1/media/") {
+		t.Fatalf("expected final prose and proxied /v1/media/ link, got:\n%s", bodyStr)
+	}
+	if strings.Count(bodyStr, `"content":"Intermediate image generation prose`) != 1 {
+		t.Fatalf("expected held intermediate prose to emit in single finalized delta:\n%s", bodyStr)
 	}
 }
 

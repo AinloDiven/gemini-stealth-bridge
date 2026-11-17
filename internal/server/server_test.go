@@ -2552,3 +2552,80 @@ func TestStreamedPreambleWithLeadingWhitespaceDoesNotTriggerFalseUpstreamRevisio
 		t.Fatalf("expected tool_calls completion, got:\n%s", rec.Body.String())
 	}
 }
+
+func TestStreamEmitsReasoningAndActionStatusExtensions(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Action: &gemini.ActionStatus{
+				ThinkingTitle:  "Analyzing request",
+				ToolID:         "skills",
+				ToolTitle:      "Skill",
+				StatusTemplate: "{tool_logo_placeholder} Skills: Research",
+			},
+			Frames: []gemini.Frame{makeFrame("", "step one", false, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Frames: []gemini.Frame{makeFrame("answer", "", true, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		return &gemini.StreamResponse{Status: 200, CID: "c", RID: "r"}, nil
+	}}
+
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
+	body := rec.Body.String()
+	for _, want := range []string{
+		`"x_gemini_reasoning"`,
+		`"event":"start"`,
+		`"event":"delta"`,
+		`"event":"done"`,
+		`"x_gemini_action_status"`,
+		`"progress_detail":"Analyzing request"`,
+		`"provider":"skills"`,
+		`"status_template":"{tool_logo_placeholder} Skills: Research"`,
+		`data: [DONE]`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("expected SSE body to contain %s, got:\n%s", want, body)
+		}
+	}
+	if !(strings.Index(body, `"event":"start"`) < strings.Index(body, `"event":"delta"`) &&
+		strings.Index(body, `"event":"delta"`) < strings.Index(body, `"event":"done"`)) {
+		t.Fatalf("unexpected reasoning event order:\n%s", body)
+	}
+}
+
+func TestStreamClosesReasoningBeforeMidStreamErrorAndFlushesMediaAction(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	srv.Cfg.MaxAttempts = 1
+	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", MediaToolActive: true,
+			Action: &gemini.ActionStatus{ToolID: "image_generation", BranchTitle: "Generating"},
+		}); err != nil {
+			return nil, err
+		}
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Frames: []gemini.Frame{makeFrame("", "partial thought", false, testModel.ModelID)},
+		}); err != nil {
+			return nil, err
+		}
+		return nil, transport.NewUpstreamError("stream interrupted", 502, "upstream_error", nil, nil)
+	}}
+
+	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
+	body := rec.Body.String()
+	actionIdx := strings.Index(body, `"phase":"generating_media"`)
+	doneIdx := strings.Index(body, `"event":"done"`)
+	errIdx := strings.Index(body, `"error":`)
+	if actionIdx < 0 || doneIdx < 0 || errIdx < 0 || !(actionIdx < doneIdx && doneIdx < errIdx) {
+		t.Fatalf("expected action (%d) < reasoning done (%d) < error (%d):\n%s", actionIdx, doneIdx, errIdx, body)
+	}
+}
+
