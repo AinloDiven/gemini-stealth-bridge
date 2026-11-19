@@ -736,7 +736,7 @@ func (s *Server) HandleResponses(ctx context.Context, w http.ResponseWriter, bod
 							as.sentText = as.text
 						}
 					} else if g.hasTools && !as.mediaToolUsed && len(as.text) > 240 {
-						if safePrefix := toolbridge.SafeStreamablePrefix(as.text); len(safePrefix) > len(as.sentText) && strings.HasPrefix(safePrefix, as.sentText) && safeErrorReplyPrefix(as.text) == "" {
+						if safePrefix := toolbridge.SafeStreamablePrefix(as.text); len(safePrefix) > len(as.sentText) && strings.HasPrefix(safePrefix, as.sentText) && safeErrorReplyPrefix(as.text) == "" && !toolbridge.IsToolProtocolRefusal(as.text) {
 							emitTextDelta(safePrefix[len(as.sentText):])
 							as.sentText = safePrefix
 						}

@@ -620,6 +620,7 @@ func FlattenMessagesWithStats(
 		}
 		reasoning := extractReasoning(m)
 
+		wasRefusal := false
 		if role == "assistant" && text != "" {
 			if inlineThinkBlockRe.MatchString(text) {
 				text = strings.TrimSpace(inlineThinkBlockRe.ReplaceAllString(text, ""))
@@ -635,7 +636,11 @@ func FlattenMessagesWithStats(
 				text = strings.TrimSpace(text)
 			}
 			if toolbridge.IsToolProtocolRefusal(text) {
-				text = ""
+				wasRefusal = true
+				text = toolbridge.StripToolGuard(text)
+				if toolbridge.IsToolProtocolRefusal(text) {
+					text = ""
+				}
 			}
 		}
 		if role == "assistant" {
@@ -687,6 +692,9 @@ func FlattenMessagesWithStats(
 				turns = append(turns, turnEntry{role: "Instruction", text: text})
 			}
 		case "assistant":
+			if wasRefusal && text == "" {
+				continue
+			}
 			turns = append(turns, turnEntry{role: "Assistant", text: text, reasoning: reasoning})
 			sawTurn = true
 		default:

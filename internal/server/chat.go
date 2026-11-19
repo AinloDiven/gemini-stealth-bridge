@@ -348,7 +348,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 							lastActiveKeepaliveAt = time.Now()
 						}
 					} else if g.hasTools && !as.mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(as.text) > 240 {
-						if safePrefix := toolbridge.SafeStreamablePrefix(as.text); len(safePrefix) > len(as.sentText) && strings.HasPrefix(safePrefix, as.sentText) && safeErrorReplyPrefix(as.text) == "" {
+						if safePrefix := toolbridge.SafeStreamablePrefix(as.text); len(safePrefix) > len(as.sentText) && strings.HasPrefix(safePrefix, as.sentText) && safeErrorReplyPrefix(as.text) == "" && !toolbridge.IsToolProtocolRefusal(as.text) {
 							g.startStream()
 							emit(sseDeltaContent{Content: safePrefix[len(as.sentText):]}, nil, nil)
 							as.sentText = safePrefix
@@ -400,6 +400,9 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		var oaCalls []toolbridge.OpenAIToolCall
 		finish := "stop"
 		var content any = as.text
+		if textStr, ok := content.(string); ok {
+			content = toolbridge.StripToolGuard(textStr)
+		}
 		if len(calls) > 0 {
 			finish = "tool_calls"
 			if (s.Cfg.KeepToolPreamble || as.sentText != "") && interpreted.Text != "" {
@@ -526,7 +529,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"content": content,
 			}
 			if s.Cfg.LiveThoughts && as.thoughts != "" {
-				msgObj["reasoning_content"] = as.thoughts
+				msgObj["reasoning_content"] = toolbridge.StripToolGuard(as.thoughts)
 			}
 			if len(oaCalls) > 0 {
 				msgObj["tool_calls"] = oaCalls
@@ -801,7 +804,14 @@ func hasCompatibleStreamPrefix(full, sent string) bool {
 }
 
 func appendToolErrorCorrection(fullPrompt, errMsg string) string {
-	note := fmt.Sprintf("[System correction: Your previous reply failed tool validation (%s). Output ONLY a valid JSON ```json {\"tool_calls\":[...]} ``` block with all required schema properties.]", strings.TrimSpace(errMsg))
+	var note string
+	if strings.Contains(errMsg, toolbridge.ToolProtocolRefusalError) {
+		// The model invented a tool-call budget. A generic schema note does not
+		// address that, so name the invention explicitly and restate availability.
+		note = "[System correction: Tools ARE available and there is NO tool-call or search budget in this session. The previous reply wrongly claimed a tool limit. Disregard any such claim and emit the next ```json {\"tool_calls\":[...]} ``` block now, using only the declared tools and their exact schema.]"
+	} else {
+		note = fmt.Sprintf("[System correction: Your previous reply failed tool validation (%s). Output ONLY a valid JSON ```json {\"tool_calls\":[...]} ``` block with all required schema properties.]", strings.TrimSpace(errMsg))
+	}
 	const suffix = "\n\nAssistant:"
 	if strings.HasSuffix(fullPrompt, suffix) {
 		return fullPrompt[:len(fullPrompt)-len(suffix)] + "\n\n" + note + suffix

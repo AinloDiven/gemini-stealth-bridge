@@ -557,7 +557,7 @@ func (g *generationSession) runUpstreamAttempt(
 					as.text = frame.Text
 				}
 			}
-			as.thoughts = mergeStreamedThoughts(as.thoughts, frame.Thoughts)
+			as.thoughts = toolbridge.StripToolGuard(mergeStreamedThoughts(as.thoughts, frame.Thoughts))
 			as.done = frame.Done
 			if as.done && !scope.StructuredMedia {
 				as.text = gemini.AppendGeneratedMediaMarkdown(as.text, as.lastImages, as.lastVideos)
@@ -613,7 +613,7 @@ func (g *generationSession) handleAttemptFailure(
 			g.s.refreshQuotaAsync(g.account, c)
 		}
 	}
-	if g.cacheKey != "" && len(g.opts.Metadata) > 0 && !as.mediaToolUsed && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+	if g.cacheKey != "" && len(g.opts.Metadata) > 0 && !as.mediaToolUsed && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || errCode == "tool_call_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
 		g.s.deleteSessionCache(g.cacheKey)
 		g.s.deleteSessionBinding(g.prep.sessionBindingKey)
 		g.cacheKey = ""
