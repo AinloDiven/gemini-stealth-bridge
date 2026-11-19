@@ -1563,9 +1563,20 @@ func (s *Server) resolveChatAccountPreferred(accts []*AccountState, scope AuthSc
 	return best
 }
 
-const quotaRefreshCooldown = 45 * time.Second
+const (
+	quotaRefreshCooldown        = 45 * time.Second
+	successQuotaRefreshCooldown = 5 * time.Minute
+)
 
 func (s *Server) refreshQuotaAsync(a *AccountState, c UpstreamClient) {
+	s.refreshQuotaWithCooldown(a, c, quotaRefreshCooldown)
+}
+
+func (s *Server) refreshQuotaOnSuccess(a *AccountState, c UpstreamClient) {
+	s.refreshQuotaWithCooldown(a, c, successQuotaRefreshCooldown)
+}
+
+func (s *Server) refreshQuotaWithCooldown(a *AccountState, c UpstreamClient, cooldown time.Duration) {
 	if a == nil || c == nil {
 		return
 	}
@@ -1579,16 +1590,7 @@ func (s *Server) refreshQuotaAsync(a *AccountState, c UpstreamClient) {
 		a.mu.Unlock()
 		return
 	}
-	lowQuota := false
-	for _, q := range a.Quota {
-		if !q.Synthetic && !strings.HasPrefix(q.ID, "sub:") && !q.Unlimited && q.Total > 0 {
-			if q.Remaining <= 200 || (q.Total >= 1000 && q.Remaining*20 <= q.Total) {
-				lowQuota = true
-				break
-			}
-		}
-	}
-	if !lowQuota && !a.QuotaAt.IsZero() && now.Sub(a.QuotaAt) < quotaRefreshCooldown {
+	if cooldown > 0 && !a.QuotaAt.IsZero() && now.Sub(a.QuotaAt) < cooldown {
 		a.mu.Unlock()
 		return
 	}

@@ -407,17 +407,16 @@ conversation (same account, saved `cid`/`rid`/`rcid`/context token; the model
 may change) so a bot can continue the same conversation after trimming history.
 The binding lives in `$BRIDGE_HOME/session-bindings.json`;
 `BRIDGE_SESSION_BINDING_TTL_MS` and `BRIDGE_SESSION_BINDING_MAX` bound it. An
-empty `model` uses `BRIDGE_DEFAULT_MODEL` when configured. A fixed cloud Skill
+empty `model` uses the selected account's first model. A fixed cloud Skill
 can be set with `BRIDGE_SKILL` (per-key `BRIDGE_SKILL_PER_KEY`, or `"skill"` in
 the account file); gsb resolves the `cCSu7` runtime handle, writes
-StreamGenerate slot 81, and prepends the `@skill` mention at byte 0 of each
+StreamGenerate slot 81 when bound, and prepends the `@skill` mention at byte 0 of each
 turn's prompt. See [`docs/PARITY_FEATURES.md`](docs/PARITY_FEATURES.md).
 
-Streaming also carries additive frames: `x_gemini_reasoning`
-(`start`/`delta`/`done`) for thinking detail, and `x_gemini_action_status` for
-the upstream thinking/tool title (`progress_detail`) plus `provider` /
-`status_template` icon inputs. Both are `choices:[]` frames with
-`x_gemini_protocol_version:3`; `reasoning_content` is unchanged.
+Streaming also carries additive `choices:[]` frames with `x_gemini_protocol_version:3`:
+`x_gemini_action_status` for upstream thinking/tool status pass-through (`source_type`,
+`phase`, optional `progress_detail`, `provider`, and `status_template`),
+`x_gemini_media`, and `x_gemini_citations`; `reasoning_content` carries thinking detail.
 
 Streaming: `chat.completion.chunk` events, final chunk with `finish_reason` and `usage`, then `data: [DONE]`. `: ping` comments every 15 seconds.
 
@@ -719,7 +718,7 @@ Docker always looks remote because of bridge NAT. Tell users to set `BRIDGE_ADMI
 
 Runtime fields editable through `PATCH`:
 
-`defaultThinking`, `defaultModel`, `accountStrategy`, `accountPriority`, `quotaPreflight`, `maxRpmPerAccount` (0–600), `maxConcurrentPerAccount` (0–64), `rejectDowngrade`, `liveThoughts`, `liveToolCalls`, `keepToolPreamble`, `historyOffload`, and `persist`.
+`defaultThinking`, `accountStrategy`, `accountPriority`, `quotaPreflight`, `maxRpmPerAccount` (0–600), `maxConcurrentPerAccount` (0–64), `rejectDowngrade`, `liveThoughts`, `liveToolCalls`, `keepToolPreamble`, `historyOffload`, and `persist`.
 
 Everything else is environment-only.
 
@@ -799,8 +798,7 @@ TLS profiles: `chrome_152_psk`, `chrome_152`, `chrome_150_psk`, `chrome_150`, `c
 | Variable | Default | Notes |
 |---|---|---|
 | `BRIDGE_DEFAULT_THINKING` | `low` | `low`, `medium`, `high` |
-| `BRIDGE_DEFAULT_MODEL` | empty | Model used when the request omits `model`; runtime-switchable with `PATCH /v1/admin/config` and `persist` |
-| `BRIDGE_SKILL` | empty | Fixed cloud Skill `@` mention; arms slot 81 |
+| `BRIDGE_SKILL` | empty | Fixed cloud Skill `@` mention; arms slot 81 when bound |
 | `BRIDGE_SKILL_PER_KEY` | empty | `token:skill` overrides |
 | `BRIDGE_SESSION_BINDING_TTL_MS` | `86400000` | `X-GSB-Session` binding TTL |
 | `BRIDGE_SESSION_BINDING_MAX` | `1024` | Maximum live explicit bindings |

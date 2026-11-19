@@ -2406,8 +2406,8 @@ func TestStreamedReasoningPreventsRetryConcatenation(t *testing.T) {
 	if strings.Count(rec.Body.String(), `"reasoning_content":"reasoning once"`) != 1 {
 		t.Fatalf("expected one reasoning_content emission, got %s", rec.Body.String())
 	}
-	if strings.Count(rec.Body.String(), `"x_gemini_reasoning"`) != 3 { // start + delta + fallback done
-		t.Fatalf("expected reasoning lifecycle start+delta+done, got %s", rec.Body.String())
+	if strings.Contains(rec.Body.String(), `"x_gemini_reasoning"`) {
+		t.Fatalf("did not expect redundant x_gemini_reasoning frames, got %s", rec.Body.String())
 	}
 }
 
@@ -2556,13 +2556,22 @@ func TestStreamedPreambleWithLeadingWhitespaceDoesNotTriggerFalseUpstreamRevisio
 func TestStreamEmitsReasoningAndActionStatusExtensions(t *testing.T) {
 	srv, acct := newTestHarness(false, true)
 	client := &mockUpstream{streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+		// Emit a skill status before pj[39] identity verifies (headersHeld) followed by
+		// a thinking status once headers are flushed, ensuring earlier cards are queued, not overwritten.
 		if err := onFrame(&gemini.LineParseResult{
-			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			CID: "c", RID: "r",
 			Action: &gemini.ActionStatus{
-				ThinkingTitle:  "Analyzing request",
 				ToolID:         "skills",
 				ToolTitle:      "Skill",
 				StatusTemplate: "{tool_logo_placeholder} Skills: Research",
+			},
+		}); err != nil {
+			return nil, err
+		}
+		if err := onFrame(&gemini.LineParseResult{
+			CID: "c", RID: "r", AnsweredModelID: testModel.ModelID,
+			Action: &gemini.ActionStatus{
+				ThinkingTitle: "Analyzing request",
 			},
 			Frames: []gemini.Frame{makeFrame("", "step one", false, testModel.ModelID)},
 		}); err != nil {
@@ -2580,23 +2589,33 @@ func TestStreamEmitsReasoningAndActionStatusExtensions(t *testing.T) {
 	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
 	body := rec.Body.String()
 	for _, want := range []string{
-		`"x_gemini_reasoning"`,
-		`"event":"start"`,
-		`"event":"delta"`,
-		`"event":"done"`,
 		`"x_gemini_action_status"`,
-		`"progress_detail":"Analyzing request"`,
 		`"provider":"skills"`,
 		`"status_template":"{tool_logo_placeholder} Skills: Research"`,
+		`"progress_detail":"Analyzing request"`,
+		`"reasoning_content":"step one"`,
 		`data: [DONE]`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("expected SSE body to contain %s, got:\n%s", want, body)
 		}
 	}
-	if !(strings.Index(body, `"event":"start"`) < strings.Index(body, `"event":"delta"`) &&
-		strings.Index(body, `"event":"delta"`) < strings.Index(body, `"event":"done"`)) {
-		t.Fatalf("unexpected reasoning event order:\n%s", body)
+	skillIdx := strings.Index(body, `"provider":"skills"`)
+	thinkIdx := strings.Index(body, `"progress_detail":"Analyzing request"`)
+	if skillIdx < 0 || thinkIdx < 0 || skillIdx >= thinkIdx {
+		t.Fatalf("expected queued early skill action (%d) before later thinking action (%d):\n%s", skillIdx, thinkIdx, body)
+	}
+	for _, unwanted := range []string{
+		`"x_gemini_reasoning"`,
+		`"operation_id"`,
+		`"lease_seconds"`,
+		`"turn_admitted"`,
+		`"artifacts_expected"`,
+		`"sequence"`,
+	} {
+		if strings.Contains(body, unwanted) {
+			t.Fatalf("did not expect bot/redundant field %s in pure API stream, got:\n%s", unwanted, body)
+		}
 	}
 }
 
@@ -2622,10 +2641,10 @@ func TestStreamClosesReasoningBeforeMidStreamErrorAndFlushesMediaAction(t *testi
 	rec := runChat(t, srv, acct, client, map[string]any{"stream": true})
 	body := rec.Body.String()
 	actionIdx := strings.Index(body, `"phase":"generating_media"`)
-	doneIdx := strings.Index(body, `"event":"done"`)
+	thoughtIdx := strings.Index(body, `"reasoning_content":"partial thought"`)
 	errIdx := strings.Index(body, `"error":`)
-	if actionIdx < 0 || doneIdx < 0 || errIdx < 0 || !(actionIdx < doneIdx && doneIdx < errIdx) {
-		t.Fatalf("expected action (%d) < reasoning done (%d) < error (%d):\n%s", actionIdx, doneIdx, errIdx, body)
+	if actionIdx < 0 || thoughtIdx < 0 || errIdx < 0 || !(actionIdx < thoughtIdx && thoughtIdx < errIdx) {
+		t.Fatalf("expected action (%d) < reasoning (%d) < error (%d):\n%s", actionIdx, thoughtIdx, errIdx, body)
 	}
 }
 
@@ -2683,4 +2702,91 @@ func TestBufferedStreamSnapshotResyncAndRevisionRejection(t *testing.T) {
 	}
 }
 
+func TestResponsesEarlySSEGraceFiresWithStrictRejectDowngrade(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	srv.Cfg.RejectDowngrade = true
+	srv.Cfg.StreamBufferMode = "verified"
+	srv.Cfg.EarlySSE = false
+	srv.Cfg.EarlySSEGrace = 15 * time.Millisecond
 
+	acct.Client = &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			time.Sleep(60 * time.Millisecond)
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c1", RID: "r1", AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{makeFrame("ok", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	srv.HandleResponses(context.Background(), rec, map[string]any{
+		"model":  testModel.ModelName,
+		"stream": true,
+		"input":  "hi",
+	}, AuthScope{OK: true, AccountID: acct.ID})
+	if rec.Code != 200 || !strings.Contains(rec.Body.String(), ": ping") || !strings.Contains(rec.Body.String(), "response.created") {
+		t.Fatalf("expected EarlySSEGrace to commit /v1/responses stream in strict mode: code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Header().Get("X-GSB-Attempt") != "" {
+		t.Fatalf("expected early grace headers to omit unknown attempt header, got %q", rec.Header().Get("X-GSB-Attempt"))
+	}
+}
+
+func TestLowQuotaDoesNotBypassRefreshCooldownAndSuccessThrottled(t *testing.T) {
+	srv, acct := newTestHarness(false, false)
+	var quotaCalls atomic.Int32
+	client := &mockUpstream{
+		quotaFn: func(ctx context.Context) []gemini.QuotaBucket {
+			quotaCalls.Add(1)
+			return []gemini.QuotaBucket{{ID: "q1", Label: "Pro", Total: 100, Remaining: 10}}
+		},
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c1", RID: "r1", AnsweredModelID: testModel.ModelID,
+				Frames: []gemini.Frame{makeFrame("ok", "", true, testModel.ModelID)},
+			})
+			return &gemini.StreamResponse{Status: 200}, nil
+		},
+	}
+	acct.Client = client
+
+	now := time.Unix(1_700_000_000, 0)
+	srv.clock = func() time.Time { return now }
+	// Seed low quota updated 10 seconds ago (< 45s and < 5m).
+	acct.Quota = []gemini.QuotaBucket{{ID: "q1", Label: "Pro", Total: 100, Remaining: 10}}
+	acct.QuotaAt = now
+
+	now = now.Add(10 * time.Second)
+	rec1 := runChat(t, srv, acct, client, nil)
+	if rec1.Code != 200 {
+		t.Fatalf("chat 1 failed: %d", rec1.Code)
+	}
+	// Advance past 45s (2 minutes total) and chat again: post-success 5m throttle still holds.
+	now = now.Add(2 * time.Minute)
+	rec2 := runChat(t, srv, acct, client, nil)
+	if rec2.Code != 200 {
+		t.Fatalf("chat 2 failed: %d", rec2.Code)
+	}
+	// Direct refreshQuotaAsync at 10s also must NOT bypass 45s cooldown just because Remaining<=200.
+	acct.QuotaAt = now
+	now = now.Add(10 * time.Second)
+	srv.refreshQuotaAsync(acct, client)
+	time.Sleep(20 * time.Millisecond)
+
+	if quotaCalls.Load() != 0 {
+		t.Fatalf("expected lowQuota cooldown bypass removed and 200 refreshes throttled, got %d GetQuota calls", quotaCalls.Load())
+	}
+}
+
+func TestSafeErrorReplyPrefixHandlesMultiByteUTF8(t *testing.T) {
+	// 85 * 3 = 255 bytes; byte 240 falls inside a 3-byte Chinese rune boundary.
+	zh := strings.Repeat("中", 85)
+	if idx := snapUTF8Start(zh, 240); idx%3 != 0 || idx > 240 {
+		t.Fatalf("snapUTF8Start(%d) = %d, want valid UTF-8 rune boundary <= 240", 240, idx)
+	}
+	if got := safeErrorReplyPrefix(zh); got != "" {
+		t.Fatalf("expected non-error Chinese prefix, got %q", got)
+	}
+}

@@ -824,6 +824,13 @@ func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
 			suppParams = []string{"tools", "tool_choice", "max_tokens", "max_completion_tokens"}
 		}
 
+		modality := "text->text"
+		inputModalities := []string{"text"}
+		if caps.Vision {
+			modality = "text+image+audio+file+video->text"
+			inputModalities = []string{"text", "image", "audio", "file", "video"}
+		}
+
 		entry := map[string]any{
 			"id":                    x.ModelName,
 			"object":                "model",
@@ -839,8 +846,8 @@ func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
 			"reasoning":             isReasoning,
 			"supported_parameters":  suppParams,
 			"architecture": map[string]any{
-				"modality":          "text+image+audio+file+video->text",
-				"input_modalities":  []string{"text", "image", "audio", "file", "video"},
+				"modality":          modality,
+				"input_modalities":  inputModalities,
 				"output_modalities": []string{"text"},
 			},
 			"top_provider": map[string]any{
@@ -866,9 +873,9 @@ func (s *Server) BuildModelsPayload(models []gemini.ModelInfo) map[string]any {
 			},
 			"capabilities": map[string]any{
 				"vision":                  caps.Vision,
-				"pdf":                     true,
-				"audioInput":              true,
-				"videoInput":              true,
+				"pdf":                     caps.Vision,
+				"audioInput":              caps.Vision,
+				"videoInput":              caps.Vision,
 				"imageOutput":             false,
 				"audioOutput":             false,
 				"search":                  caps.Search,

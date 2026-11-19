@@ -830,7 +830,7 @@ Accepted fields:
 
 | Field | Notes |
 |---|---|
-| `model` | Optional; empty uses `BRIDGE_DEFAULT_MODEL` when set, otherwise the first model on the selected account. Supports router prefixes and `@think=` |
+| `model` | Optional; empty uses the first model on the selected account. Supports router prefixes and `@think=` |
 | `messages` | Required, non-empty array. Roles: `system`, `developer`, `user`, `assistant`, `tool`, `function` |
 | `stream` | Boolean; SSE when true |
 | `tools` | Array of `{"type":"function","function":{name,description,parameters}}`. Tool names match `^[A-Za-z0-9_.:-]{1,128}$`; duplicates are rejected |
@@ -889,8 +889,8 @@ Wire format:
 - a first role-only delta (`{"role":"assistant","content":""}`)
 - text in `choices[0].delta.content`
 - reasoning in `choices[0].delta.reasoning_content` when extracted and enabled
-- reasoning lifecycle in `x_gemini_reasoning` frames (`start`/`delta`/`done`),
-  upstream action titles/icons in `x_gemini_action_status` frames, and structured
+- upstream action status cards in `x_gemini_action_status` frames, structured
+  search citations in `x_gemini_citations` frames, and structured
   generated media in `x_gemini_media` frames (all additive `choices:[]`
   envelopes with `x_gemini_protocol_version:3`; see
   [PARITY_FEATURES.md](docs/PARITY_FEATURES.md))
@@ -1299,8 +1299,7 @@ An unknown value falls back to `chrome_150_psk`. User-Agent and `Sec-CH-UA*` ver
 | Variable | Default | Meaning |
 |---|---|---|
 | `BRIDGE_DEFAULT_THINKING` | `low` | Effort applied when a request sends none: `low`, `medium`, `high` |
-| `BRIDGE_DEFAULT_MODEL` | Empty | Model used when a request omits `model`; switchable at runtime via `PATCH /v1/admin/config` `{"defaultModel":…,"persist":true}` |
-| `BRIDGE_SKILL` | Empty | Fixed cloud Skill `@` mention (for example `@research`); arms StreamGenerate slot 81 |
+| `BRIDGE_SKILL` | Empty | Fixed cloud Skill `@` mention (for example `@research`); arms StreamGenerate slot 81 when bound |
 | `BRIDGE_SKILL_PER_KEY` | Empty | `token:skill` overrides for `BRIDGE_SKILL` |
 | `BRIDGE_SESSION_BINDING_TTL_MS` | `86400000` | Lifetime of an explicit `X-GSB-Session` binding |
 | `BRIDGE_SESSION_BINDING_MAX` | `1024` | Maximum live explicit session bindings |

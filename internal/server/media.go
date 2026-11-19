@@ -853,7 +853,7 @@ func (s *Server) handleMediaGenerationEndpoint(ctx context.Context, w http.Respo
 	prep.account.Fails = 0
 	prep.account.LastUsed = s.now()
 	prep.account.mu.Unlock()
-	s.refreshQuotaAsync(prep.account, s.clientFor(prep.account))
+	s.refreshQuotaOnSuccess(prep.account, s.clientFor(prep.account))
 
 	dataList := make([]map[string]any, 0, len(items))
 	for _, it := range items {

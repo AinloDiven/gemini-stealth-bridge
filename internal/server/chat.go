@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -52,7 +50,6 @@ type sseExtensionChunk struct {
 	Object          string                   `json:"object"`
 	Choices         []sseChatChoice          `json:"choices"`
 	ProtocolVersion int                      `json:"x_gemini_protocol_version"`
-	Reasoning       map[string]any           `json:"x_gemini_reasoning,omitempty"`
 	ActionStatus    map[string]any           `json:"x_gemini_action_status,omitempty"`
 	Media           []map[string]any         `json:"x_gemini_media,omitempty"`
 	Citations       []gemini.GroundingSource `json:"x_gemini_citations,omitempty"`
@@ -107,87 +104,6 @@ func buildMediaExtensionPayload(images []gemini.GeneratedImage, videos []gemini.
 	return items
 }
 
-// buildActionStatusPayload projects one upstream action card into the
-// x_gemini_action_status contract. It only relays values that came from the
-// wire: progress_detail is the thinking/tool title and provider/status_template
-// are the tool id and logo template. No title or icon is synthesized.
-func buildActionStatusPayload(operationID string, a *gemini.ActionStatus) map[string]any {
-	if a == nil {
-		return nil
-	}
-	sourceType := "thinking_progress"
-	phase := "thinking"
-	progress := strings.TrimSpace(a.ThinkingTitle)
-	if strings.Contains(progress, "{tool_logo_placeholder}") || strings.Contains(progress, "{tool_name_placeholder}") {
-		progress = ""
-	}
-	toolProgress := strings.TrimSpace(a.ToolTitle)
-	if toolProgress == "" {
-		toolProgress = stripToolLogoPlaceholder(a.BranchTitle)
-	}
-	switch a.ToolID {
-	case "web_search":
-		sourceType = "web_search"
-		phase = "searching"
-		if progress == "" {
-			progress = toolProgress
-		}
-	case "image_generation", "video_generation", "music_gen":
-		sourceType = "tool_progress"
-		phase = "generating_media"
-		if toolProgress != "" {
-			progress = toolProgress
-		}
-	default:
-		if progress == "" {
-			sourceType = "tool_progress"
-			progress = toolProgress
-		}
-	}
-	template := strings.TrimSpace(a.StatusTemplate)
-	if strings.Contains(template, "{tool_name_placeholder}") {
-		template = strings.TrimSpace(strings.ReplaceAll(template, "{tool_name_placeholder}", strings.TrimSpace(a.ToolTitle)))
-	}
-	if !strings.Contains(template, "{tool_logo_placeholder}") {
-		template = ""
-	}
-	if progress == "" && template == "" && phase != "generating_media" {
-		return nil
-	}
-	// A tool/thinking card is a progress observation, not the generation's
-	// terminal signal. The web client keeps the turn active after a tool card
-	// completes, and clients treat a terminal frame as final for the whole
-	// operation, so these cards are always non-terminal.
-	state := "active"
-	terminal := false
-	leaseSeconds := 300
-	if phase == "generating_media" {
-		leaseSeconds = 1020
-	}
-	payload := map[string]any{
-		"operation_id":       operationID + ":generation",
-		"type":               "generation",
-		"source_type":        sourceType,
-		"state":              state,
-		"phase":              phase,
-		"text":               progress,
-		"progress_detail":    progress,
-		"terminal":           terminal,
-		"lease_seconds":      leaseSeconds,
-		"turn_admitted":      false,
-		"artifacts_expected": 0,
-		"artifacts_ready":    0,
-		"artifacts_failed":   0,
-	}
-	if a.ToolID != "" {
-		payload["provider"] = a.ToolID
-	}
-	if template != "" {
-		payload["status_template"] = template
-	}
-	return payload
-}
-
 func stripToolLogoPlaceholder(s string) string {
 	s = strings.ReplaceAll(s, "{tool_logo_placeholder}", "")
 	s = strings.ReplaceAll(s, "{tool_name_placeholder}", "")
@@ -237,172 +153,23 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		return
 	}
 
-	accts := prep.accts
-	account := prep.account
-	model := prep.model
-	mid := prep.mid
-	requested := prep.requested
-	effortStr := prep.effortStr
-	hasTools := prep.hasTools
 	toolsRaw = prep.toolsRaw
-	stream := prep.stream
-	buffered := prep.buffered
-	opts := prep.opts
-	fullPrompt := prep.fullPrompt
-	curPrompt := prep.curPrompt
-	flattenStats := prep.flattenStats
-	overflowParts := prep.overflowParts
-	imageParts := prep.imageParts
-	fullAttachmentParts := prep.fullAttachmentParts
-	attachmentParts := prep.attachmentParts
-	hasher := prep.hasher
-	cacheKey := prep.cacheKey
-	cacheUsed := cacheKey != ""
 	cmplID := "chatcmpl-" + randomHex(8)
 	created := time.Now().Unix()
-	eagerStream := strings.EqualFold(s.Cfg.StreamBufferMode, "eager")
 
-	headersSent := false
-	// handlerDone is set before the handler returns. Keepalive and early-SSE
-	// goroutines outlive the handler, and net/http nils the response writer once
-	// the handler returns; writing or flushing past that point dereferences a nil
-	// bufio.Writer and crashes the whole daemon.
-	var handlerDone atomic.Bool
-	var ttftMs atomic.Int64
-	var headerMs, identityMs atomic.Int64
-	var firstReasoningMs, firstContentMs, firstToolMs atomic.Int64
-	var uploadMs, accountSwitches atomic.Int64
-	ttftMs.Store(-1)
-	headerMs.Store(-1)
-	identityMs.Store(-1)
-	firstReasoningMs.Store(-1)
-	firstContentMs.Store(-1)
-	firstToolMs.Store(-1)
-	curAttempt := 0
-	lastUpstreamStatus := 0
-	lastRetryReason := ""
-	var streamMu sync.Mutex
-	flusher, _ := w.(http.Flusher)
-	reasoningOpen := false
-	reasoningDeltas := 0
-	reasoningText := ""
-
-	writeExtensionLocked := func(ext sseExtensionChunk) {
-		if ctx.Err() != nil || handlerDone.Load() {
-			return
-		}
-		b, err := json.Marshal(&ext)
-		if err != nil {
-			return
-		}
-		_, _ = w.Write([]byte("data: "))
-		_, _ = w.Write(b)
-		_, _ = w.Write([]byte("\n\n"))
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-	closeReasoningLocked := func() {
-		if !reasoningOpen {
-			return
-		}
-		reasoningOpen = false
-		writeExtensionLocked(sseExtensionChunk{
-			Object:          "chat.completion.chunk",
-			Choices:         []sseChatChoice{},
-			ProtocolVersion: 3,
-			Reasoning: map[string]any{
-				"id":          "rs_0",
-				"index":       0,
-				"status":      "completed",
-				"event":       "done",
-				"text":        reasoningText,
-				"delta_count": reasoningDeltas,
-			},
-		})
-	}
-	closeReasoningIfStarted := func() {
-		streamMu.Lock()
-		if headersSent {
-			closeReasoningLocked()
-		}
-		streamMu.Unlock()
-	}
-
-	// markPhase records a phase timestamp once, in milliseconds from request
-	// start. A value stays -1 until that phase is actually observed.
-	markPhase := func(target *atomic.Int64) {
-		target.CompareAndSwap(-1, time.Since(reqStartedAt).Milliseconds())
-	}
-	// markMeaningfulOutput records the first client-visible model output and
-	// derives ttft_ms from the same event.
-	markMeaningfulOutput := func(target *atomic.Int64) {
-		markPhase(target)
-		markPhase(&ttftMs)
-	}
-	// assignAccount counts an account switch only when failover moves the request
-	// to a different account. Same-account retries leave the counter untouched.
-	assignAccount := func(next *AccountState) {
-		if next != nil && next != account {
-			accountSwitches.Add(1)
-		}
-		account = next
-	}
+	g := newGenerationSession(s, ctx, w, prep, messages, toolsRaw, toolChoiceRaw, cmplID, "/v1/chat/completions", reqStartedAt, prepareMs)
+	defer g.close()
 
 	var writeBuf []byte
-	emit := func(delta any, finish any, usage map[string]any) {
-		if ctx.Err() != nil {
+	emitLocked := func(delta any, finish any, usage map[string]any) {
+		if g.ctx.Err() != nil || g.handlerDone.Load() {
 			return
-		}
-		// Only non-empty reasoning, non-empty content, and non-empty tool_calls
-		// count as output. Role-only deltas, model metadata, keepalive pings, and
-		// finish chunks must not move the first-output timestamps.
-		switch d := delta.(type) {
-		case sseDeltaReasoning:
-			if d.ReasoningContent != "" {
-				markMeaningfulOutput(&firstReasoningMs)
-			}
-		case sseDeltaContent:
-			if d.Content != "" {
-				markMeaningfulOutput(&firstContentMs)
-			}
-		case map[string]any:
-			if hasToolCallDelta(d) {
-				markMeaningfulOutput(&firstToolMs)
-			}
-		}
-		streamMu.Lock()
-		defer streamMu.Unlock()
-		if handlerDone.Load() {
-			return
-		}
-		if r, ok := delta.(sseDeltaReasoning); ok && r.ReasoningContent != "" {
-			if !reasoningOpen {
-				reasoningOpen = true
-				reasoningDeltas = 0
-				reasoningText = ""
-				writeExtensionLocked(sseExtensionChunk{
-					Object:          "chat.completion.chunk",
-					Choices:         []sseChatChoice{},
-					ProtocolVersion: 3,
-					Reasoning: map[string]any{
-						"id":     "rs_0",
-						"index":  0,
-						"status": "in_progress",
-						"event":  "start",
-					},
-				})
-			}
-		} else if c, ok := delta.(sseDeltaContent); ok && c.Content != "" {
-			closeReasoningLocked()
-		} else if m, ok := delta.(map[string]any); ok && hasToolCallDelta(m) {
-			closeReasoningLocked()
 		}
 		chunk := sseChatChunk{
 			ID:      cmplID,
 			Object:  "chat.completion.chunk",
 			Created: created,
-			Model:   mid,
+			Model:   g.mid,
 			Choices: [1]sseChatChoice{
 				{
 					Index:        0,
@@ -417,49 +184,58 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 		writeBuf = append(writeBuf, b...)
 		writeBuf = append(writeBuf, "\n\n"...)
 		_, _ = w.Write(writeBuf)
-		if flusher != nil {
-			flusher.Flush()
+		if g.flusher != nil {
+			g.flusher.Flush()
 		}
-		if r, ok := delta.(sseDeltaReasoning); ok && r.ReasoningContent != "" {
-			reasoningText += r.ReasoningContent
-			reasoningDeltas++
-			writeExtensionLocked(sseExtensionChunk{
-				Object:          "chat.completion.chunk",
-				Choices:         []sseChatChoice{},
-				ProtocolVersion: 3,
-				Reasoning: map[string]any{
-					"id":     "rs_0",
-					"index":  0,
-					"status": "in_progress",
-					"event":  "delta",
-					"delta":  r.ReasoningContent,
-				},
-			})
+	}
+	emit := func(delta any, finish any, usage map[string]any) {
+		if g.ctx.Err() != nil {
+			return
+		}
+		// Only non-empty reasoning, non-empty content, and non-empty tool_calls
+		// count as output. Role-only deltas, model metadata, keepalive pings, and
+		// finish chunks must not move the first-output timestamps.
+		switch d := delta.(type) {
+		case sseDeltaReasoning:
+			if d.ReasoningContent != "" {
+				g.markMeaningfulOutput(&g.firstReasoningMs)
+			}
+		case sseDeltaContent:
+			if d.Content != "" {
+				g.markMeaningfulOutput(&g.firstContentMs)
+			}
+		case map[string]any:
+			if hasToolCallDelta(d) {
+				g.markMeaningfulOutput(&g.firstToolMs)
+			}
+		}
+		g.streamMu.Lock()
+		emitLocked(delta, finish, usage)
+		g.streamMu.Unlock()
+	}
+	writeExtensionLocked := func(ext sseExtensionChunk) {
+		if g.ctx.Err() != nil || g.handlerDone.Load() {
+			return
+		}
+		b, err := json.Marshal(&ext)
+		if err != nil {
+			return
+		}
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+		if g.flusher != nil {
+			g.flusher.Flush()
 		}
 	}
 
-	var pendingAction *gemini.ActionStatus
-	actionSeq := 0
-	lastActionSig := ""
-	emitActionStatus := func(a *gemini.ActionStatus) {
-		payload := buildActionStatusPayload(cmplID, a)
-		if payload == nil {
-			return
-		}
-		sigBytes, _ := json.Marshal(payload)
-		sig := string(sigBytes)
-		streamMu.Lock()
-		defer streamMu.Unlock()
-		if !headersSent {
-			pendingAction = a
-			return
-		}
-		if sig == lastActionSig {
-			return
-		}
-		lastActionSig = sig
-		actionSeq++
-		payload["sequence"] = actionSeq
+	g.onStreamCommittedLocked = func() {
+		emitLocked(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+	}
+	g.onKeepalive = func() {
+		emit(map[string]any{"role": "assistant"}, nil, nil)
+	}
+	g.emitActionLocked = func(payload map[string]any) {
 		writeExtensionLocked(sseExtensionChunk{
 			Object:          "chat.completion.chunk",
 			Choices:         []sseChatChoice{},
@@ -467,851 +243,224 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			ActionStatus:    payload,
 		})
 	}
-	sentCitationKeys := make(map[string]bool)
-	emitCitations := func(sources []gemini.GroundingSource) {
-		if len(sources) == 0 {
-			return
-		}
-		withIDs := gemini.GroundingCitationsWithIDs(sources)
-		streamMu.Lock()
-		defer streamMu.Unlock()
-		if !headersSent {
-			return
-		}
-		var unseen []gemini.GroundingSource
-		for _, src := range withIDs {
-			if src.URL == "" && src.Title == "" {
-				continue
-			}
-			key := strconv.Itoa(src.ID) + "\x00" + src.URL + "\x00" + src.Title + "\x00" + src.MimeType
-			if sentCitationKeys[key] {
-				continue
-			}
-			sentCitationKeys[key] = true
-			unseen = append(unseen, src)
-		}
-		if len(unseen) == 0 {
-			return
-		}
+	g.emitCitationsLocked = func(items []gemini.GroundingSource) {
 		writeExtensionLocked(sseExtensionChunk{
 			Object:          "chat.completion.chunk",
 			Choices:         []sseChatChoice{},
 			ProtocolVersion: 3,
-			Citations:       unseen,
+			Citations:       items,
 		})
 	}
 
-	var pinger *streamPinger
-	var pingerMu sync.Mutex
-	stopKeepalive := func() {
-		pingerMu.Lock()
-		p := pinger
-		pinger = nil
-		pingerMu.Unlock()
-		p.Stop()
-	}
-	defer stopKeepalive()
-	// Defers run LIFO, so handlerDone runs before stopKeepalive and
-	// closeReasoningIfStarted runs before handlerDone.
-	defer handlerDone.Store(true)
-	defer closeReasoningIfStarted()
-
-	// streamStarted closes as soon as the response headers are flushed, so the
-	// grace timer below does not keep a goroutine alive after streaming begins.
-	streamStarted := make(chan struct{})
-	var streamStartedOnce sync.Once
-	markStreamStarted := func() { streamStartedOnce.Do(func() { close(streamStarted) }) }
-
-	startStreamWith := func(early bool, attempt, upstreamStatus int, retryReason string) {
-		streamMu.Lock()
-		if headersSent || ctx.Err() != nil || handlerDone.Load() {
-			streamMu.Unlock()
-			return
-		}
-		setGSBHeaders(w, false, account.ID, mid, attempt, upstreamStatus, retryReason)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(200)
-		headersSent = true
-		markStreamStarted()
-		// header_ms is the actual response header commit, independent of any
-		// early flush or first meaningful delta.
-		markPhase(&headerMs)
-		_, _ = io.WriteString(w, ": ping\n\n")
-		if flusher != nil {
-			flusher.Flush()
-		}
-		streamMu.Unlock()
-
-		pingerMu.Lock()
-		if pinger == nil && !handlerDone.Load() {
-			pinger = startStreamPinger(&streamMu, w, flusher, defaultKeepaliveInterval, func() {
-				emit(map[string]any{"role": "assistant"}, nil, nil)
-			})
-		}
-		pingerMu.Unlock()
-
-		emit(map[string]any{"role": "assistant", "content": ""}, nil, nil)
-		streamMu.Lock()
-		pa := pendingAction
-		pendingAction = nil
-		streamMu.Unlock()
-		if pa != nil {
-			emitActionStatus(pa)
-		}
-	}
-
-	// startStream reads the caller-owned attempt diagnostics, so it must only be
-	// called from the request goroutine.
-	startStream := func(early bool) {
-		startStreamWith(early, curAttempt, lastUpstreamStatus, lastRetryReason)
-	}
-
-	if stream && s.Cfg.EarlySSE && (eagerStream || !s.Cfg.RejectDowngrade) {
-		startStream(false)
-	} else if stream && buffered && s.Cfg.EarlySSEGrace > 0 {
-		// Buffered mode normally holds the response headers until the first frame
-		// so a detected model downgrade can still become an HTTP error. That only
-		// works while the upstream answers inside the proxy's response-header
-		// timeout: a thinking-heavy model can sit for minutes, and the client
-		// abandons the request with "timeout awaiting response headers" while gsb
-		// is still waiting. Flush headers once the grace period elapses and keep
-		// the remaining downgrade check on the stream body instead — the body
-		// check is strictly stronger than the status-line one, because a
-		// downgrade detected there still stops the stream and the client sees the
-		// mismatch in the frames.
-		go func() {
-			timer := time.NewTimer(s.Cfg.EarlySSEGrace)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-				// No upstream call has completed yet, so attempt/status/retry are
-				// unknown here; pass -1 to omit them instead of reading variables owned
-				// by the request goroutine.
-				startStreamWith(true, -1, 0, "")
-			case <-ctx.Done():
-			case <-streamStarted:
-			}
-		}()
-	}
-
-	account.mu.RLock()
-	originGroup := account.AccountGroup
-	account.mu.RUnlock()
-
-	maxAttempts := s.Cfg.MaxAttempts
-	if maxAttempts < 1 {
-		maxAttempts = 1
-	}
-	maxUpstream := s.Cfg.MaxUpstreamAttempts
-	if maxUpstream < 1 {
-		maxUpstream = maxAttempts
-	}
-	upstreamCalls := 0
-	var retryDeadline time.Time
-	if s.Cfg.RetryBudget > 0 {
-		retryDeadline = reqStartedAt.Add(s.Cfg.RetryBudget)
-	}
-
-	triedAccounts := map[string]bool{account.ID: true}
-	freshSocketNext := false
-	rebootstrapNext := false
-	priorAttemptSentThought := false
-	serverMediaRounds := 0
-	var skillTurn skillTurnState
-	sendPrompt := curPrompt
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		curAttempt = attempt
-		var (
-			candidateID           string
-			selected              bool
-			done                  bool
-			text, thoughts        string
-			sentText, sentThought string
-			servedID, servedLabel string
-			identityConflict      bool
-			mediaToolUsed         bool
-			lastImages            []gemini.GeneratedImage
-			lastVideos            []gemini.GeneratedVideo
-			lastCID, lastRID      string
-			lastContextToken      string
-			grounding             []gemini.GroundingSource
-		)
-		observeIdentity := func(ansID, ansLabel string) {
-			if ansID == "" {
-				return
-			}
-			if servedID != "" && servedID != ansID {
-				identityConflict = true
-			}
-			servedID = ansID
-			if ansLabel != "" {
-				servedLabel = ansLabel
-			}
-		}
-
-		attemptStartedAt := time.Now()
-		lastActiveKeepaliveAt := attemptStartedAt
+	g.startEarlyOrGrace()
+	for attempt := 0; attempt < g.maxAttempts; attempt++ {
+		g.curAttempt = attempt
+		as := &attemptState{startedAt: time.Now()}
+		lastActiveKeepaliveAt := as.startedAt
 		var toolStreamer *toolbridge.LiveToolCallStreamer
 		preambleFlushed := false
-		if stream && buffered && hasTools && s.Cfg.LiveToolCalls {
-			toolStreamer = toolbridge.NewLiveToolCallStreamer(toolsRaw, toolChoiceRaw, func(d map[string]any) {
-				startStream(false)
+		if g.stream && g.buffered && g.hasTools && s.Cfg.LiveToolCalls {
+			toolStreamer = toolbridge.NewLiveToolCallStreamer(g.toolsRaw, g.toolChoiceRaw, func(d map[string]any) {
+				g.startStream()
 				if !preambleFlushed {
 					preambleFlushed = true
-					if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
+					if pre := toolbridge.ExtractPreToolPreamble(as.text); pre != "" {
 						if s.Cfg.KeepToolPreamble {
-							if tail, ok := remainingStreamTail(pre, sentText); ok && tail != "" {
+							if tail, ok := remainingStreamTail(pre, as.sentText); ok && tail != "" {
 								emit(sseDeltaContent{Content: tail}, nil, nil)
-								sentText = pre
+								as.sentText = pre
 							}
 						} else if s.Cfg.LiveThoughts {
-							thoughts = appendPreambleToThoughts(thoughts, pre)
+							as.thoughts = appendPreambleToThoughts(as.thoughts, pre)
 						}
 					}
 				}
-				if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
-					emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
-					sentThought = thoughts
+				if s.Cfg.LiveThoughts && !g.priorAttemptSentThought && len(as.thoughts) > len(as.sentThought) && strings.HasPrefix(as.thoughts, as.sentThought) {
+					emit(sseDeltaReasoning{ReasoningContent: as.thoughts[len(as.sentThought):]}, nil, nil)
+					as.sentThought = as.thoughts
 				}
 				emit(d, nil, nil)
 				lastActiveKeepaliveAt = time.Now()
 			})
 		}
 
-		var attemptStateMu sync.Mutex
-		c := s.clientFor(account)
-		opts.FreshSocket = freshSocketNext
-		if rebootstrapNext {
-			_ = c.Bootstrap(ctx)
-			skillTurn.invalidate()
-		}
-		freshSocketNext = false
-		rebootstrapNext = false
-
-		uploadStartedAt := time.Now()
-		files, uploadErr := s.uploadAttachments(ctx, account.ID, c, attachmentParts)
-		uploadMs.Add(time.Since(uploadStartedAt).Milliseconds())
-		if len(files) > 0 {
-			opts.Files = files
-		}
-
-		var upstream *gemini.StreamResponse
-		var streamErr error
-		if uploadErr != nil {
-			streamErr = uploadErr
-		} else {
-			sendPrompt = skillTurn.prepare(ctx, s, scope, account, &opts, curPrompt)
-			upstreamCalls++
-			account.mu.Lock()
-			account.activeStreams++
-			account.mu.Unlock()
-			upstream, streamErr = c.StreamGenerateLive(ctx, sendPrompt, opts, func(update *gemini.LineParseResult) error {
-				attemptStateMu.Lock()
-				if update.MediaToolActive {
-					mediaToolUsed = true
+		c := s.clientFor(g.account)
+		upstream, streamErr := g.runUpstreamAttempt(c, scope, as, toolStreamer, nil, func(frameDone bool) error {
+			if g.stream && !g.buffered && ctx.Err() == nil {
+				tail, textOK := remainingStreamTail(as.text, as.sentText)
+				if !textOK || (s.Cfg.LiveThoughts && !strings.HasPrefix(as.thoughts, as.sentThought)) {
+					return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 				}
-				if mediaToolUsed {
-					servedID = model.ModelID
-					servedLabel = model.ModelName
-					identityConflict = false
-				} else {
-					observeIdentity(update.AnsweredModelID, update.AnsweredModelLabel)
+				wantThought := s.Cfg.LiveThoughts && !g.priorAttemptSentThought && len(as.thoughts) > len(as.sentThought)
+				if tail != "" || wantThought {
+					g.startStream()
+					g.emitCitations(as.grounding)
+					if tail != "" {
+						emit(sseDeltaContent{Content: tail}, nil, nil)
+						as.sentText = as.text
+					}
+					if wantThought {
+						emit(sseDeltaReasoning{ReasoningContent: as.thoughts[len(as.sentThought):]}, nil, nil)
+						as.sentThought = as.thoughts
+					}
+				} else if as.text != as.sentText {
+					as.sentText = as.text
 				}
-				if servedID != "" {
-					markPhase(&identityMs)
+			} else if g.stream && g.buffered && ctx.Err() == nil && !frameDone {
+				if as.sentText != "" && !hasCompatibleStreamPrefix(as.text, as.sentText) {
+					return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
 				}
-				earlyMismatch := !mediaToolUsed && s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
-				identityVerifiedNow := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
-				attemptStateMu.Unlock()
-				if earlyMismatch {
-					return transport.ErrStopStreaming
+				identityVerified := canStreamVerified(g.eagerStream, s.Cfg.RejectDowngrade, as.identityConflict, *g.model, as.servedID, as.servedLabel)
+				if identityVerified {
+					g.startStream()
+					g.emitCitations(as.grounding)
 				}
-				if stream && buffered && ctx.Err() == nil && identityVerifiedNow {
-					startStream(false)
-				}
-				if update.Action != nil {
-					emitActionStatus(update.Action)
-				}
-
-				if update.CID != "" {
-					lastCID = update.CID
-				}
-				if update.RID != "" {
-					lastRID = update.RID
-				}
-				if update.ContextToken != "" {
-					lastContextToken = update.ContextToken
-				}
-				grounding = gemini.MergeGroundingSources(grounding, update.GroundingSources)
-				if stream && !buffered {
-					emitCitations(grounding)
-				}
-				for _, frame := range update.Frames {
-					if !selected {
-						candidateID = frame.RCID
-						selected = true
-					} else if frame.RCID != candidateID {
-						if len(frame.GeneratedVideos) > 0 && len(lastVideos) == 0 && text == "" && sentText == "" {
-							candidateID = frame.RCID
-						} else {
-							continue
+				if identityVerified && s.Cfg.LiveThoughts {
+					if g.hasTools && !s.Cfg.KeepToolPreamble && as.sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) {
+						if pre := toolbridge.ExtractPreToolPreamble(as.text); pre != "" {
+							as.thoughts = appendPreambleToThoughts(as.thoughts, pre)
 						}
 					}
-					attemptStateMu.Lock()
-					s.rewriteFrameMedia(ctx, account.ID, &frame)
-					if len(frame.GeneratedImages) > 0 || len(frame.GeneratedVideos) > 0 {
-						mediaToolUsed = true
-						if len(frame.GeneratedImages) > 0 {
-							lastImages = frame.GeneratedImages
-						}
-						if len(frame.GeneratedVideos) > 0 {
-							lastVideos = frame.GeneratedVideos
-						}
-					}
-					if mediaToolUsed {
-						servedID = model.ModelID
-						servedLabel = model.ModelName
-						identityConflict = false
-					} else {
-						observeIdentity(frame.AnsweredModelID, frame.AnsweredModelLabel)
-					}
-					if servedID != "" {
-						markPhase(&identityMs)
-					}
-					if frame.Text != "" || text == "" {
-						if !shouldPreserveTextOnErrorFrame(text, frame.Text, sentText, hasTools, toolsRaw, toolChoiceRaw, toolStreamer) {
-							text = frame.Text
-						}
-					}
-					thoughts = mergeStreamedThoughts(thoughts, frame.Thoughts)
-					done = frame.Done
-					if done && !scope.StructuredMedia {
-						text = gemini.AppendGeneratedMediaMarkdown(text, lastImages, lastVideos)
-					}
-					frameMismatch := s.Cfg.RejectDowngrade && (servedID != "" || servedLabel != "") && !gemini.IsMatchingServedModel(*model, servedID, servedLabel)
-					attemptStateMu.Unlock()
-					if frameMismatch {
-						return transport.ErrStopStreaming
-					}
-					if stream && !buffered && ctx.Err() == nil {
-						tail, textOK := remainingStreamTail(text, sentText)
-						if !textOK || (s.Cfg.LiveThoughts && !strings.HasPrefix(thoughts, sentThought)) {
-							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
-						}
-						if tail != "" || (s.Cfg.LiveThoughts && len(thoughts) > len(sentThought)) {
-							startStream(false)
-							emitCitations(grounding)
-							if tail != "" {
-								emit(sseDeltaContent{Content: tail}, nil, nil)
-								sentText = text
-							}
-							if s.Cfg.LiveThoughts && len(thoughts) > len(sentThought) {
-								emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
-								sentThought = thoughts
-							}
-						} else if text != sentText {
-							sentText = text
-						}
-					} else if stream && buffered && ctx.Err() == nil && !done {
-						if sentText != "" && !hasCompatibleStreamPrefix(text, sentText) {
-							return transport.NewUpstreamError("upstream revised an already streamed answer", 502, "upstream_revision", nil, nil)
-						}
-						// Hold all model output until the requested identity is verified.
-						identityVerified := canStreamVerified(eagerStream, s.Cfg.RejectDowngrade, identityConflict, *model, servedID, servedLabel)
-						if identityVerified {
-							startStream(false)
-							emitCitations(grounding)
-						}
-						if identityVerified && s.Cfg.LiveThoughts {
-							if hasTools && !s.Cfg.KeepToolPreamble && sentText == "" && (toolStreamer == nil || !toolStreamer.SentAny()) {
-								if pre := toolbridge.ExtractPreToolPreamble(text); pre != "" {
-									thoughts = appendPreambleToThoughts(thoughts, pre)
-								}
-							}
-							if !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
-								startStream(false)
-								emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
-								sentThought = thoughts
-								lastActiveKeepaliveAt = time.Now()
-							} else if servedID != "" && time.Since(attemptStartedAt) >= 5*time.Second {
-								startStream(false)
-								if time.Since(lastActiveKeepaliveAt) >= 5*time.Second {
-									emit(map[string]any{"role": "assistant"}, nil, nil)
-									lastActiveKeepaliveAt = time.Now()
-								}
-							}
-						}
-						if identityVerified && toolStreamer != nil {
-							if err := toolStreamer.PushError(text); err != nil {
-								return err
-							}
-						}
-						canStreamText := identityVerified
-						if canStreamText {
-							if !hasTools && !mediaToolUsed && len(text) > 240 && gemini.GeminiErrorReply(text) == "" {
-								if tail, ok := remainingStreamTail(text, sentText); ok && tail != "" {
-									startStream(false)
-									emit(sseDeltaContent{Content: tail}, nil, nil)
-									sentText = text
-									lastActiveKeepaliveAt = time.Now()
-								}
-							} else if hasTools && !mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(text) > 240 {
-								if safePrefix := toolbridge.SafeStreamablePrefix(text); len(safePrefix) > len(sentText) && strings.HasPrefix(safePrefix, sentText) && gemini.GeminiErrorReply(text[:240]) == "" {
-									startStream(false)
-									emit(sseDeltaContent{Content: safePrefix[len(sentText):]}, nil, nil)
-									sentText = safePrefix
-									lastActiveKeepaliveAt = time.Now()
-								}
-							}
+					if !g.priorAttemptSentThought && len(as.thoughts) > len(as.sentThought) && strings.HasPrefix(as.thoughts, as.sentThought) {
+						g.startStream()
+						emit(sseDeltaReasoning{ReasoningContent: as.thoughts[len(as.sentThought):]}, nil, nil)
+						as.sentThought = as.thoughts
+						lastActiveKeepaliveAt = time.Now()
+					} else if as.servedID != "" && time.Since(as.startedAt) >= 5*time.Second {
+						g.startStream()
+						if time.Since(lastActiveKeepaliveAt) >= 5*time.Second {
+							emit(map[string]any{"role": "assistant"}, nil, nil)
+							lastActiveKeepaliveAt = time.Now()
 						}
 					}
 				}
-				return nil
-			})
-			account.mu.Lock()
-			if account.activeStreams > 0 {
-				account.activeStreams--
+				if identityVerified && toolStreamer != nil {
+					if err := toolStreamer.PushError(as.text); err != nil {
+						return err
+					}
+				}
+				if identityVerified {
+					if !g.hasTools && !as.mediaToolUsed && len(as.text) > 240 && gemini.GeminiErrorReply(as.text) == "" {
+						if tail, ok := remainingStreamTail(as.text, as.sentText); ok && tail != "" {
+							g.startStream()
+							emit(sseDeltaContent{Content: tail}, nil, nil)
+							as.sentText = as.text
+							lastActiveKeepaliveAt = time.Now()
+						}
+					} else if g.hasTools && !as.mediaToolUsed && (toolStreamer == nil || !toolStreamer.SentAny()) && len(as.text) > 240 {
+						if safePrefix := toolbridge.SafeStreamablePrefix(as.text); len(safePrefix) > len(as.sentText) && strings.HasPrefix(safePrefix, as.sentText) && safeErrorReplyPrefix(as.text) == "" {
+							g.startStream()
+							emit(sseDeltaContent{Content: safePrefix[len(as.sentText):]}, nil, nil)
+							as.sentText = safePrefix
+							lastActiveKeepaliveAt = time.Now()
+						}
+					}
+				}
 			}
-			account.mu.Unlock()
-		}
-		if upstream != nil && upstream.Status > 0 {
-			lastUpstreamStatus = upstream.Status
-		}
-		if upstream != nil {
-			grounding = gemini.MergeGroundingSources(grounding, upstream.GroundingSources)
-		}
+			return nil
+		})
 
 		interpreted, runCheck := s.evaluateAttemptCompletion(
 			ctx,
-			account,
-			*model,
-			mid,
+			g.account,
+			*g.model,
+			g.mid,
 			upstream,
 			streamErr,
-			selected,
-			done,
-			text,
-			sentText,
-			len(lastImages) > 0 || len(lastVideos) > 0,
-			servedID,
-			servedLabel,
-			identityConflict,
-			hasTools,
-			toolsRaw,
-			toolChoiceRaw,
+			as.selected,
+			as.done,
+			as.text,
+			as.sentText,
+			len(as.lastImages) > 0 || len(as.lastVideos) > 0,
+			as.servedID,
+			as.servedLabel,
+			as.identityConflict,
+			g.hasTools,
+			g.toolsRaw,
+			g.toolChoiceRaw,
 		)
 
 		if runCheck != nil {
-			var ue *transport.UpstreamError
-			errors.As(runCheck, &ue)
-			errCode := ""
-			errStatus := 502
-			if ue != nil {
-				errCode = ue.Code
-				errStatus = ue.StatusCode
-				if lastUpstreamStatus == 0 && errStatus > 0 {
-					lastUpstreamStatus = errStatus
-				}
+			payloadCommitted := as.sentText != "" || (toolStreamer != nil && toolStreamer.SentAny()) || as.mediaToolUsed
+			if g.handleAttemptFailure(c, scope, as, runCheck, payloadCommitted) {
+				continue
 			}
-			if errCode == "account_banned" {
-				s.markAccountQuarantined(account, runCheck.Error())
-			} else if errCode != "session_busy" && errCode != "client_cancelled" && errCode != "upstream_error_reply" && errCode != "tool_call_error" && errCode != "model_label_mismatch" {
-				s.markAccountFailure(account, runCheck.Error())
-				if errCode != "empty_upstream_response" {
-					s.refreshQuotaAsync(account, c)
-				}
-			}
-			if cacheKey != "" && len(opts.Metadata) > 0 && !mediaToolUsed && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
-				s.deleteSessionCache(cacheKey)
-				s.deleteSessionBinding(prep.sessionBindingKey)
-				cacheKey = ""
-			}
-
-			// Content, tool-call deltas, or started media tools already commit the
-			// upstream turn; retrying into a new conversation would duplicate it.
-			payloadCommitted := func() bool {
-				return sentText != "" || (toolStreamer != nil && toolStreamer.SentAny()) || mediaToolUsed
-			}
-			responseCommitted := func() bool {
-				streamMu.Lock()
-				headers := headersSent
-				streamMu.Unlock()
-				return headers || payloadCommitted() || sentThought != ""
-			}
-			inStreamRetryable := (errCode == "tool_call_error" ||
-				errCode == "upstream_error_reply" ||
-				errCode == "empty_upstream_response" ||
-				errCode == "incomplete_upstream_response" ||
-				(scope.AccountID == "" && (errCode == "model_substitution" ||
-					errStatus == 429 ||
-					errCode == "rate_limit_error" ||
-					errCode == "session_busy" ||
-					errCode == "upstream_auth_error" ||
-					errCode == "auth_redirect" ||
-					errCode == "upstream_connect_timeout" ||
-					errCode == "upstream_stalled" ||
-					errCode == "upstream_timeout" ||
-					errCode == "upstream_degraded" ||
-					errCode == "model_identity_unknown" ||
-					errCode == "model_identity_conflict"))) && !payloadCommitted()
-			canRetryMore := attempt+1 < maxAttempts && upstreamCalls < maxUpstream &&
-				(retryDeadline.IsZero() || time.Now().Before(retryDeadline)) &&
-				(!responseCommitted() || inStreamRetryable) && ctx.Err() == nil &&
-				errCode != "account_banned"
-			if canRetryMore {
-				if sentThought != "" {
-					priorAttemptSentThought = true
-				}
-				if errCode == "session_busy" {
-					lastRetryReason = "session_busy"
-					if scope.AccountID == "" {
-						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
-							opts.Metadata = nil
-							opts.Files = nil
-							curPrompt = fullPrompt
-							attachmentParts = fullAttachmentParts
-							continue
-						}
-					}
-					waitDur := parseRetryAfterDuration(ue, 2*time.Second, retryDeadline)
-					if waitDur > 0 {
-						select {
-						case <-time.After(waitDur):
-						case <-ctx.Done():
-						}
-					}
-					if ctx.Err() == nil {
-						continue
-					}
-				}
-				if errCode == "model_substitution" || errStatus == 429 || errCode == "rate_limit_error" {
-					lastRetryReason = errCode
-					if lastRetryReason == "" {
-						lastRetryReason = "rate_limit_error"
-					}
-					// Switching accounts is a pool-only operation and can only happen
-					// before any response bytes commit the current attempt.
-					if scope.AccountID == "" {
-						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
-							opts.Metadata = nil
-							opts.Files = nil
-							curPrompt = fullPrompt
-							attachmentParts = fullAttachmentParts
-							continue
-						}
-					}
-				}
-				if errStatus == 401 || errCode == "upstream_auth_error" || errCode == "auth_redirect" {
-					lastRetryReason = errCode
-					c.InvalidateAuth()
-					switched := false
-					if scope.AccountID == "" {
-						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
-							opts.Metadata = nil
-							opts.Files = nil
-							curPrompt = fullPrompt
-							attachmentParts = fullAttachmentParts
-							switched = true
-						}
-					}
-					if !switched {
-						freshSocketNext = true
-						rebootstrapNext = true
-					}
-					continue
-				}
-				if errCode == "upstream_connect_timeout" ||
-					errCode == "upstream_stalled" ||
-					errCode == "upstream_timeout" {
-					lastRetryReason = errCode
-					if scope.AccountID == "" {
-						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
-							opts.Metadata = nil
-							opts.Files = nil
-							curPrompt = fullPrompt
-							attachmentParts = fullAttachmentParts
-							continue
-						}
-					}
-				}
-				if errCode == "upstream_degraded" {
-					// Gemini Web failed the turn on its side while the account still
-					// has quota. Prefer a different account; if the request is pinned
-					// or the pool is spent, retry once on a fresh socket.
-					lastRetryReason = errCode
-					if scope.AccountID == "" {
-						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
-							opts.Metadata = nil
-							opts.Files = nil
-							curPrompt = fullPrompt
-							attachmentParts = fullAttachmentParts
-							continue
-						}
-					}
-					freshSocketNext = true
-					rebootstrapNext = true
-					opts.Metadata = nil
-					opts.Files = nil
-					curPrompt = fullPrompt
-					attachmentParts = fullAttachmentParts
-					continue
-				}
-				if errCode == "model_identity_unknown" || errCode == "model_identity_conflict" {
-					lastRetryReason = errCode
-					if scope.AccountID == "" {
-						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
-							opts.Metadata = nil
-							opts.Files = nil
-							curPrompt = fullPrompt
-							attachmentParts = fullAttachmentParts
-							continue
-						}
-					}
-				}
-				if errCode == "upstream_transport_error" ||
-					errCode == "upstream_error" ||
-					errCode == "incomplete_upstream_response" ||
-					errCode == "tool_call_error" {
-					lastRetryReason = errCode
-					if errCode != "tool_call_error" {
-						freshSocketNext = true
-						rebootstrapNext = true
-					}
-					opts.Metadata = nil
-					opts.Files = nil
-					curPrompt = fullPrompt
-					if errCode == "tool_call_error" {
-						curPrompt = appendToolErrorCorrection(fullPrompt, runCheck.Error())
-					}
-					attachmentParts = fullAttachmentParts
-					continue
-				}
-				if errCode == "upstream_error_reply" {
-					// §11.6: Soft block: at most 1 retry on the SAME account without failover or GetQuota
-					if attempt == 0 {
-						lastRetryReason = errCode
-						freshSocketNext = true
-						rebootstrapNext = true
-						opts.Metadata = nil
-						opts.Files = nil
-						select {
-						case <-time.After(100 * time.Millisecond):
-						case <-ctx.Done():
-						}
-						if len(fullPrompt) > 120000 {
-							if compacted, extraOverflow, cErr := prompt.FlattenMessages(messages, toolsRaw, toolChoiceRaw, prompt.FlattenOptions{
-								StartIndex:      0,
-								MaxPromptChars:  100000,
-								MaxOldToolChars: 12000,
-								AllowOverflow:   s.Cfg.HistoryOffload,
-							}); cErr == nil {
-								curPrompt = appendErrorReplyRecoveryNote(compacted, hasTools)
-								attachmentParts = make([]prompt.AttachmentPart, 0, len(extraOverflow)+len(imageParts))
-								attachmentParts = append(attachmentParts, extraOverflow...)
-								attachmentParts = append(attachmentParts, imageParts...)
-								continue
-							}
-						}
-						curPrompt = appendErrorReplyRecoveryNote(fullPrompt, hasTools)
-						attachmentParts = fullAttachmentParts
-						continue
-					}
-				}
-				if errCode == "empty_upstream_response" {
-					lastRetryReason = errCode
-					wasCachedContinuation := len(opts.Metadata) > 0
-					opts.Metadata = nil
-					opts.Files = nil
-					switched := false
-					if !wasCachedContinuation && scope.AccountID == "" {
-						if nextAcct, nextModel := s.pickFallbackAccount(accts, triedAccounts, originGroup, requested, hasher); nextAcct != nil && nextModel != nil {
-							triedAccounts[nextAcct.ID] = true
-							assignAccount(nextAcct)
-							model = nextModel
-							opts.Model = nextModel
-							switched = true
-						}
-					}
-					if !switched {
-						freshSocketNext = true
-						rebootstrapNext = true
-					}
-					curPrompt = fullPrompt
-					attachmentParts = fullAttachmentParts
-					continue
-				}
-			}
-
-			stopKeepalive()
-			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
-			totalMs := time.Since(reqStartedAt).Milliseconds()
-			s.logRequestJSON(map[string]any{
-				"req_id":             cmplID,
-				"endpoint":           "/v1/chat/completions",
-				"model":              mid,
-				"account":            account.ID,
-				"effort":             effortStr,
-				"prompt_bytes":       len(sendPrompt),
-				"header_bytes":       flattenStats.HeaderBytes,
-				"body_bytes":         flattenStats.BodyBytes,
-				"footer_bytes":       flattenStats.FooterBytes,
-				"tool_bytes":         flattenStats.ToolSchemaBytes,
-				"ttft_ms":            ttftMs.Load(),
-				"total_ms":           totalMs,
-				"status":             errStatus,
-				"error_code":         errCode,
-				"cached_tokens":      0,
-				"attempts":           curAttempt + 1,
-				"prepare_ms":         prepareMs,
-				"cache_hit":          cacheUsed,
-				"cache_prefix_split": prep.cacheSplit,
-				"upload_ms":          uploadMs.Load(),
-				"identity_ms":        identityMs.Load(),
-				"header_ms":          headerMs.Load(),
-				"first_reasoning_ms": firstReasoningMs.Load(),
-				"first_content_ms":   firstContentMs.Load(),
-				"first_tool_ms":      firstToolMs.Load(),
-				"done_ms":            totalMs,
-				"account_switches":   accountSwitches.Load(),
-				"requested_model":    mid,
-				"served_model":       servedID,
-				"served_label":       servedLabel,
-				"label_mismatch":     gemini.ServedLabelMismatch(*model, servedID, servedLabel),
-			})
 			if ctx.Err() == nil {
-				closeReasoningIfStarted()
-				sendChatError(w, headersSent, runCheck)
+				sendChatError(w, g.headersCommitted(), runCheck)
 			}
 			return
 		}
-
 		// Success!
-		var calls []toolbridge.Call
-		if interpreted != nil {
-			calls = interpreted.Calls
+		calls, retryMedia := g.resolveMediaContinuation(scope, interpreted, as)
+		if retryMedia {
+			attempt--
+			continue
 		}
-		if hasServerSideMediaCalls(calls) && serverMediaRounds < 2 {
-			mediaStart := time.Now()
-			promptAdd, clientCalls, _ := s.executeServerSideMediaCalls(ctx, accts, scope, account, model, calls)
-			if !retryDeadline.IsZero() {
-				retryDeadline = retryDeadline.Add(time.Since(mediaStart))
-			}
-			if len(clientCalls) == 0 {
-				fullPrompt = fullPrompt + promptAdd
-				curPrompt = fullPrompt
-				opts.Metadata = nil
-				serverMediaRounds++
-				attempt--
-				if upstreamCalls > 0 {
-					upstreamCalls--
-				}
-				continue
-			}
-			calls = clientCalls
-		} else if hasTools && len(calls) == 0 && (len(lastImages) > 0 || len(lastVideos) > 0) && serverMediaRounds < 2 && sentText == "" {
-			if promptAdd := formatDirectMediaToolContinuation(lastImages, lastVideos); promptAdd != "" {
-				fullPrompt = fullPrompt + promptAdd
-				curPrompt = fullPrompt
-				opts.Metadata = nil
-				serverMediaRounds++
-				attempt--
-				if upstreamCalls > 0 {
-					upstreamCalls--
-				}
-				continue
-			}
-		}
+
 		var oaCalls []toolbridge.OpenAIToolCall
 		finish := "stop"
-		var content any = text
+		var content any = as.text
 		if len(calls) > 0 {
 			finish = "tool_calls"
-			if (s.Cfg.KeepToolPreamble || sentText != "") && interpreted.Text != "" {
+			if (s.Cfg.KeepToolPreamble || as.sentText != "") && interpreted.Text != "" {
 				content = interpreted.Text
 			} else {
 				if s.Cfg.LiveThoughts && interpreted != nil && strings.TrimSpace(interpreted.Text) != "" {
-					thoughts = appendPreambleToThoughts(thoughts, interpreted.Text)
+					as.thoughts = appendPreambleToThoughts(as.thoughts, interpreted.Text)
 				}
 				content = nil
 			}
-		} else if sentText == "" && thoughts != "" {
-			content = stripLeakedThoughtsFromContent(text, thoughts)
+		} else if as.sentText == "" && as.thoughts != "" {
+			content = stripLeakedThoughtsFromContent(as.text, as.thoughts)
 		}
 		// Web-search citations are appended to the answer so the client sees the
 		// sources the model actually used, in the order Google returned them.
-		if s.Cfg.IncludeGrounding && len(grounding) > 0 {
+		if s.Cfg.IncludeGrounding && len(as.grounding) > 0 {
 			if textStr, ok := content.(string); ok {
-				content = appendGroundingCitations(textStr, grounding)
+				content = appendGroundingCitations(textStr, as.grounding)
 			}
 		}
 		// A relabel is not a substitution: the backend id still names the slot the
 		// client asked for, so the request succeeds, but the label that came back
 		// named a different tier. Reporting it keeps the difference visible
 		// instead of letting "gemini-carbon" silently answer as "4 Argon".
-		labelMismatch := gemini.ServedLabelMismatch(*model, servedID, servedLabel)
+		labelMismatch := gemini.ServedLabelMismatch(*g.model, as.servedID, as.servedLabel)
 		var served map[string]any
-		if servedID != "" {
-			served = map[string]any{"id": servedID, "label": servedLabel}
+		if as.servedID != "" {
+			served = map[string]any{"id": as.servedID, "label": as.servedLabel}
 			if labelMismatch {
 				served["label_mismatch"] = true
 			}
 		}
 
-		usage := s.computeChatUsage(fullPrompt, curPrompt, overflowParts, messages, toolsRaw, toolChoiceRaw, text, thoughts)
-		s.clearModelExhausted(account, model.ModelName)
-		stopKeepalive()
+		usage := s.computeChatUsage(g.fullPrompt, g.curPrompt, g.overflowParts, messages, g.toolsRaw, g.toolChoiceRaw, as.text, as.thoughts)
+		s.clearModelExhausted(g.account, g.model.ModelName)
+		g.stopKeepalive()
 		if ctx.Err() != nil {
 			return
 		}
 
 		if len(calls) > 0 {
-			if stream && buffered {
-				startStream(false)
+			if g.stream && g.buffered {
+				g.startStream()
 				if toolStreamer == nil || !toolStreamer.SentAny() {
-					if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) && strings.HasPrefix(thoughts, sentThought) {
-						emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
-						sentThought = thoughts
+					if s.Cfg.LiveThoughts && !g.priorAttemptSentThought && len(as.thoughts) > len(as.sentThought) && strings.HasPrefix(as.thoughts, as.sentThought) {
+						emit(sseDeltaReasoning{ReasoningContent: as.thoughts[len(as.sentThought):]}, nil, nil)
+						as.sentThought = as.thoughts
 					}
 					if contentStr, ok := content.(string); ok {
-						if tail, ok := remainingStreamTail(contentStr, sentText); ok && tail != "" {
+						if tail, ok := remainingStreamTail(contentStr, as.sentText); ok && tail != "" {
 							emit(sseDeltaContent{Content: tail}, nil, nil)
-							sentText = contentStr
+							as.sentText = contentStr
 						}
 					}
 				}
 				if toolStreamer != nil {
 					var finalizeErr error
-					oaCalls, finalizeErr = toolStreamer.FinalizeError(calls, text)
+					oaCalls, finalizeErr = toolStreamer.FinalizeError(calls, as.text)
 					if finalizeErr != nil {
 						if ctx.Err() == nil {
-							closeReasoningIfStarted()
-							sendChatError(w, headersSent, finalizeErr)
+							sendChatError(w, g.headersCommitted(), finalizeErr)
 						}
 						return
 					}
@@ -1326,62 +475,58 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 			}
 		}
 
-		if !opts.Temporary {
-			s.saveSessionContinuation(account.ID, mid, messages, toolsRaw, toolChoiceRaw, content, oaCalls, lastCID, lastRID, candidateID, lastContextToken, prep.sessionBindingKey)
+		if !g.opts.Temporary {
+			s.saveSessionContinuation(g.account.ID, g.mid, messages, g.toolsRaw, g.toolChoiceRaw, content, oaCalls, as.lastCID, as.lastRID, as.candidateID, as.lastContextToken, g.prep.sessionBindingKey)
 		}
 
-		if stream {
-			startStream(false)
-			if buffered && len(calls) == 0 {
-				if s.Cfg.LiveThoughts && !priorAttemptSentThought && len(thoughts) > len(sentThought) {
-					emit(sseDeltaReasoning{ReasoningContent: thoughts[len(sentThought):]}, nil, nil)
-					sentThought = thoughts
+		if g.stream {
+			g.startStream()
+			if g.buffered && len(calls) == 0 {
+				if s.Cfg.LiveThoughts && !g.priorAttemptSentThought && len(as.thoughts) > len(as.sentThought) {
+					emit(sseDeltaReasoning{ReasoningContent: as.thoughts[len(as.sentThought):]}, nil, nil)
+					as.sentThought = as.thoughts
 				}
 			}
 			if len(calls) == 0 {
-				emitCitations(grounding)
-				// The citations are part of the answer, so whatever has not been
-				// streamed yet (the answer tail in eager mode, the citation list
-				// in both modes) is emitted here.
+				g.emitCitations(as.grounding)
 				if contentStr, ok := content.(string); ok {
-					if tail, ok := remainingStreamTail(contentStr, sentText); ok && tail != "" {
+					if tail, ok := remainingStreamTail(contentStr, as.sentText); ok && tail != "" {
 						emit(sseDeltaContent{Content: tail}, nil, nil)
-						sentText = contentStr
+						as.sentText = contentStr
 					}
 				}
 			}
-			closeReasoningIfStarted()
 			var mediaPayload []map[string]any
 			if len(calls) == 0 {
-				mediaPayload = buildMediaExtensionPayload(lastImages, lastVideos)
+				mediaPayload = buildMediaExtensionPayload(as.lastImages, as.lastVideos)
 			}
 			if len(mediaPayload) > 0 {
-				streamMu.Lock()
+				g.streamMu.Lock()
 				writeExtensionLocked(sseExtensionChunk{
 					Object:          "chat.completion.chunk",
 					Choices:         []sseChatChoice{},
 					ProtocolVersion: 3,
 					Media:           mediaPayload,
 				})
-				streamMu.Unlock()
+				g.streamMu.Unlock()
 			}
-			if served != nil && (servedID != model.ModelID || labelMismatch) {
+			if served != nil && (as.servedID != g.model.ModelID || labelMismatch) {
 				emit(map[string]any{"model_served": served}, nil, nil)
 			}
 			emit(sseDeltaEmpty{}, finish, usage)
-			streamMu.Lock()
+			g.streamMu.Lock()
 			_, _ = io.WriteString(w, "data: [DONE]\n\n")
-			if flusher != nil {
-				flusher.Flush()
+			if g.flusher != nil {
+				g.flusher.Flush()
 			}
-			streamMu.Unlock()
+			g.streamMu.Unlock()
 		} else {
 			msgObj := map[string]any{
 				"role":    "assistant",
 				"content": content,
 			}
-			if s.Cfg.LiveThoughts && thoughts != "" {
-				msgObj["reasoning_content"] = thoughts
+			if s.Cfg.LiveThoughts && as.thoughts != "" {
+				msgObj["reasoning_content"] = as.thoughts
 			}
 			if len(oaCalls) > 0 {
 				msgObj["tool_calls"] = oaCalls
@@ -1390,7 +535,7 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"id":      cmplID,
 				"object":  "chat.completion",
 				"created": created,
-				"model":   mid,
+				"model":   g.mid,
 				"choices": []map[string]any{
 					{
 						"index":         0,
@@ -1401,66 +546,23 @@ func (s *Server) HandleChat(ctx context.Context, w http.ResponseWriter, body map
 				"usage": usage,
 			}
 			if len(calls) == 0 {
-				if mediaPayload := buildMediaExtensionPayload(lastImages, lastVideos); len(mediaPayload) > 0 {
+				if mediaPayload := buildMediaExtensionPayload(as.lastImages, as.lastVideos); len(mediaPayload) > 0 {
 					payload["x_gemini_media"] = mediaPayload
 				}
-				if citPayload := gemini.GroundingCitationsWithIDs(grounding); len(citPayload) > 0 {
+				if citPayload := gemini.GroundingCitationsWithIDs(as.grounding); len(citPayload) > 0 {
 					payload["x_gemini_citations"] = citPayload
 				}
 			}
-			if served != nil && (servedID != model.ModelID || labelMismatch) {
-				payload["requested_model"] = mid
+			if served != nil && (as.servedID != g.model.ModelID || labelMismatch) {
+				payload["requested_model"] = g.mid
 				payload["model_served"] = served
 			}
-			setGSBHeaders(w, headersSent, account.ID, mid, curAttempt, lastUpstreamStatus, lastRetryReason)
-			markPhase(&headerMs)
+			setGSBHeaders(w, g.headersCommitted(), g.account.ID, g.mid, g.curAttempt, g.lastUpstreamStatus, g.lastRetryReason)
+			g.markPhase(&g.headerMs)
 			sendJSON(w, 200, payload, nil)
 		}
 
-		cachedTok := 0
-		if d, ok := usage["prompt_tokens_details"].(map[string]any); ok {
-			cachedTok, _ = d["cached_tokens"].(int)
-		}
-		totalMs := time.Since(reqStartedAt).Milliseconds()
-		s.logRequestJSON(map[string]any{
-			"req_id":             cmplID,
-			"endpoint":           "/v1/chat/completions",
-			"model":              mid,
-			"account":            account.ID,
-			"effort":             effortStr,
-			"prompt_bytes":       len(sendPrompt),
-			"header_bytes":       flattenStats.HeaderBytes,
-			"body_bytes":         flattenStats.BodyBytes,
-			"footer_bytes":       flattenStats.FooterBytes,
-			"tool_bytes":         flattenStats.ToolSchemaBytes,
-			"ttft_ms":            ttftMs.Load(),
-			"total_ms":           totalMs,
-			"status":             200,
-			"error_code":         "",
-			"cached_tokens":      cachedTok,
-			"attempts":           curAttempt + 1,
-			"prepare_ms":         prepareMs,
-			"cache_hit":          cacheUsed,
-			"cache_prefix_split": prep.cacheSplit,
-			"upload_ms":          uploadMs.Load(),
-			"identity_ms":        identityMs.Load(),
-			"header_ms":          headerMs.Load(),
-			"first_reasoning_ms": firstReasoningMs.Load(),
-			"first_content_ms":   firstContentMs.Load(),
-			"first_tool_ms":      firstToolMs.Load(),
-			"done_ms":            totalMs,
-			"account_switches":   accountSwitches.Load(),
-			"requested_model":    mid,
-			"served_model":       servedID,
-			"served_label":       servedLabel,
-			"label_mismatch":     labelMismatch,
-		})
-
-		account.mu.Lock()
-		account.Fails = 0
-		account.LastUsed = s.now()
-		account.mu.Unlock()
-		s.refreshQuotaAsync(account, c)
+		g.finishSuccess(c, usage, as.servedID, as.servedLabel)
 		return
 	}
 }

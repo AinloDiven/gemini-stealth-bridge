@@ -552,3 +552,76 @@ func TestCitationsExtensionAndSourcesFiltering(t *testing.T) {
 	}
 }
 
+func TestResponsesEmitsActionStatusAndCitations(t *testing.T) {
+	sources := []gemini.GroundingSource{{URL: "https://example.com/ref", Title: "Ref Doc"}}
+	client := &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(update *gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c1", RID: "r1",
+				Action: &gemini.ActionStatus{
+					ToolID:         "skills",
+					ToolTitle:      "Skill",
+					StatusTemplate: "{tool_logo_placeholder} Skills: Research",
+				},
+			})
+			_ = onFrame(&gemini.LineParseResult{
+				CID: "c1", RID: "r1", AnsweredModelID: testModel.ModelID,
+				Action:           &gemini.ActionStatus{ThinkingTitle: "Checking sources"},
+				GroundingSources: sources,
+				Frames: []gemini.Frame{{
+					RCID: "rc1", Text: "Answer [cite: 1]", Done: true,
+					AnsweredModelID: testModel.ModelID, GroundingSources: sources,
+				}},
+			})
+			return &gemini.StreamResponse{Status: 200, GroundingSources: sources}, nil
+		},
+	}
+	srv := mcpTestServer(t, client)
+	srv.Cfg.IncludeGrounding = true
+
+	doResp := func(stream bool) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]any{
+			"model":  testModel.ModelName,
+			"stream": stream,
+			"input":  "search ref",
+		})
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(body)))
+		req.Header.Set("Authorization", "Bearer audit")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	recStream := doResp(true)
+	if recStream.Code != 200 {
+		t.Fatalf("expected 200 responses stream, got %d: %s", recStream.Code, recStream.Body.String())
+	}
+	sb := recStream.Body.String()
+	for _, want := range []string{
+		"event: response.x_gemini_action_status",
+		`"provider":"skills"`,
+		`"progress_detail":"Checking sources"`,
+		"event: response.x_gemini_citations",
+		`"title":"Ref Doc"`,
+	} {
+		if !strings.Contains(sb, want) {
+			t.Fatalf("expected %s in /v1/responses SSE, got:\n%s", want, sb)
+		}
+	}
+	if strings.Index(sb, `"provider":"skills"`) >= strings.Index(sb, `"progress_detail":"Checking sources"`) {
+		t.Fatalf("expected queued skills status before checking sources in /v1/responses SSE:\n%s", sb)
+	}
+
+	recJSON := doResp(false)
+	if recJSON.Code != 200 {
+		t.Fatalf("expected 200 responses JSON, got %d: %s", recJSON.Code, recJSON.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(recJSON.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	cits, ok := payload["x_gemini_citations"].([]any)
+	if !ok || len(cits) != 1 {
+		t.Fatalf("expected 1 x_gemini_citations entry in /v1/responses JSON, got %#v", payload["x_gemini_citations"])
+	}
+}
