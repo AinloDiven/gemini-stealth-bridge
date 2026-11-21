@@ -279,7 +279,7 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 		filesSlot = fArr
 	}
 
-	inner := make([]any, 82)
+	inner := make([]any, 81)
 	inner[0] = []any{prompt, 0, nil, filesSlot, nil, nil, 0}
 	inner[1] = []string{lang}
 	inner[2] = meta
@@ -332,7 +332,7 @@ func (ac *AccountClient) BuildInnerRequest(prompt string, opts StreamOptions) (i
 	}
 	inner[80] = thinkLvl
 	if opts.SkillRuntime != "" {
-		inner[81] = []any{opts.SkillRuntime}
+		inner = append(inner, []any{opts.SkillRuntime})
 	}
 
 	uuidVal = strings.ToUpper(uuid.NewString())

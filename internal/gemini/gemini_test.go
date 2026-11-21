@@ -834,3 +834,31 @@ func TestParseActionStatusAndAsyncVideoPoll(t *testing.T) {
 	}
 }
 
+func TestNextReqIDWrapsAndNormalizesOversizedDiskCounter(t *testing.T) {
+	ac := NewAccountClient("acct", "SID=v", "", nil, nil)
+	ac.reqCounter.Store(maxReqID - 50000)
+	got := ac.nextReqID()
+	if got < 100000 || got >= 200000 || got%100000 != 50000 {
+		t.Fatalf("expected wrapped _reqid keeping 5-digit offset 50000, got %d", got)
+	}
+
+	path := t.TempDir() + "/acct.json"
+	if _, err := cookies.SaveCredentialFile(path, cookies.CredentialFile{
+		Kind:      "gemini-web",
+		Name:      "acct",
+		Cookies:   "SID=v",
+		FSid:      "fsid-1",
+		LastReqID: 658952334,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadAccountFromFile(path, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur := loaded.reqCounter.Load(); cur < 100000 || cur >= maxReqID {
+		t.Fatalf("expected oversized persisted LastReqID to reset within [100000, %d), got %d", maxReqID, cur)
+	}
+}
+
+

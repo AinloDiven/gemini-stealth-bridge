@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/azrinaldi/gemini-stealth-bridge/internal/gemini"
+	"github.com/azrinaldi/gemini-stealth-bridge/internal/transport"
 )
 
 func recordingSessionClient(prompts *[]string, metas *[][]any) *mockUpstream {
@@ -291,3 +292,64 @@ func TestPoolKeySessionBindingSurvivesPoolGrowthAndLeavesRotateCursorIntact(t *t
 		t.Fatalf("expected deleted account bindings purged: code=%d len=%d", delRec.Code, srv.sessionBindingLen())
 	}
 }
+
+func TestSessionBindingEvictsOnStallAndSilentPostGraceCancel(t *testing.T) {
+	srv, acct := newTestHarness(false, true)
+	srv.Cfg.EarlySSEGrace = 15 * time.Millisecond
+	srv.Cfg.MaxAttempts = 1
+
+	var turn int
+	acct.Client = &mockUpstream{
+		streamFn: func(ctx context.Context, prompt string, opts gemini.StreamOptions, onFrame func(*gemini.LineParseResult) error) (*gemini.StreamResponse, error) {
+			turn++
+			switch turn {
+			case 1:
+				_ = onFrame(&gemini.LineParseResult{
+					CID: "c_hang", RID: "r_1", ContextToken: "ctx_1",
+					AnsweredModelID: testModel.ModelID, AnsweredModelLabel: testModel.DisplayName,
+					Frames: []gemini.Frame{{RCID: "rc_1", Text: "ok", Done: true}},
+				})
+				return &gemini.StreamResponse{Status: 200, CID: "c_hang", RID: "r_1"}, nil
+			case 2:
+				return nil, transport.NewUpstreamError("request cancelled", 499, "client_cancelled", nil, context.Canceled)
+			case 3:
+				time.Sleep(35 * time.Millisecond)
+				return nil, transport.NewUpstreamError("request cancelled", 499, "client_cancelled", nil, context.Canceled)
+			default:
+				return nil, transport.NewUpstreamError("upstream produced no data", 504, "upstream_stalled", nil, nil)
+			}
+		},
+	}
+
+	send := func(msg string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"model":%q,"stream":true,"messages":[{"role":"user","content":%q}]}`, testModel.ModelName, msg)))
+		req.Header.Set("X-GSB-Session", "hang-sess")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Turn 1 establishes binding.
+	if rec := send("hello"); rec.Code != 200 || srv.sessionBindingLen() != 1 {
+		t.Fatalf("turn 1 failed: code=%d bindings=%d", rec.Code, srv.sessionBindingLen())
+	}
+	// Turn 2: immediate pre-grace client cancel keeps the binding intact.
+	send("fast cancel")
+	if srv.sessionBindingLen() != 1 {
+		t.Fatalf("expected pre-grace cancel to preserve binding, got %d", srv.sessionBindingLen())
+	}
+	// Turn 3: silent hang past EarlySSEGrace followed by client cancel evicts stale binding.
+	send("silent post-grace cancel")
+	if srv.sessionBindingLen() != 0 {
+		t.Fatalf("expected silent post-grace cancel to evict binding, got %d", srv.sessionBindingLen())
+	}
+	// Re-establish binding and verify upstream_stalled evicts it too.
+	turn = 0
+	send("rebind")
+	turn = 3
+	send("stalled")
+	if srv.sessionBindingLen() != 0 {
+		t.Fatalf("expected upstream_stalled to evict binding, got %d", srv.sessionBindingLen())
+	}
+}
+

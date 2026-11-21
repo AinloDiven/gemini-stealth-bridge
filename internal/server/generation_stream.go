@@ -613,7 +613,17 @@ func (g *generationSession) handleAttemptFailure(
 			g.s.refreshQuotaAsync(g.account, c)
 		}
 	}
-	if g.cacheKey != "" && len(g.opts.Metadata) > 0 && !as.mediaToolUsed && (errCode == "empty_upstream_response" || errCode == "incomplete_upstream_response" || errCode == "upstream_error_reply" || errCode == "upstream_error" || errCode == "tool_call_error" || (errCode == "upstream_http_error" && errStatus >= 400)) {
+	silentPostGraceCancel := errCode == "client_cancelled" && g.headersCommitted() && as.servedID == "" && as.text == "" && as.thoughts == ""
+	if g.cacheKey != "" && len(g.opts.Metadata) > 0 && !as.mediaToolUsed && (errCode == "empty_upstream_response" ||
+		errCode == "incomplete_upstream_response" ||
+		errCode == "upstream_error_reply" ||
+		errCode == "upstream_error" ||
+		errCode == "tool_call_error" ||
+		errCode == "upstream_stalled" ||
+		errCode == "upstream_timeout" ||
+		errCode == "upstream_connect_timeout" ||
+		silentPostGraceCancel ||
+		(errCode == "upstream_http_error" && errStatus >= 400)) {
 		g.s.deleteSessionCache(g.cacheKey)
 		g.s.deleteSessionBinding(g.prep.sessionBindingKey)
 		g.cacheKey = ""

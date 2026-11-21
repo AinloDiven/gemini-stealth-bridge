@@ -28,8 +28,8 @@ func TestBuildInnerRequestArmsSkillSlot81(t *testing.T) {
 	if err := json.Unmarshal([]byte(empty), &plain); err != nil {
 		t.Fatal(err)
 	}
-	if plain[81] != nil {
-		t.Fatalf("expected empty slot 81 without a skill, got %#v", plain[81])
+	if len(plain) != 81 {
+		t.Fatalf("expected 81 inner slots without a skill, got %d", len(plain))
 	}
 }
 

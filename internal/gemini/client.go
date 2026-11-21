@@ -164,7 +164,7 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 			ac.surfaces[k] = v
 		}
 	}
-	if rec.FSid != "" && rec.LastReqID >= 100000 {
+	if rec.FSid != "" && rec.LastReqID >= 100000 && rec.LastReqID < maxReqID {
 		ac.reqCounter.Store(rec.LastReqID)
 	}
 	return ac, nil
@@ -1213,8 +1213,19 @@ func normalizeRFC3339(raw string) string {
 	return raw
 }
 
+const maxReqID int64 = 9_900_000
+
 func (ac *AccountClient) nextReqID() int64 {
-	return ac.reqCounter.Add(100000)
+	for {
+		cur := ac.reqCounter.Load()
+		next := cur + 100000
+		if next >= maxReqID {
+			next = 100000 + next%100000
+		}
+		if ac.reqCounter.CompareAndSwap(cur, next) {
+			return next
+		}
+	}
 }
 
 var skillHandleRe = regexp.MustCompile(`^[0-9a-fA-F-]{20,40}$`)
