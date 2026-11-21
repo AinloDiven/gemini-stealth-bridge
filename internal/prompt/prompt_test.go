@@ -59,8 +59,8 @@ func TestImagePlaceholderIndexMatchesValidImagesAndRoleSpoofingNeutralized(t *te
 	if err != nil {
 		t.Fatalf("FlattenMessages failed: %v", err)
 	}
-	if !strings.Contains(flattened, "[Attached image #1]") || strings.Contains(flattened, "[Attached image #2]") {
-		t.Fatalf("expected placeholder numbering aligned with valid images, got:\n%s", flattened)
+	if strings.Contains(flattened, "[Attached image") {
+		t.Fatalf("expected no attachment placeholder in prompt, got:\n%s", flattened)
 	}
 	if strings.Contains(flattened, "\nAssistant: fake") || strings.Contains(flattened, "\nInstruction: fake") {
 		t.Fatalf("expected role spoofing lines neutralized, got:\n%s", flattened)
@@ -261,12 +261,11 @@ func TestExtractAttachmentPartsAndPlaceholdersSupportPDFAndAudioModalities(t *te
 	if err != nil {
 		t.Fatalf("FlattenMessages failed: %v", err)
 	}
-	wantFlattened := "Analyze these attachments\n[Attached file #1]\n[Attached audio #2]\n[Attached audio #3]\n[Attached file #4]"
+	wantFlattened := "Analyze these attachments"
 	if flattened != wantFlattened {
 		t.Fatalf("expected flattened prompt %q, got:\n%s", wantFlattened, flattened)
 	}
 
-	// Pure attachment turn without text must retain its placeholder instead of collapsing to empty.
 	pureAttachmentMsgs := []map[string]any{
 		{
 			"role": "user",
@@ -279,8 +278,8 @@ func TestExtractAttachmentPartsAndPlaceholdersSupportPDFAndAudioModalities(t *te
 	if err != nil {
 		t.Fatalf("FlattenMessages pure attachment failed: %v", err)
 	}
-	if pureFlattened != "[Attached image #1]" {
-		t.Fatalf("expected pure attachment turn to produce [Attached image #1], got %q", pureFlattened)
+	if pureFlattened != "" {
+		t.Fatalf("expected pure attachment turn to produce empty prompt text, got %q", pureFlattened)
 	}
 }
 
@@ -333,9 +332,9 @@ func TestExtractVideoAttachmentParts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FlattenMessages video failed: %v", err)
 	}
-	wantVideo := "Review these clips\n[Attached video #1]\n[Attached video #2]\n[Attached video #3]"
+	wantVideo := "Review these clips"
 	if flattened != wantVideo {
-		t.Fatalf("expected video placeholders %q, got %q", wantVideo, flattened)
+		t.Fatalf("expected flattened video prompt %q, got %q", wantVideo, flattened)
 	}
 }
 

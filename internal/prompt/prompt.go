@@ -549,10 +549,9 @@ func FlattenMessagesWithStats(
 	opts FlattenOptions,
 ) (string, []AttachmentPart, FlattenStats, error) {
 	var (
-		sys          []string
-		turns        []turnEntry
-		callNames    = make(map[string]string)
-		imageCounter int
+		sys       []string
+		turns     []turnEntry
+		callNames = make(map[string]string)
 	)
 
 	for _, m := range messages {
@@ -600,7 +599,7 @@ func FlattenMessagesWithStats(
 			if name == "" {
 				name = "tool"
 			}
-			text := spoofedRoleLineRe.ReplaceAllString(contentToText(m["content"], &imageCounter), "$1 :")
+			text := spoofedRoleLineRe.ReplaceAllString(contentToText(m["content"]), "$1 :")
 			idSuffix := ""
 			if tcID != "" {
 				idSuffix = fmt.Sprintf(" (%s)", tcID)
@@ -614,7 +613,7 @@ func FlattenMessagesWithStats(
 			continue
 		}
 
-		text := contentToText(m["content"], &imageCounter)
+		text := contentToText(m["content"])
 		if role != "assistant" && role != "system" && role != "developer" {
 			text = spoofedRoleLineRe.ReplaceAllString(text, "$1 :")
 		}
@@ -1225,21 +1224,7 @@ func normalizeMessageForHash(m map[string]any) any {
 	return entry
 }
 
-func attachmentPlaceholder(mimeType string, n int) string {
-	m := strings.ToLower(strings.TrimSpace(mimeType))
-	switch {
-	case strings.HasPrefix(m, "image/"):
-		return fmt.Sprintf("[Attached image #%d]", n)
-	case strings.HasPrefix(m, "audio/"):
-		return fmt.Sprintf("[Attached audio #%d]", n)
-	case strings.HasPrefix(m, "video/"):
-		return fmt.Sprintf("[Attached video #%d]", n)
-	default:
-		return fmt.Sprintf("[Attached file #%d]", n)
-	}
-}
-
-func contentToText(content any, imageCounter *int) string {
+func contentToText(content any) string {
 	switch c := content.(type) {
 	case nil:
 		return ""
@@ -1255,9 +1240,6 @@ func contentToText(content any, imageCounter *int) string {
 			} else if m, ok := item.(map[string]any); ok && m != nil {
 				if t, ok := m["text"].(string); ok && t != "" {
 					parts = append(parts, t)
-				} else if att := extractSingleImagePart(m, *imageCounter); att != nil {
-					*imageCounter++
-					parts = append(parts, attachmentPlaceholder(att.ContentType, *imageCounter))
 				}
 			}
 		}

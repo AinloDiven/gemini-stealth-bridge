@@ -46,4 +46,4 @@ Emitted as `choices: []` SSE chunks (with `x_gemini_protocol_version: 3`) on `/v
 
 ## 4. Multimodal Input Attachments
 
-`ExtractImageParts` and `/v1/responses` normalize inline base64, `data:` URLs, and remote `http(s)` URLs for images, PDFs/documents (`file`/`input_file`/`document`), audio (`input_audio`/`audio`), and video (`video_url`/`input_video`/`video`), emitting `[Attached image|audio|video|file #N]` placeholders and advertising `capabilities.vision` / multimodal modalities in `/v1/models`.
+`ExtractImageParts` and `/v1/responses` normalize inline base64, `data:` URLs, and remote `http(s)` URLs for images, PDFs/documents (`file`/`input_file`/`document`), audio (`input_audio`/`audio`), and video (`video_url`/`input_video`/`video`), advertising `capabilities.vision` / multimodal modalities in `/v1/models`.
