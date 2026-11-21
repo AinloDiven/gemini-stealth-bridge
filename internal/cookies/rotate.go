@@ -55,12 +55,14 @@ func ClampRotateInterval(d, defaultDur time.Duration) time.Duration {
 type Rotator struct {
 	mu           sync.Mutex
 	lastPSIDTSAt map[string]time.Time
+	lastStatus   map[string]int
 }
 
 // NewRotator creates a new cookie Rotator with per-account rate-limit guards.
 func NewRotator() *Rotator {
 	return &Rotator{
 		lastPSIDTSAt: make(map[string]time.Time),
+		lastStatus:   make(map[string]int),
 	}
 }
 
@@ -79,6 +81,15 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 	rotatedAny := false
 	lastStatus := 0
 	nextInterval := defaultRotateInterval
+
+	if r.inRateLimitCooldown(accountID) {
+		return &RotateResult{
+			Status:       429,
+			Rotated:      false,
+			CookieHeader: cookie,
+			NextInterval: ClampRotateInterval(nextInterval, defaultRotateInterval),
+		}, nil
+	}
 
 	// Primary path: POST /RotateCookies with [000,"-0000000000000000000"] and full cookie jar.
 	// Renews both __Secure-1PSIDTS / __Secure-3PSIDTS and SIDCC / __Secure-*PSIDCC in a single call.
@@ -108,7 +119,7 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 					cookie = merged
 					rotatedAny = true
 				}
-				if res.Status == 200 && rotatedAny {
+				if (res.Status == 200 && rotatedAny) || res.Status == 401 || res.Status == 403 || res.Status == 429 {
 					return &RotateResult{
 						Status:       res.Status,
 						Rotated:      rotatedAny,
@@ -162,10 +173,13 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 					Timeout: 20 * time.Second,
 				})
 				if postErr == nil {
-					lastStatus = postRes.Status
 					if merged, changed := AbsorbSetCookie(cookie, postRes.SetCookies); changed {
 						cookie = merged
 						rotatedAny = true
+					}
+					if !(lastStatus == 200 && postRes.Status == 429) {
+						lastStatus = postRes.Status
+						r.note1PSIDTS(accountID, postRes.Status)
 					}
 				}
 			}
@@ -182,6 +196,16 @@ func (r *Rotator) RotateAccount(ctx context.Context, accountID string, currentCo
 	}, nil
 }
 
+func (r *Rotator) inRateLimitCooldown(accountID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	last, ok := r.lastPSIDTSAt[accountID]
+	if !ok || r.lastStatus[accountID] != 429 {
+		return false
+	}
+	return time.Since(last) < min1PSIDTSInterval
+}
+
 func (r *Rotator) allow1PSIDTS(accountID string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -196,6 +220,7 @@ func (r *Rotator) note1PSIDTS(accountID string, status int) {
 	if status == 200 || status == 401 || status == 403 || status == 429 {
 		r.mu.Lock()
 		r.lastPSIDTSAt[accountID] = time.Now()
+		r.lastStatus[accountID] = status
 		r.mu.Unlock()
 	}
 }

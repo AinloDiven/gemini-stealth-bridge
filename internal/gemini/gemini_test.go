@@ -10,6 +10,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -442,6 +443,56 @@ func TestBootstrapRotation429NotAuthError(t *testing.T) {
 	var ue *transport.UpstreamError
 	if !errors.As(err, &ue) || ue.StatusCode != 429 || ue.Code != "rate_limit_error" {
 		t.Fatalf("expected 429 rate_limit_error on rotation 429 during bootstrap, got %+v (%v)", ue, err)
+	}
+}
+
+func TestEnsureBootstrappedRevalidatesTokensViaBatchExec(t *testing.T) {
+	appCalls := 0
+	batchCalls := 0
+	doer := &stubGeminiDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			u := req.URL.String()
+			switch {
+			case strings.HasSuffix(u, "/app"):
+				appCalls++
+				return &fhttp.Response{
+					StatusCode: 302,
+					Header:     fhttp.Header{"Location": []string{"https://accounts.google.com/ServiceLogin?passive=1209600&osid=1"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			case strings.Contains(u, "batchexecute"):
+				batchCalls++
+				body := ")]}'\n\n" + `[["wrb.fr","otAQ7b","[1,null,false]"]]` + "\n"
+				return &fhttp.Response{
+					StatusCode: 200,
+					Header:     fhttp.Header{},
+					Body:       io.NopCloser(strings.NewReader(body)),
+				}, nil
+			default:
+				return &fhttp.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(""))}, nil
+			}
+		},
+	}
+	pool := transport.NewPool(transport.PoolOptions{
+		ClientConfig: transport.ClientConfig{CustomDoer: doer},
+		MaxSessions:  2,
+	})
+	ac := NewAccountClient("acct_revalidate", "SAPISID=sap1; __Secure-1PSID=p1; __Secure-1PSIDTS=ts1", "", pool, cookies.NewRotator())
+	ac.SetTokens("at_valid", "bl_valid", "fsid_1")
+	// Simulate xsrfTTL expiry while cached tokens remain valid.
+	ac.mu.Lock()
+	ac.bootstrappedAt = time.Now().Add(-2 * xsrfTTL)
+	ac.mu.Unlock()
+
+	sess, err := ac.acquireSession(context.Background())
+	if err != nil {
+		t.Fatalf("acquireSession: %v", err)
+	}
+	if err := ac.ensureBootstrapped(context.Background(), sess.Client); err != nil {
+		t.Fatalf("expected ensureBootstrapped to revalidate via otAQ7b without /app, got: %v", err)
+	}
+	if batchCalls != 1 || appCalls != 0 {
+		t.Fatalf("expected 1 otAQ7b probe and 0 /app calls, got batchCalls=%d appCalls=%d", batchCalls, appCalls)
 	}
 }
 

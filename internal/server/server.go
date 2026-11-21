@@ -1026,8 +1026,8 @@ func (s *Server) RunSchedulerStep(ctx context.Context, now time.Time) {
 				if res != nil && res.Rotated {
 					a.RotatedAt = now
 					// A rotation that produced fresh cookies proves the session is
-					// still renewable, so an expiry verdict recorded earlier is stale.
-					if looksLikeAuthFailure(a.LastError) {
+					// still renewable, so an expiry or rotation-limit verdict recorded earlier is stale.
+					if looksLikeAuthFailure(a.LastError) || isCookieRotationFailure(a.LastError) {
 						a.LastError = ""
 						a.LastFail = time.Time{}
 						a.Fails = 0

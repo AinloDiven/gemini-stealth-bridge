@@ -191,6 +191,10 @@ func looksLikeAuthFailure(msg string) bool {
 	return false
 }
 
+func isCookieRotationFailure(msg string) bool {
+	return strings.Contains(strings.ToLower(msg), "cookie rotation")
+}
+
 func truncateReason(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {

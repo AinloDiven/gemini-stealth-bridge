@@ -353,6 +353,11 @@ func (s *Server) RefreshAccount(ctx context.Context, a *AccountState, force bool
 	a.Capacity = am.Capacity
 	a.ModelsAt = time.Now()
 	a.ModelsError = nil
+	if looksLikeAuthFailure(a.LastError) || isCookieRotationFailure(a.LastError) {
+		a.LastError = ""
+		a.LastFail = time.Time{}
+		a.Fails = 0
+	}
 	a.mu.Unlock()
 	if len(quota) > 0 {
 		s.mergeAccountQuota(a, quota)

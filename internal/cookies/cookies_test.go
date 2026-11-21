@@ -118,6 +118,43 @@ func TestDualPathCookieRotator(t *testing.T) {
 	}
 }
 
+func TestRotatorStopsOn429AndHonorsCooldown(t *testing.T) {
+	calls := 0
+	doer := &stubCookieDoer{
+		fn: func(req *fhttp.Request) (*fhttp.Response, error) {
+			calls++
+			return &fhttp.Response{
+				StatusCode: 429,
+				Header:     fhttp.Header{},
+				Body:       io.NopCloser(strings.NewReader("rate limited")),
+			}, nil
+		},
+	}
+	sc, err := transport.NewStealthClient(transport.ClientConfig{CustomDoer: doer})
+	if err != nil {
+		t.Fatalf("NewStealthClient: %v", err)
+	}
+
+	rot := NewRotator()
+	initial := "SAPISID=sap; __Secure-1PSID=psid; __Secure-1PSIDTS=old_ts"
+	res1, err := rot.RotateAccount(context.Background(), "acct429", initial, sc)
+	if err != nil || res1 == nil || res1.Status != 429 || res1.Rotated {
+		t.Fatalf("expected 429 without rotation on call 1, got res=%+v err=%v", res1, err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected primary 429 to stop without hitting 658 fallback, got %d HTTP calls", calls)
+	}
+
+	// Second call within 60s cooldown must not hit /RotateCookies again.
+	res2, err := rot.RotateAccount(context.Background(), "acct429", initial, sc)
+	if err != nil || res2 == nil || res2.Status != 429 || res2.Rotated {
+		t.Fatalf("expected cooldown 429 on call 2, got res=%+v err=%v", res2, err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected cooldown to suppress extra HTTP calls, got %d", calls)
+	}
+}
+
 func TestSaveAndLoadAccountFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "acct.json")

@@ -96,7 +96,6 @@ type AccountClient struct {
 	profileID        string
 	tokenFetchedAt   string
 	tokenSource      string
-	fromDiskAT       bool
 	quarantined      bool
 	quarantineReason string
 	disabled         bool
@@ -164,9 +163,6 @@ func LoadAccountFromFile(path string, pool *transport.Pool, rotator *cookies.Rot
 		for k, v := range rec.Surfaces {
 			ac.surfaces[k] = v
 		}
-	}
-	if rec.AT != "" {
-		ac.fromDiskAT = true
 	}
 	if rec.FSid != "" && rec.LastReqID >= 100000 {
 		ac.reqCounter.Store(rec.LastReqID)
@@ -270,14 +266,14 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 		return false
 	}
 	ac.mu.Lock()
-	changed := rec.Cookies != ac.cookieHeader
+	cookieChanged := rec.Cookies != ac.cookieHeader
+	tokenChanged := rec.AT != "" && rec.AT != ac.at
 	ac.cookieHeader = rec.Cookies
 	if rec.Email != "" {
 		ac.email = rec.Email
 	}
 	if rec.AT != "" {
 		ac.at = rec.AT
-		ac.fromDiskAT = true
 	}
 	if rec.BL != "" {
 		ac.bl = rec.BL
@@ -297,19 +293,21 @@ func (ac *AccountClient) ReloadFromDiskIfNewer() bool {
 	ac.quarantineReason = rec.QuarantineReason
 	ac.skill = rec.Skill
 	ac.fileMtimeMs = mtime
-	if changed {
-		ac.cookieGen.Add(1)
+	if cookieChanged || tokenChanged {
 		ac.bootstrappedAt = time.Time{}
 		ac.modelsCache = nil
 	}
+	if cookieChanged {
+		ac.cookieGen.Add(1)
+	}
 	ac.mu.Unlock()
 
-	if changed && ac.Pool != nil {
+	if cookieChanged && ac.Pool != nil {
 		if s := ac.Pool.Existing(ac.sessionKey()); s != nil {
 			s.QueueCookieUpdate(rec.Cookies)
 		}
 	}
-	return changed
+	return cookieChanged
 }
 
 // Email returns the account's Google email address.
@@ -324,7 +322,6 @@ func (ac *AccountClient) SetTokens(at, bl, fSid string) {
 	ac.mu.Lock()
 	if at != "" {
 		ac.at = at
-		ac.fromDiskAT = false
 		ac.bootstrappedAt = time.Now()
 	}
 	if bl != "" {
@@ -346,7 +343,8 @@ func (ac *AccountClient) CookieHeader() string {
 // InvalidateAuth clears the cached SNlM0e token so the next call re-bootstraps.
 func (ac *AccountClient) InvalidateAuth() {
 	ac.mu.Lock()
-	ac.bootstrappedAt = time.Now().Add(-2 * xsrfTTL)
+	ac.at = ""
+	ac.bootstrappedAt = time.Time{}
 	ac.mu.Unlock()
 }
 
@@ -546,6 +544,10 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 		}
 	}
 
+	if at == "" && ac.verifyTokensOnClient(ctx, sc) {
+		return nil
+	}
+
 	if lastRotRes != nil && lastRotRes.Status == 429 && at == "" {
 		return transport.NewUpstreamError("cookie rotation rate limited (HTTP 429)", 429, "rate_limit_error", res.Headers, nil)
 	}
@@ -581,7 +583,6 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 	ac.at = at
 	ac.tokenFetchedAt = nowISO
 	ac.tokenSource = "bridge"
-	ac.fromDiskAT = false
 	if ac.blOverride != "" {
 		ac.bl = ac.blOverride
 		log.Printf("[gemini] account %s using BRIDGE_BL_OVERRIDE=%s", ac.ID, ac.blOverride)
@@ -613,41 +614,44 @@ func (ac *AccountClient) bootstrapOnClient(ctx context.Context, sc *transport.St
 	return nil
 }
 
+func (ac *AccountClient) verifyTokensOnClient(ctx context.Context, sc *transport.StealthClient) bool {
+	ac.mu.RLock()
+	hasTokens := ac.at != "" && ac.bl != "" && ac.fSid != ""
+	ac.mu.RUnlock()
+	if !hasTokens {
+		return false
+	}
+	res, err := ac.doBatchExec(ctx, sc, "otAQ7b", "[]")
+	if err != nil || res == nil || res.Status != 200 {
+		return false
+	}
+	p := findBatchPayload(ParseBatch(res.Body), "otAQ7b")
+	if p == nil || isStatus1016(p) {
+		return false
+	}
+	ac.mu.Lock()
+	ac.bootstrappedAt = time.Now()
+	ac.mu.Unlock()
+	return true
+}
+
 func (ac *AccountClient) ensureBootstrapped(ctx context.Context, sc *transport.StealthClient) error {
 	ac.mu.RLock()
-	at := ac.at
-	fromDisk := ac.fromDiskAT
-	bootAt := ac.bootstrappedAt
-	age := time.Since(bootAt)
+	fresh := ac.at != "" && !ac.bootstrappedAt.IsZero() && time.Since(ac.bootstrappedAt) < xsrfTTL
 	ac.mu.RUnlock()
-	if at != "" && !fromDisk && !bootAt.IsZero() && age < xsrfTTL {
+	if fresh {
 		return nil
 	}
 	ac.bootMu.Lock()
 	defer ac.bootMu.Unlock()
 	ac.mu.RLock()
-	at = ac.at
-	bl := ac.bl
-	fSid := ac.fSid
-	fromDisk = ac.fromDiskAT
-	bootAt = ac.bootstrappedAt
-	age = time.Since(bootAt)
+	fresh = ac.at != "" && !ac.bootstrappedAt.IsZero() && time.Since(ac.bootstrappedAt) < xsrfTTL
 	ac.mu.RUnlock()
-	if at != "" && !fromDisk && !bootAt.IsZero() && age < xsrfTTL {
+	if fresh {
 		return nil
 	}
-	if fromDisk && at != "" && bl != "" && fSid != "" {
-		if res, err := ac.doBatchExec(ctx, sc, "otAQ7b", "[]"); err == nil && res != nil && res.Status == 200 {
-			entries := ParseBatch(res.Body)
-			p := findBatchPayload(entries, "otAQ7b")
-			if p != nil && !isStatus1016(p) {
-				ac.mu.Lock()
-				ac.fromDiskAT = false
-				ac.bootstrappedAt = time.Now()
-				ac.mu.Unlock()
-				return nil
-			}
-		}
+	if ac.verifyTokensOnClient(ctx, sc) {
+		return nil
 	}
 	return ac.bootstrapOnClient(ctx, sc)
 }
